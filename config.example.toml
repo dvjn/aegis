@@ -1,0 +1,13 @@
+# http_addr = "127.0.0.1:8765"
+# database_url = "sqlite://data/aegis.db?mode=rwc"
+# max_capture_bytes = 16777216
+
+# Add entries to name accounts or configure additional accounts.
+[[providers]]
+id = "claude-personal"
+type = "claude_subscription"
+
+[[providers]]
+id = "codex-personal"
+type = "codex_subscription"
+# base_url = "http://127.0.0.1:4000" # provider-specific override

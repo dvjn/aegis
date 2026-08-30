@@ -1,0 +1,62 @@
+[package]
+name = "aegis"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+async-trait = "0.1.92"
+axum = "0.8.9"
+axum-extra = { version = "0.12", features = ["cookie"] }
+base64 = "0.23.1"
+chrono = { version = "0.4.45", features = ["serde", "clock"] }
+clap = { version = "4.6.6", features = ["derive"] }
+email_address = "0.2.9"
+fastcdc = "5.0.0"
+flate2 = "1.1.9"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+hkdf = "0.13"
+hmac = "0.13"
+libc = "0.2.189"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots", "pool", "ring"] }
+maud = { version = "0.27", features = ["axum"] }
+rand = "0.10"
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "rustls-no-provider", "stream"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+rpassword = "7"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+sea-orm = { version = "2.0.2", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { version = "2.0.2", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+subtle = "2.6"
+thiserror = "2.0.20"
+# Only for the cookie Max-Age type, which the cookie crate expresses in time::Duration.
+time = { version = "0.3.55", default-features = false }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = "0.1.19"
+tokio-util = "0.7.19"
+toml = "1.1.4"
+tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "timeout", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.26.0", features = ["v4", "v7", "serde"] }
+webpki-roots = "1.0.9"
+zeroize = "1"
+
+[build-dependencies]
+sha2 = "0.11.0"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }

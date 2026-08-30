@@ -1,0 +1,1032 @@
+/* @font-face is inlined in the page head, because the font path is hashed at
+   build time. */
+
+:root {
+  color-scheme: dark;
+
+  --canvas: #08090b;
+  --surface-1: #0e1013;
+  --surface-2: #14171b;
+  --surface-3: #1b1f24;
+  --line: #23272d;
+  --line-strong: #30353d;
+  --line-hover: #414751;
+
+  --ink: #f4f6f8;
+  --ink-secondary: #c3cad4;
+  --muted: #79828f;
+
+  --accent: #2f6fed;
+  --accent-hover: #3b7cf7;
+  --accent-pressed: #2560d4;
+  --accent-ink: #ffffff;
+  --accent-faint: rgba(47, 111, 237, .12);
+  --focus-ring: rgba(96, 150, 255, .6);
+
+  --danger: #ef6b73;
+  --danger-line: #4d2429;
+  --danger-surface: #1a1012;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  --control-height: 36px;
+  --control-height-sm: 30px;
+  --card-width: 32rem;
+
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-feature-settings: "liga" 1, "calt" 1;
+  font-synthesis: none;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--canvas);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+  background: var(--canvas);
+}
+
+body {
+  min-width: 20rem;
+  color: var(--ink);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+/* Nothing in this design is rounded, so every focus ring is a square outline
+   at a fixed offset. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* The uppercase micro-label that names a field, a group, or a value. */
+label,
+legend,
+.consent-caption,
+.consent-account-caption,
+.detail-label {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+/* --- Frame ---------------------------------------------------------------- */
+
+.site-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.container {
+  width: min(100% - 32px, 72rem);
+  margin-inline: auto;
+}
+
+header.site {
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-1);
+}
+
+.site-nav {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+header.site .site-title {
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  text-decoration: none;
+}
+
+.nav-auth {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.nav-auth [role="button"] {
+  width: auto;
+  min-height: var(--control-height-sm);
+  padding: 0 var(--space-3);
+  font-size: 13px;
+}
+
+.nav-auth a.nav-icon {
+  width: var(--control-height-sm);
+  padding: 0;
+  border-color: var(--line-strong);
+  color: var(--ink-secondary);
+  background: var(--surface-2);
+}
+
+.nav-auth a.nav-icon:hover {
+  border-color: var(--line-hover);
+  color: var(--ink);
+  background: var(--surface-3);
+}
+
+main.auth-shell {
+  width: min(100%, var(--card-width));
+  margin-inline: auto;
+  padding: var(--space-12) 16px var(--space-12);
+  align-self: start;
+}
+
+main.account-shell {
+  width: min(100% - 32px, 72rem);
+  margin-inline: auto;
+  padding: var(--space-8) 0 var(--space-12);
+  align-self: start;
+}
+
+.page-head {
+  display: flex;
+  gap: var(--space-4);
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: var(--space-6);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -.015em;
+}
+
+/* The two columns are independent stacks, so a tall card on one side does not
+   drag the other side's cards down with it. */
+.account-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+/* Two readings of the same shape carry equal weight, unlike the account page
+   where tables and forms want different room. */
+.account-grid-even {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.account-column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+main.home-shell {
+  margin-inline: auto;
+  padding: clamp(48px, 22vh, 176px) 16px var(--space-12);
+  align-self: start;
+  text-align: center;
+}
+
+main.home-shell h1 {
+  margin: 0;
+  font-size: 48px;
+  font-weight: 600;
+  letter-spacing: -.02em;
+  line-height: 1;
+}
+
+main.home-shell p {
+  margin: var(--space-4) 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+/* --- Cards --------------------------------------------------------------- */
+
+.auth-card {
+  --card-pad: var(--space-4);
+
+  margin: 0;
+  padding: var(--card-pad);
+  border: 1px solid var(--line);
+  background: var(--surface-1);
+}
+
+.auth-card h1 {
+  margin: 0 0 var(--space-2);
+  color: var(--ink);
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -.015em;
+}
+
+.auth-card h2 {
+  margin: 0 0 var(--space-1);
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -.005em;
+}
+
+.auth-card > p:first-of-type,
+.card-head p,
+.auth-card h2 + p {
+  margin: 0 0 var(--space-4);
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.auth-card h2 + .table-wrap {
+  margin-top: var(--space-4);
+}
+
+/* A table that closes a card runs to its edges. Inset, it would draw a second
+   border a gutter inside the card's own. */
+.auth-card > .table-wrap:last-child {
+  margin: 0 calc(var(--card-pad) * -1) calc(var(--card-pad) * -1);
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+}
+
+.card-head {
+  margin-bottom: var(--space-6);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.card-head h1 {
+  margin-bottom: var(--space-2);
+}
+
+.card-head p {
+  margin-bottom: 0;
+}
+
+/* --- Fields -------------------------------------------------------------- */
+
+form {
+  margin: 0;
+}
+
+label {
+  margin: 0 0 var(--space-2);
+}
+
+input:not([type="hidden"]) {
+  display: block;
+  width: 100%;
+  min-height: var(--control-height);
+  margin: 0 0 var(--space-4);
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--ink);
+  caret-color: var(--accent-hover);
+  background: var(--surface-2);
+  font-size: 14px;
+}
+
+input::placeholder {
+  color: var(--muted);
+}
+
+input:hover {
+  border-color: var(--line-hover);
+}
+
+input:focus-visible {
+  border-color: var(--accent);
+  outline-offset: 0;
+}
+
+/* Only the card's own submit needs to clear the field above it. A descendant
+   selector would also catch the one-button forms inside a table row. */
+.auth-card > form > button {
+  margin-top: var(--space-2);
+}
+
+/* A set of related controls, framed as a field rather than a card. */
+.field-group {
+  margin: 0 0 var(--space-6);
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+}
+
+.field-group legend {
+  float: left;
+  width: 100%;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-3);
+}
+
+.checkbox-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: var(--space-3);
+  gap: var(--space-2) var(--space-4);
+  clear: both;
+}
+
+/* The rule above makes every input a full-width block, which would put the box
+   on its own line above its text. A checkbox keeps its intrinsic size. */
+.checkbox-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin: 0;
+  min-height: 22px;
+  color: var(--ink-secondary);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  min-height: 0;
+  margin: 0;
+  flex: none;
+  accent-color: var(--accent);
+}
+
+/* --- Buttons ------------------------------------------------------------- */
+
+button,
+a[role="button"] {
+  display: inline-flex;
+  min-height: var(--control-height);
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  color: var(--accent-ink);
+  background: var(--accent);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 1.2;
+  letter-spacing: .01em;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+button:hover,
+a[role="button"]:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+button:active,
+a[role="button"]:active {
+  border-color: var(--accent-pressed);
+  background: var(--accent-pressed);
+}
+
+button.secondary,
+a[role="button"].secondary {
+  border-color: var(--line-strong);
+  color: var(--ink-secondary);
+  background: var(--surface-2);
+}
+
+button.secondary:hover,
+a[role="button"].secondary:hover {
+  border-color: var(--line-hover);
+  color: var(--ink);
+  background: var(--surface-3);
+}
+
+.auth-card > form > button,
+.auth-card > form > [role="button"],
+.auth-card > [role="button"] {
+  width: 100%;
+}
+
+/* An account card holds several unrelated forms, so no single action owns the
+   full width of it. */
+.account-card > form > button,
+.account-card > [role="button"] {
+  width: auto;
+}
+
+/* A control that reports a state rather than offering an action, such as the
+   revoked marker that stands where Revoke would be. */
+button:disabled,
+button:disabled:hover {
+  border-color: var(--line);
+  color: var(--muted);
+  background: var(--surface-1);
+  cursor: default;
+}
+
+/* A subordinate control beside a value. */
+button.compact,
+a[role="button"].compact {
+  width: auto;
+  min-height: var(--control-height-sm);
+  flex: none;
+  padding: 0 var(--space-3);
+  font-size: 12px;
+}
+
+/* --- Messages ------------------------------------------------------------ */
+
+.auth-note {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--line-strong);
+  border-left: 2px solid var(--accent);
+  color: var(--ink-secondary);
+  background: var(--surface-2);
+  font-size: 13px;
+}
+
+.auth-note pre {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: var(--canvas);
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+.auth-error {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--danger-line);
+  border-left: 2px solid var(--danger);
+  color: var(--danger);
+  background: var(--danger-surface);
+  font-size: 13px;
+}
+
+.auth-alternate {
+  margin: var(--space-4) 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.auth-alternate a {
+  color: var(--ink-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.auth-alternate a:hover {
+  color: var(--ink);
+}
+
+.account-note,
+.account-empty {
+  margin: var(--space-3) 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* --- Lists --------------------------------------------------------------- */
+
+/* A card renders its list unconditionally, so an empty one must not leave the
+   frame of the list behind. */
+.account-list:empty {
+  display: none;
+}
+
+.account-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  list-style: none;
+  background: var(--surface-2);
+}
+
+/* Rows share a hairline instead of each carrying its own frame, which keeps a
+   long list flat. */
+.account-item + .account-item {
+  border-top: 1px solid var(--line);
+}
+
+.account-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+}
+
+.account-item-head {
+  display: flex;
+  gap: var(--space-4);
+  align-items: center;
+  justify-content: space-between;
+}
+
+.account-item-body {
+  min-width: 0;
+}
+
+.account-item-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 550;
+}
+
+.account-meta,
+.account-footer {
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.account-footer {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
+}
+
+.account-item-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex: none;
+  align-items: center;
+}
+
+.account-item form {
+  flex: none;
+}
+
+.account-item button {
+  min-height: var(--control-height-sm);
+  padding: 0 var(--space-3);
+  font-size: 12px;
+}
+
+/* --- Tiles and ranges ---------------------------------------------------- */
+
+.tile-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+/* Same padding as a card, so a tile label sits on the column line the headings
+   and table cells below it share. */
+.tile {
+  margin: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  background: var(--surface-1);
+}
+
+.tile-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.tile-value {
+  margin-top: var(--space-1);
+  color: var(--ink);
+  font-size: 32px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  line-height: 1.1;
+}
+
+/* The tile keeps its height whether or not a note is present. */
+.tile-note {
+  min-height: 1.5em;
+  margin-top: var(--space-1);
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-switch {
+  display: flex;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+}
+
+.range-option {
+  display: inline-flex;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  padding: 0 var(--space-3);
+  color: var(--ink-secondary);
+  font-size: 12px;
+  font-weight: 550;
+  text-decoration: none;
+}
+
+.range-option + .range-option {
+  border-left: 1px solid var(--line-strong);
+}
+
+.range-option:hover {
+  color: var(--ink);
+  background: var(--surface-3);
+}
+
+.range-option.is-current {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+/* --- Tables -------------------------------------------------------------- */
+
+/* A table keeps its column widths, so a narrow card scrolls it rather than
+   letting the columns collapse into each other. */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  background: transparent;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+
+.data-table th,
+.data-table td {
+  padding: var(--space-2) var(--space-4);
+  text-align: left;
+  vertical-align: middle;
+}
+
+/* Every body row reserves the height of the compact buttons it may hold, so a
+   row with actions is no taller than one without. */
+.data-table tbody th,
+.data-table tbody td {
+  height: var(--control-height-sm);
+}
+
+.data-table thead th {
+  padding-bottom: var(--space-1);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.data-table tbody tr + tr th,
+.data-table tbody tr + tr td {
+  border-top: 1px solid var(--line);
+}
+
+.cell-title {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 550;
+}
+
+/* A client id or other identifier that qualifies the row title. */
+.cell-subtitle {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* Timestamps read as one unit, so they never wrap mid-value. */
+.cell-moment {
+  color: var(--ink-secondary);
+  white-space: nowrap;
+}
+
+.cell-absent {
+  color: var(--muted);
+}
+
+/* Qualified by the table, because `.data-table th` would otherwise win on
+   specificity and keep these cells left-aligned. */
+.data-table .col-numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The action column is sized by its buttons; the flexible columns give up
+   width before it does. */
+.col-actions {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.cell-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* A form around a button is a block box; stretching it would leave the button
+   sitting below the space the form claims. */
+.cell-actions form {
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+
+.table-empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+}
+
+.chip {
+  padding: 1px var(--space-2);
+  border: 1px solid var(--line-strong);
+  color: var(--ink-secondary);
+  background: var(--surface-1);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* A state that replaces an action, such as a revoked key. */
+.status-tag {
+  display: inline-block;
+  margin-left: var(--space-2);
+  padding: 1px var(--space-2);
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  background: var(--surface-1);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* --- Consent ------------------------------------------------------------- */
+
+.consent-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.consent-card .card-head {
+  margin-bottom: 0;
+}
+
+.consent-account {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-3);
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+}
+
+.consent-avatar {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
+  border: 1px solid var(--accent);
+  color: var(--accent-hover);
+  background: var(--accent-faint);
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.consent-account-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.consent-account-email {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.consent-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.consent-caption {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line-strong);
+  border-bottom: 0;
+  background: var(--surface-3);
+}
+
+.consent-box {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+}
+
+.detail-row {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+  padding: var(--space-2) 0;
+}
+
+.detail-row + .detail-row {
+  border-top: 1px solid var(--line);
+}
+
+.detail-label {
+  padding-top: 2px;
+}
+
+.detail-value {
+  color: var(--ink-secondary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.perm-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.perm-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.perm-scope {
+  padding: 1px var(--space-2);
+  border: 1px solid var(--line-strong);
+  color: var(--ink-secondary);
+  background: var(--surface-3);
+}
+
+.perm-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.consent-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.consent-actions button {
+  flex: 1;
+}
+
+/* The device code is the one string a person has to compare character by
+   character, so it is set in mono at the largest size on the page. */
+.user-code {
+  margin: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--accent);
+  color: var(--ink);
+  background: var(--accent-faint);
+  font-family: var(--mono);
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: .22em;
+  text-align: center;
+  overflow-x: auto;
+}
+
+/* --- Narrow screens ------------------------------------------------------ */
+
+/* Two columns of tables stop fitting well before the phone breakpoint. */
+@media (max-width: 60rem) {
+  .account-grid,
+  .account-grid-even,
+  .tile-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 34rem) {
+  main.account-shell {
+    padding-top: var(--space-6);
+  }
+
+  .data-table th,
+  .data-table td {
+    padding: var(--space-2) var(--space-3);
+  }
+
+  main.auth-shell {
+    padding-top: var(--space-6);
+  }
+
+  .auth-card {
+    --card-pad: var(--space-4);
+  }
+
+  .checkbox-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* A label and its value need the whole width. */
+  .detail-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+
+  .account-item-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-3);
+  }
+
+  .consent-actions {
+    flex-direction: column;
+  }
+
+  .user-code {
+    font-size: 20px;
+    letter-spacing: .16em;
+  }
+}

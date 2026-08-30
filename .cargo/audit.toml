@@ -1,0 +1,4 @@
+[advisories]
+# Locked through SeaORM Migration's schema dependencies, but absent from the
+# resolved build graph (`cargo tree --target all -i rkyv@0.7.46` is empty).
+ignore = ["RUSTSEC-2026-0235"]

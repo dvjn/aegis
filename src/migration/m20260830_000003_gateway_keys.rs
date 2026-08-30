@@ -1,0 +1,194 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(GatewayKeys::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(GatewayKeys::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(GatewayKeys::UserId).string().not_null())
+                    .col(ColumnDef::new(GatewayKeys::Name).string().not_null())
+                    .col(
+                        ColumnDef::new(GatewayKeys::AllowedProviders)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(GatewayKeys::CreatedAt).string().not_null())
+                    .col(ColumnDef::new(GatewayKeys::RevokedAt).string())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_gateway_keys_user")
+                            .from(GatewayKeys::Table, GatewayKeys::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("ux_gateway_keys_user_name")
+                    .table(GatewayKeys::Table)
+                    .col(GatewayKeys::UserId)
+                    .col(GatewayKeys::Name)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(GatewayKeyVersions::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(GatewayKeyVersions::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(GatewayKeyVersions::KeyId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(GatewayKeyVersions::KeyHash)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(GatewayKeyVersions::Prefix)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(GatewayKeyVersions::CreatedAt)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(GatewayKeyVersions::LastUsedAt).string())
+                    .col(ColumnDef::new(GatewayKeyVersions::RevokedAt).string())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_gateway_key_versions_key")
+                            .from(GatewayKeyVersions::Table, GatewayKeyVersions::KeyId)
+                            .to(GatewayKeys::Table, GatewayKeys::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("ix_gateway_key_versions_key")
+                    .table(GatewayKeyVersions::Table)
+                    .col(GatewayKeyVersions::KeyId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(GatewayRequests::Table)
+                    .add_column(ColumnDef::new(GatewayRequests::KeyId).string())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(GatewayRequests::Table)
+                    .add_column(ColumnDef::new(GatewayRequests::KeyVersionId).string())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("ix_gateway_requests_key_id")
+                    .table(GatewayRequests::Table)
+                    .col(GatewayRequests::KeyId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("ix_gateway_requests_key_id")
+                    .table(GatewayRequests::Table)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(GatewayRequests::Table)
+                    .drop_column(GatewayRequests::KeyVersionId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(GatewayRequests::Table)
+                    .drop_column(GatewayRequests::KeyId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(GatewayKeyVersions::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(GatewayKeys::Table).to_owned())
+            .await
+    }
+}
+
+#[derive(DeriveIden)]
+enum Users {
+    Table,
+    Id,
+}
+#[derive(DeriveIden)]
+enum GatewayKeys {
+    Table,
+    Id,
+    UserId,
+    Name,
+    AllowedProviders,
+    CreatedAt,
+    RevokedAt,
+}
+#[derive(DeriveIden)]
+enum GatewayKeyVersions {
+    Table,
+    Id,
+    KeyId,
+    KeyHash,
+    Prefix,
+    CreatedAt,
+    LastUsedAt,
+    RevokedAt,
+}
+#[derive(DeriveIden)]
+enum GatewayRequests {
+    Table,
+    KeyId,
+    KeyVersionId,
+}

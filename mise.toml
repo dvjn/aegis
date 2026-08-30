@@ -1,0 +1,174 @@
+[tools]
+rust = { version = "1.98.0", components = "rustfmt,clippy" }
+zig = "0.16.0"
+"github:rustsec/rustsec" = { version = "cargo-audit/v0.22.2", exe = "cargo-audit" }
+"github:rust-cross/cargo-zigbuild" = { version = "0.23.0", exe = "cargo-zigbuild" }
+watchexec = "2.6.1"
+
+[env]
+TARGETS = "{{ env.BUILD_TARGETS | default(value='x86_64-unknown-linux-musl:amd64 aarch64-unknown-linux-musl:arm64') }}"
+
+[tasks.local-bootstrap]
+description = "Create the standard local account and API key when absent"
+env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8765" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p data
+chmod 700 data
+fresh_database=false
+if [[ ! -e data/dev.db ]]; then
+  fresh_database=true
+fi
+if [[ "$fresh_database" == true || ! -s data/api-key ]]; then
+  if [[ "$fresh_database" == true ]]; then
+    rm -f data/user-id data/api-key
+  fi
+if [[ ! -s data/api-key ]]; then
+  if [[ ! -s data/user-id ]]; then
+    bootstrap_output="$(printf 'Correct passw0rd!\n' | cargo run --quiet -- bootstrap-user \
+      --email admin@example.com \
+      --password-file /dev/stdin)"
+    user_id="$(sed -n 's/.*created user: \([0-9a-f-]*\).*/\1/p' <<<"$bootstrap_output" | tail -1)"
+    test -n "$user_id" || { printf '%s\n' "$bootstrap_output" >&2; exit 1; }
+    (umask 077; printf '%s\n' "$user_id" > data/user-id)
+  fi
+  key_output="$(cargo run --quiet -- key create \
+    --user "$(tr -d '\r\n' < data/user-id)" \
+    --name mise \
+    --provider claude \
+    --provider codex)"
+  api_key="$(sed -n 's/^key: //p' <<<"$key_output")"
+  test -n "$api_key" || { printf '%s\n' "$key_output" >&2; exit 1; }
+  (umask 077; printf '%s\n' "$api_key" > data/api-key)
+fi
+fi
+printf 'Local server: http://127.0.0.1:8765\nEmail: admin@example.com\nPassword: Correct passw0rd!\nAPI key file: data/api-key\n'
+'''
+
+[tasks.dev]
+description = "Run the local server with live reload"
+depends = ["local-bootstrap"]
+env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8765" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --exts rs,toml -- cargo run -- serve
+'''
+
+[tasks.serve]
+description = "Run the local server once, without live reload"
+depends = ["local-bootstrap"]
+env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8765" }
+run = "cargo run -- serve"
+
+[tasks.health]
+description = "Check the local Aegis server"
+run = '''curl --fail --silent --show-error "http://127.0.0.1:8765/healthz" && echo'''
+
+[tasks.claude]
+description = "Run Claude Code through local Aegis"
+run = '''
+test -s data/api-key || { echo "Run 'mise run serve' or 'mise run dev' once to create data/api-key" >&2; exit 1; }
+export ANTHROPIC_BASE_URL='http://127.0.0.1:8765/providers/claude'
+export ANTHROPIC_CUSTOM_HEADERS="x-aegis-api-key: $(tr -d '\r\n' < data/api-key)"
+export CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1
+exec claude "$@"
+'''
+
+[tasks.codex]
+description = "Run Codex through local Aegis"
+run = '''
+test -s data/api-key || { echo "Run 'mise run serve' or 'mise run dev' once to create data/api-key" >&2; exit 1; }
+export AEGIS_API_KEY="$(tr -d '\r\n' < data/api-key)"
+exec codex \
+  --config model_provider='"aegis"' \
+  --config model_providers.aegis.name='"Aegis"' \
+  --config model_providers.aegis.base_url='"http://127.0.0.1:8765/providers/codex"' \
+  --config model_providers.aegis.wire_api='"responses"' \
+  --config model_providers.aegis.requires_openai_auth=true \
+  --config 'model_providers.aegis.env_http_headers={ "x-aegis-api-key" = "AEGIS_API_KEY" }' \
+  "$@"
+'''
+
+[tasks.test]
+run = "cargo test"
+
+[tasks.fmt]
+run = "cargo fmt --all"
+
+[tasks.lint]
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.audit]
+description = "Check dependencies for known vulnerabilities"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+cargo audit
+# An ignored advisory in .cargo/audit.toml is only safe while the crate stays
+# out of the resolved graph. Fail when it comes back.
+tree="$(cargo tree --target all --prefix none --format '{p}')"
+if grep -Eq '^rkyv v0\\.7\\.46($|[[:space:]])' <<<"$tree"; then
+  echo "error: rkyv 0.7.46 is in the dependency graph, so RUSTSEC-2026-0235 is no longer unreachable" >&2
+  exit 1
+fi
+"""
+
+[tasks.check]
+depends = ["fmt-check", "lint", "test", "audit"]
+
+[tasks.fmt-check]
+run = "cargo fmt --all --check"
+
+[tasks.build]
+run = "cargo build --release"
+
+[tasks.dist]
+description = "Cross-compile the release binaries into dist/<arch>/aegis"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf dist
+for entry in $TARGETS; do
+  target="${entry%%:*}"
+  arch="${entry##*:}"
+  rustup target add "$target"
+  cargo zigbuild --release --locked --target "$target"
+  install -Dm755 "target/$target/release/aegis" "dist/$arch/aegis"
+done
+"""
+sources = ["src/**/*.rs", "build.rs", "Cargo.toml", "Cargo.lock"]
+
+[tasks.package]
+description = "Make the release tarballs and checksums from dist/"
+depends = ["dist"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+version="${VERSION:-$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)}"
+for entry in $TARGETS; do
+  target="${entry%%:*}"
+  arch="${entry##*:}"
+  name="aegis-${version}-${target}"
+  mkdir -p "dist/${name}"
+  cp "dist/${arch}/aegis" "dist/${name}/aegis"
+  cp README.md "dist/${name}/"
+  tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+  rm -rf "dist/${name}"
+  (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+done
+"""
+
+[tasks.image]
+description = "Build the container image for both architectures"
+depends = ["dist"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+platforms=""
+for entry in $TARGETS; do
+  platforms="${platforms},linux/${entry##*:}"
+done
+podman build --platform "${platforms#,}" --manifest aegis:local .
+"""
