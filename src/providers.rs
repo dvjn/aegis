@@ -52,18 +52,27 @@ pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
             reasoning_tokens: None,
             raw_json: serde_json::to_string(value).ok(),
         },
-        Provider::Codex => Usage {
-            input_tokens: integer(value, "input_tokens"),
-            output_tokens: integer(value, "output_tokens"),
-            cache_read_tokens: value
+        Provider::Codex => {
+            let cache_read_tokens = value
                 .get("input_tokens_details")
-                .and_then(|details| integer(details, "cached_tokens")),
-            cache_write_tokens: None,
-            reasoning_tokens: value
-                .get("output_tokens_details")
-                .and_then(|details| integer(details, "reasoning_tokens")),
-            raw_json: serde_json::to_string(value).ok(),
-        },
+                .and_then(|details| integer(details, "cached_tokens"));
+            Usage {
+                // The Responses API counts cached tokens inside input_tokens,
+                // while the Messages API keeps them apart. Subtract here so the
+                // stored columns are disjoint for every provider and a total
+                // never counts a cached token twice. Clamped because an
+                // inconsistent upstream payload must not yield a negative count.
+                input_tokens: integer(value, "input_tokens")
+                    .map(|total| (total - cache_read_tokens.unwrap_or(0)).max(0)),
+                output_tokens: integer(value, "output_tokens"),
+                cache_read_tokens,
+                cache_write_tokens: None,
+                reasoning_tokens: value
+                    .get("output_tokens_details")
+                    .and_then(|details| integer(details, "reasoning_tokens")),
+                raw_json: serde_json::to_string(value).ok(),
+            }
+        }
     }
 }
 
@@ -150,7 +159,38 @@ data: {"type":"message_delta","usage":{"output_tokens":42,"input_tokens":10}}
     fn extracts_codex_response_usage() {
         let body = br#"{"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":40},"output_tokens_details":{"reasoning_tokens":5}}}"#;
         let usage = extract_usage(Provider::Codex, body);
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(60));
         assert_eq!(usage.reasoning_tokens, Some(5));
+    }
+
+    #[test]
+    fn codex_cached_tokens_are_counted_once() {
+        let body = br#"{"usage":{"input_tokens":1000,"output_tokens":20,"input_tokens_details":{"cached_tokens":400}}}"#;
+        let usage = extract_usage(Provider::Codex, body);
+        assert_eq!(usage.input_tokens, Some(600));
+        assert_eq!(usage.cache_read_tokens, Some(400));
+        assert_eq!(
+            usage.input_tokens.unwrap()
+                + usage.cache_read_tokens.unwrap()
+                + usage.output_tokens.unwrap(),
+            1020,
+            "the four counters must add up to the tokens the upstream reported"
+        );
+    }
+
+    #[test]
+    fn codex_cached_tokens_above_the_input_total_clamp_to_zero() {
+        let body = br#"{"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":400}}}"#;
+        let usage = extract_usage(Provider::Codex, body);
+        assert_eq!(usage.input_tokens, Some(0));
+        assert_eq!(usage.cache_read_tokens, Some(400));
+    }
+
+    #[test]
+    fn codex_raw_json_keeps_the_upstream_input_total() {
+        let body = br#"{"usage":{"input_tokens":1000,"output_tokens":20,"input_tokens_details":{"cached_tokens":400}}}"#;
+        let usage = extract_usage(Provider::Codex, body);
+        let raw: Value = serde_json::from_str(&usage.raw_json.unwrap()).unwrap();
+        assert_eq!(raw["input_tokens"], 1000);
     }
 }
