@@ -91,6 +91,44 @@ exec codex \
   "$@"
 '''
 
+[tasks.pi]
+description = "Run pi through local Aegis"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+test -s data/api-key || { echo "Run 'mise run serve' or 'mise run dev' once to create data/api-key" >&2; exit 1; }
+export AEGIS_API_KEY="$(tr -d '\r\n' < data/api-key)"
+
+real_agent_dir="${PI_REAL_AGENT_DIR:-$HOME/.pi/agent}"
+agent_dir="$PWD/data/pi-agent"
+rm -rf "$agent_dir"
+mkdir -p "$agent_dir"
+chmod 700 "$agent_dir"
+if [[ -d "$real_agent_dir" ]]; then
+  find "$real_agent_dir" -mindepth 1 -maxdepth 1 \
+    ! -name models.json ! -name settings.json ! -name '*.lock' \
+    -exec ln -s {} "$agent_dir/" \;
+fi
+
+settings_source="$real_agent_dir/settings.json"
+test -s "$settings_source" || settings_source=/dev/null
+jq -s '(.[0] // {}) + {transport: "sse"}' "$settings_source" > "$agent_dir/settings.json"
+
+cat > "$agent_dir/models.json" <<'JSON'
+{
+  "providers": {
+    "openai-codex": {
+      "baseUrl": "http://127.0.0.1:8765/providers/codex",
+      "headers": { "x-aegis-api-key": "$AEGIS_API_KEY" }
+    }
+  }
+}
+JSON
+
+export PI_CODING_AGENT_DIR="$agent_dir"
+exec pi "$@"
+'''
+
 [tasks.test]
 run = "cargo test"
 
