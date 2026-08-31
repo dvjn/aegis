@@ -3,6 +3,7 @@ use anyhow::Context;
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
+    pricing::cost,
     providers::{Provider, extract_usage, requested_model},
     request_id::RequestId,
     telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
@@ -25,7 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
-fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
+pub(crate) fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -260,6 +261,7 @@ impl Gateway {
             }
 
             let usage = extract_usage(provider, &capture);
+            let cost = cost(model.as_deref(), &usage);
             for (field, value) in [
                 ("input_tokens", usage.input_tokens),
                 ("output_tokens", usage.output_tokens),
@@ -289,6 +291,7 @@ impl Gateway {
                     response_truncated: truncated,
                     client_disconnected: disconnected,
                     usage: &usage,
+                    cost,
                     error_message: stream_error.as_deref(),
                 })
                 .await

@@ -1,4 +1,7 @@
-use crate::providers::{Provider, Usage};
+use crate::{
+    pricing::Cost,
+    providers::{Provider, Usage},
+};
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
@@ -138,6 +141,7 @@ pub struct CompletionRecord<'a> {
     pub response_truncated: bool,
     pub client_disconnected: bool,
     pub usage: &'a Usage,
+    pub cost: Cost,
     pub error_message: Option<&'a str>,
 }
 
@@ -215,7 +219,7 @@ impl SqliteSink {
             self.database
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
-                    "INSERT OR REPLACE INTO gateway_usage (request_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, raw_usage_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO gateway_usage (request_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, raw_usage_json, cost_nanodollars, cost_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         record.id.to_string().into(),
                         record.usage.input_tokens.into(),
@@ -224,6 +228,8 @@ impl SqliteSink {
                         record.usage.cache_write_tokens.into(),
                         record.usage.reasoning_tokens.into(),
                         record.usage.raw_json.clone().into(),
+                        record.cost.nanodollars.into(),
+                        record.cost.source.as_str().into(),
                     ],
                 ))
                 .await?;

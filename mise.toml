@@ -129,6 +129,48 @@ export PI_CODING_AGENT_DIR="$agent_dir"
 exec pi "$@"
 '''
 
+[tasks."pricing:update"]
+description = "Refresh the vendored LiteLLM model price map"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+url="${LITELLM_MODEL_COST_MAP_URL:-https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json}"
+upstream="$(mktemp)"
+trap 'rm -f "$upstream"' EXIT
+curl --fail --silent --show-error --location --output "$upstream" "$url"
+
+jq -S '
+  to_entries
+  | map(select(
+      (.value | type == "object")
+      and (.value.litellm_provider == "anthropic" or .value.litellm_provider == "openai")
+      and (.value.input_cost_per_token != null)
+    ))
+  | map({
+      key: .key,
+      value: (
+        { input: .value.input_cost_per_token,
+          output: (.value.output_cost_per_token // 0) }
+        + (if .value.cache_read_input_token_cost == null then {}
+           else { cache_read: .value.cache_read_input_token_cost } end)
+        + (if .value.cache_creation_input_token_cost == null then {}
+           else { cache_write: .value.cache_creation_input_token_cost } end)
+      )
+    })
+  | from_entries
+' "$upstream" > src/pricing/model_prices.json
+
+commit="$(curl --fail --silent --show-error --location \
+  "https://api.github.com/repos/BerriAI/litellm/commits/main?path=model_prices_and_context_window.json" | jq -r .sha)"
+sed -i \
+  -e "s|^Upstream commit: .*|Upstream commit: $commit|" \
+  -e "s|^Upstream sha256: .*|Upstream sha256: $(sha256sum "$upstream" | cut -d" " -f1)|" \
+  -e "s|^Retrieved:       .*|Retrieved:       $(date -u +%Y-%m-%d)|" \
+  src/pricing/LICENSE
+
+printf 'Priced models: %s\n' "$(jq length src/pricing/model_prices.json)"
+'''
+
 [tasks.test]
 run = "cargo test"
 
