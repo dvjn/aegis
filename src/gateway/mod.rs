@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
@@ -51,7 +53,25 @@ pub struct Gateway {
 #[derive(Clone)]
 struct ProviderTarget {
     kind: Provider,
-    base_url: Arc<str>,
+    origin: Arc<str>,
+    base_path: Arc<str>,
+}
+
+impl ProviderTarget {
+    fn upstream_url(&self, path: &str) -> String {
+        if self.base_path.is_empty() || begins_with_segments(path, &self.base_path) {
+            format!("{}{path}", self.origin)
+        } else {
+            format!("{}{}{path}", self.origin, self.base_path)
+        }
+    }
+}
+
+fn begins_with_segments(path: &str, prefix: &str) -> bool {
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
 }
 
 impl Gateway {
@@ -74,15 +94,18 @@ impl Gateway {
                     }
                     ProviderKind::CodexSubscription { base_url } => (Provider::Codex, base_url),
                 };
-                (
+                let parsed = url::Url::parse(&base_url)
+                    .with_context(|| format!("provider {:?} has an invalid base_url", config.id))?;
+                Ok((
                     config.id,
                     ProviderTarget {
                         kind,
-                        base_url: Arc::from(base_url.trim_end_matches('/')),
+                        origin: Arc::from(parsed.origin().ascii_serialization()),
+                        base_path: Arc::from(parsed.path().trim_end_matches('/')),
                     },
-                )
+                ))
             })
-            .collect();
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
         Ok(Self {
             client,
             sink,
@@ -153,7 +176,7 @@ impl Gateway {
             .unwrap_or(parts.uri.path());
         let route_prefix = format!("/providers/{provider_id}");
         let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
-        let upstream_url = format!("{}{upstream_path}", target.base_url);
+        let upstream_url = target.upstream_url(upstream_path);
         let model = requested_model(&body);
         let span = tracing::Span::current();
         span.record("user_id", tracing::field::display(&authenticated.user_id));
@@ -323,4 +346,85 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Provider, ProviderTarget};
+    use std::sync::Arc;
+
+    fn target(base_url: &str) -> ProviderTarget {
+        let parsed = url::Url::parse(base_url).expect("valid base_url");
+        ProviderTarget {
+            kind: Provider::Codex,
+            origin: Arc::from(parsed.origin().ascii_serialization()),
+            base_path: Arc::from(parsed.path().trim_end_matches('/')),
+        }
+    }
+
+    #[test]
+    fn endpoint_only_paths_go_under_the_configured_base_path() {
+        let codex = target("https://chatgpt.com/backend-api/codex");
+
+        assert_eq!(
+            codex.upstream_url("/responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            codex.upstream_url("/responses?stream=true"),
+            "https://chatgpt.com/backend-api/codex/responses?stream=true"
+        );
+    }
+
+    #[test]
+    fn paths_that_restate_the_base_path_are_not_doubled() {
+        let codex = target("https://chatgpt.com/backend-api/codex");
+
+        assert_eq!(
+            codex.upstream_url("/backend-api/codex/responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            codex.upstream_url("/backend-api/codex"),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(
+            codex.upstream_url("/backend-api/codex?stream=true"),
+            "https://chatgpt.com/backend-api/codex?stream=true"
+        );
+    }
+
+    #[test]
+    fn a_partial_segment_match_is_not_treated_as_the_base_path() {
+        let codex = target("https://chatgpt.com/backend-api/codex");
+
+        assert_eq!(
+            codex.upstream_url("/backend-api/codexes/responses"),
+            "https://chatgpt.com/backend-api/codex/backend-api/codexes/responses"
+        );
+    }
+
+    #[test]
+    fn a_base_url_without_a_path_forwards_the_path_unchanged() {
+        let anthropic = target("https://api.anthropic.com");
+
+        assert_eq!(
+            anthropic.upstream_url("/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn a_base_url_with_a_port_keeps_the_port() {
+        let local = target("http://127.0.0.1:4000/backend-api/codex");
+
+        assert_eq!(
+            local.upstream_url("/responses"),
+            "http://127.0.0.1:4000/backend-api/codex/responses"
+        );
+        assert_eq!(
+            local.upstream_url("/backend-api/codex/responses"),
+            "http://127.0.0.1:4000/backend-api/codex/responses"
+        );
+    }
 }
