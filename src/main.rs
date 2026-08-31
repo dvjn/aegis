@@ -10,6 +10,7 @@ mod mcp;
 mod migration;
 mod oauth;
 mod origin;
+mod pricing;
 mod providers;
 mod request_id;
 mod telemetry;
@@ -131,6 +132,12 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
     )
     .context("failed to construct gateway")?;
     let cancellation = CancellationToken::new();
+    match pricing::load_effective_map(&database, &config.pricing).await {
+        Ok(map) => pricing::install(map),
+        Err(error) => tracing::warn!(%error, "failed to load stored model prices"),
+    }
+    pricing::spawn_refresh(database.clone(), config.pricing, cancellation.clone());
+
     let application = app::router(
         domain,
         gateway,

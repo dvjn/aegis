@@ -9,6 +9,8 @@ mod m20260830_000006_remove_empty_usage;
 mod m20260830_000007_semantic_payload_parts;
 mod m20260831_000008_reset_oauth_scopes;
 mod m20260901_000009_normalize_codex_input_tokens;
+mod m20260901_000010_gateway_usage_cost;
+mod m20260901_000011_model_prices;
 
 pub struct Migrator;
 
@@ -25,6 +27,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260830_000007_semantic_payload_parts::Migration),
             Box::new(m20260831_000008_reset_oauth_scopes::Migration),
             Box::new(m20260901_000009_normalize_codex_input_tokens::Migration),
+            Box::new(m20260901_000010_gateway_usage_cost::Migration),
+            Box::new(m20260901_000011_model_prices::Migration),
         ]
     }
 }

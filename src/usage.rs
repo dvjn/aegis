@@ -56,6 +56,8 @@ pub struct UsageTotals {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub output_tokens: i64,
+    pub cost_nanodollars: i64,
+    pub unpriced: i64,
 }
 
 impl UsageTotals {
@@ -73,6 +75,7 @@ pub struct UsageGroup {
     pub label: Option<String>,
     pub requests: i64,
     pub tokens: i64,
+    pub cost_nanodollars: i64,
 }
 
 #[derive(Clone)]
@@ -86,7 +89,9 @@ const TOTALS_SQL: &str = "SELECT COUNT(*) requests, \
      COALESCE(SUM(u.input_tokens), 0) input_tokens, \
      COALESCE(SUM(u.cache_read_tokens), 0) cache_read_tokens, \
      COALESCE(SUM(u.cache_write_tokens), 0) cache_write_tokens, \
-     COALESCE(SUM(u.output_tokens), 0) output_tokens \
+     COALESCE(SUM(u.output_tokens), 0) output_tokens, \
+     COALESCE(SUM(u.cost_nanodollars), 0) cost_nanodollars, \
+     COALESCE(SUM(CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END), 0) unpriced \
      FROM gateway_requests r \
      JOIN gateway_keys k ON k.id = r.key_id \
      LEFT JOIN gateway_usage u ON u.request_id = r.id \
@@ -96,7 +101,8 @@ const BREAKDOWN_SQL: &str = "SELECT {column} label, COUNT(*) requests, \
      COALESCE(SUM(u.input_tokens), 0) + \
      COALESCE(SUM(u.cache_read_tokens), 0) + \
      COALESCE(SUM(u.cache_write_tokens), 0) + \
-     COALESCE(SUM(u.output_tokens), 0) tokens \
+     COALESCE(SUM(u.output_tokens), 0) tokens, \
+     COALESCE(SUM(u.cost_nanodollars), 0) cost_nanodollars \
      FROM gateway_requests r \
      JOIN gateway_keys k ON k.id = r.key_id \
      LEFT JOIN gateway_usage u ON u.request_id = r.id \
@@ -359,6 +365,73 @@ mod tests {
             1020,
             "the cached tokens the Responses API reports inside input_tokens must not be added twice"
         );
+    }
+
+    #[tokio::test]
+    async fn cost_sums_across_totals_and_breakdowns() {
+        let (store, user) = fixture().await;
+        for (id, cost) in [("r-hour", 1_500_000_i64), ("r-days", 2_500_000)] {
+            store
+                .database
+                .execute_unprepared(&format!(
+                    "UPDATE gateway_usage SET cost_nanodollars = {cost}, cost_source = 'calculated' WHERE request_id = '{id}'"
+                ))
+                .await
+                .unwrap();
+        }
+
+        let totals = store.totals(user, Range::Week).await.unwrap();
+        assert_eq!(totals.cost_nanodollars, 4_000_000);
+        assert_eq!(totals.unpriced, 0, "both requests in range carry a cost");
+
+        let month = store.totals(user, Range::Month).await.unwrap();
+        assert_eq!(
+            month.cost_nanodollars, 4_000_000,
+            "the unpriced request adds nothing"
+        );
+        assert_eq!(month.unpriced, 1);
+
+        let models = store.by_model(user, Range::Month).await.unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|row| (row.label.clone(), row.cost_nanodollars))
+                .collect::<Vec<_>>(),
+            vec![(Some("opus".to_owned()), 4_000_000), (None, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_traffic_is_priced_when_the_migration_runs() {
+        let (store, user) = fixture().await;
+        store
+            .database
+            .execute_unprepared(
+                "UPDATE gateway_requests SET requested_model = 'claude-sonnet-4-5' WHERE id = 'r-hour'",
+            )
+            .await
+            .unwrap();
+        let usage = crate::providers::Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(1_000),
+            cache_write_tokens: Some(200),
+            reasoning_tokens: None,
+            raw_json: None,
+        };
+        let cost = crate::pricing::cost(Some("claude-sonnet-4-5"), &usage);
+        let nanodollars = cost.nanodollars.expect("a current model is priced");
+        store
+            .database
+            .execute_unprepared(&format!(
+                "UPDATE gateway_usage SET cost_nanodollars = {nanodollars}, cost_source = 'calculated' WHERE request_id = 'r-hour'"
+            ))
+            .await
+            .unwrap();
+
+        let totals = store.totals(user, Range::Day).await.unwrap();
+        assert_eq!(totals.cost_nanodollars, nanodollars);
+        assert!(totals.cost_nanodollars > 0);
     }
 
     #[tokio::test]

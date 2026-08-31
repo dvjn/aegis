@@ -22,6 +22,41 @@ pub struct Config {
     pub smtp: Option<SmtpSettings>,
     pub auth: AuthConfig,
     pub oauth: OAuthConfig,
+    pub pricing: PricingConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PricingConfig {
+    #[serde(default = "default_pricing_url")]
+    pub url: String,
+    #[serde(default = "default_pricing_refresh_hours")]
+    pub refresh_hours: u64,
+    #[serde(default = "default_pricing_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub overrides: Vec<PriceOverride>,
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        Self {
+            url: default_pricing_url(),
+            refresh_hours: default_pricing_refresh_hours(),
+            enabled: default_pricing_enabled(),
+            overrides: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PriceOverride {
+    pub model: String,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub cache_read_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,6 +103,8 @@ struct FileConfig {
     public_url: Option<String>,
     #[serde(default)]
     registration_enabled: bool,
+    #[serde(default)]
+    pricing: PricingConfig,
 }
 
 impl Default for FileConfig {
@@ -79,6 +116,7 @@ impl Default for FileConfig {
             providers: default_providers(),
             public_url: None,
             registration_enabled: false,
+            pricing: PricingConfig::default(),
         }
     }
 }
@@ -115,6 +153,23 @@ impl Config {
 
         let providers = file.providers;
         validate_providers(&providers)?;
+
+        let mut pricing = file.pricing;
+        if let Some(url) = optional_var("PRICING_URL")? {
+            pricing.url = url;
+        }
+        if let Some(hours) = optional_var("PRICING_REFRESH_HOURS")? {
+            pricing.refresh_hours = hours
+                .parse()
+                .context("PRICING_REFRESH_HOURS must be a positive integer")?;
+        }
+        if let Some(enabled) = optional_var("PRICING_ENABLED")? {
+            pricing.enabled = enabled
+                .parse()
+                .context("PRICING_ENABLED must be true or false")?;
+        }
+        validate_pricing(&pricing)?;
+
         let smtp = smtp_config()?;
         let root_key = root_key()?;
         Ok(Self {
@@ -138,6 +193,7 @@ impl Config {
                 hmac_key: derive_key(&root_key, b"aegis/v1/oauth-hmac"),
                 key_id: "v1".into(),
             },
+            pricing,
         })
     }
 }
@@ -271,6 +327,19 @@ fn default_codex_base_url() -> String {
     "https://chatgpt.com/backend-api/codex".into()
 }
 
+fn default_pricing_url() -> String {
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        .into()
+}
+
+fn default_pricing_refresh_hours() -> u64 {
+    12
+}
+
+fn default_pricing_enabled() -> bool {
+    true
+}
+
 fn default_providers() -> Vec<ProviderConfig> {
     vec![
         ProviderConfig {
@@ -318,6 +387,17 @@ fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
     Ok(())
 }
 
+fn validate_pricing(pricing: &PricingConfig) -> Result<()> {
+    let url = url::Url::parse(&pricing.url).context("pricing url is not a valid URL")?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        bail!("pricing url must use https and include a host");
+    }
+    if pricing.refresh_hours < 1 {
+        bail!("pricing refresh_hours must be at least 1");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +430,60 @@ mod tests {
         assert_eq!(config.http_addr, default_http_addr());
         assert_eq!(config.database_url, default_database_url());
         assert_eq!(config.providers.len(), 2);
+    }
+
+    #[test]
+    fn parses_a_pricing_block_with_overrides() {
+        let config: FileConfig = toml::from_str(
+            r#"
+            [pricing]
+            url = "https://example.invalid/prices.json"
+            refresh_hours = 6
+            enabled = false
+
+            [[pricing.overrides]]
+            model = "claude-opus-4-5"
+            input_per_mtok = 5.0
+            output_per_mtok = 25.0
+            cache_read_per_mtok = 0.5
+            "#,
+        )
+        .expect("configuration should parse");
+        validate_pricing(&config.pricing).expect("pricing should be valid");
+        assert_eq!(config.pricing.url, "https://example.invalid/prices.json");
+        assert_eq!(config.pricing.refresh_hours, 6);
+        assert!(!config.pricing.enabled);
+        let [override_entry] = config.pricing.overrides.as_slice() else {
+            panic!("one override should parse");
+        };
+        assert_eq!(override_entry.model, "claude-opus-4-5");
+        assert_eq!(override_entry.cache_read_per_mtok, Some(0.5));
+        assert_eq!(override_entry.cache_write_per_mtok, None);
+    }
+
+    #[test]
+    fn pricing_falls_back_to_defaults_when_the_section_is_absent() {
+        let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
+        assert_eq!(config.pricing.url, default_pricing_url());
+        assert_eq!(config.pricing.refresh_hours, 12);
+        assert!(config.pricing.enabled);
+        assert!(config.pricing.overrides.is_empty());
+        validate_pricing(&config.pricing).expect("defaults should be valid");
+    }
+
+    #[test]
+    fn pricing_rejects_a_plaintext_url_and_a_zero_refresh_interval() {
+        let plaintext = PricingConfig {
+            url: "http://example.invalid/prices.json".into(),
+            ..PricingConfig::default()
+        };
+        assert!(validate_pricing(&plaintext).is_err());
+
+        let never_refreshed = PricingConfig {
+            refresh_hours: 0,
+            ..PricingConfig::default()
+        };
+        assert!(validate_pricing(&never_refreshed).is_err());
     }
 
     #[test]

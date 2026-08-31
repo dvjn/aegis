@@ -31,10 +31,11 @@ pub fn page(
                             token_text(totals.output_tokens)
                         )),
                     ))
+                    (tile("Cost", &money_text(totals.cost_nanodollars), Some(&cost_note(totals))))
                 }
                 div class="account-grid account-grid-even" {
-                    (breakdown_card("Models", "Requests and tokens by the model each request asked for.", "Model", models))
-                    (breakdown_card("Providers", "Requests and tokens by the provider account that served them.", "Provider", providers))
+                    (breakdown_card("Models", "Requests, tokens, and cost by the model each request asked for.", "Model", models))
+                    (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", providers))
                 }
             }
         },
@@ -69,6 +70,14 @@ fn outcome_text(totals: &UsageTotals) -> String {
     parts.join(" · ")
 }
 
+fn cost_note(totals: &UsageTotals) -> String {
+    let mut note = "estimated".to_owned();
+    if totals.unpriced > 0 {
+        note.push_str(&format!(" · {} unpriced", count_text(totals.unpriced)));
+    }
+    note
+}
+
 fn tile(label: &str, value: &str, note: Option<&str>) -> Markup {
     html! {
         article class="tile" {
@@ -93,11 +102,12 @@ fn breakdown_card(title: &str, blurb: &str, column: &str, rows: &[UsageGroup]) -
                             th scope="col" { (column) }
                             th scope="col" class="col-numeric" { "Requests" }
                             th scope="col" class="col-numeric" { "Tokens" }
+                            th scope="col" class="col-numeric" { "Cost" }
                         }
                     }
                     tbody {
                         @if rows.is_empty() {
-                            tr { td colspan="3" class="table-empty" { "No traffic in this range." } }
+                            tr { td colspan="4" class="table-empty" { "No traffic in this range." } }
                         }
                         @for row in rows {
                             tr {
@@ -109,6 +119,7 @@ fn breakdown_card(title: &str, blurb: &str, column: &str, rows: &[UsageGroup]) -
                                 }
                                 td class="col-numeric" { (count_text(row.requests)) }
                                 td class="col-numeric" { (token_text(row.tokens)) }
+                                td class="col-numeric" { (money_text(row.cost_nanodollars)) }
                             }
                         }
                     }
@@ -134,6 +145,19 @@ fn count_text(value: i64) -> String {
     }
 }
 
+fn money_text(nanodollars: i64) -> String {
+    const NANODOLLARS_PER_CENT: i64 = 10_000_000;
+    let dollars = nanodollars as f64 / crate::pricing::NANODOLLARS_PER_DOLLAR;
+    if nanodollars == 0 {
+        "$0.00".to_owned()
+    } else if nanodollars.abs() < NANODOLLARS_PER_CENT {
+        format!("${dollars:.4}")
+    } else {
+        let cents = (dollars * 100.0).round() as i64;
+        format!("${}.{:02}", count_text(cents / 100), (cents % 100).abs())
+    }
+}
+
 fn token_text(value: i64) -> String {
     match value {
         0 => "0".to_owned(),
@@ -145,7 +169,7 @@ fn token_text(value: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_text, token_text};
+    use super::{count_text, money_text, token_text};
 
     #[test]
     fn numbers_read_as_summaries() {
@@ -160,6 +184,20 @@ mod tests {
             (4_200_000, "4.2M"),
         ] {
             assert_eq!(token_text(value), expected, "tokens {value}");
+        }
+    }
+
+    #[test]
+    fn money_keeps_fractions_of_a_cent_visible() {
+        for (nanodollars, expected) in [
+            (0, "$0.00"),
+            (1_000, "$0.0000"),
+            (4_700_000, "$0.0047"),
+            (10_000_000, "$0.01"),
+            (39_139_738_410, "$39.14"),
+            (1_234_567_890_000, "$1,234.57"),
+        ] {
+            assert_eq!(money_text(nanodollars), expected, "cost {nanodollars}");
         }
     }
 }
