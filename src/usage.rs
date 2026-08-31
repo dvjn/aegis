@@ -323,6 +323,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_cached_tokens_are_counted_once() {
+        use crate::providers::{Provider, extract_usage};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = Uuid::now_v7();
+        db.execute_unprepared(&format!("INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('{user}','codex@example.com','codex@example.com','user','active',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")).await.unwrap();
+        db.execute_unprepared(&format!("INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at) VALUES('{KEY}','{user}','agent','[\"codex\"]','2026-01-01T00:00:00Z')")).await.unwrap();
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        db.execute_unprepared(&format!(
+            "INSERT INTO gateway_requests(id,request_id,provider,protocol,method,endpoint,requested_model,started_at,request_bytes,response_bytes,client_disconnected,key_id) \
+             VALUES('r-codex','r-codex','codex','openai_responses','POST','/providers/codex/v1/responses','gpt','{now}',0,0,FALSE,'{KEY}')"
+        ))
+        .await
+        .unwrap();
+
+        let usage = extract_usage(
+            Provider::Codex,
+            br#"{"usage":{"input_tokens":1000,"output_tokens":20,"input_tokens_details":{"cached_tokens":400}}}"#,
+        );
+        db.execute_unprepared(&format!(
+            "INSERT INTO gateway_usage(request_id,input_tokens,output_tokens,cache_read_tokens) \
+             VALUES('r-codex',{},{},{})",
+            usage.input_tokens.unwrap(),
+            usage.output_tokens.unwrap(),
+            usage.cache_read_tokens.unwrap()
+        ))
+        .await
+        .unwrap();
+
+        let totals = UsageStore::new(db).totals(user, Range::Day).await.unwrap();
+        assert_eq!(
+            totals.tokens(),
+            1020,
+            "the cached tokens the Responses API reports inside input_tokens must not be added twice"
+        );
+    }
+
+    #[tokio::test]
     async fn traffic_of_another_user_is_not_counted() {
         let (store, _) = fixture().await;
         let stranger = Uuid::now_v7();
