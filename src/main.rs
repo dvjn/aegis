@@ -133,7 +133,12 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
     .context("failed to construct gateway")?;
     let cancellation = CancellationToken::new();
     match pricing::load_effective_map(&database, &config.pricing).await {
-        Ok(map) => pricing::install(map),
+        Ok(map) => {
+            pricing::install(map.clone());
+            if let Err(error) = pricing::backfill_costs(&database, &map).await {
+                tracing::warn!(%error, "failed to backfill historical request costs");
+            }
+        }
         Err(error) => tracing::warn!(%error, "failed to load stored model prices"),
     }
     pricing::spawn_refresh(database.clone(), config.pricing, cancellation.clone());

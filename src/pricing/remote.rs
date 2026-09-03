@@ -97,7 +97,11 @@ async fn refresh_once(
     )
     .await?;
     let models = candidate.model_count();
-    install(candidate.with_overrides(&pricing.overrides));
+    let effective = candidate.with_overrides(&pricing.overrides);
+    install(effective.clone());
+    if let Err(error) = super::backfill_costs(database, &effective).await {
+        tracing::warn!(%error, "failed to backfill historical request costs");
+    }
     tracing::info!(models, "adopted fetched model prices");
     Ok(())
 }
