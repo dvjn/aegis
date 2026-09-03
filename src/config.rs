@@ -328,8 +328,7 @@ fn default_codex_base_url() -> String {
 }
 
 fn default_pricing_url() -> String {
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-        .into()
+    "https://raw.githubusercontent.com/dvjn/aegis/main/src/pricing/model_prices.json".into()
 }
 
 fn default_pricing_refresh_hours() -> u64 {
@@ -464,7 +463,10 @@ mod tests {
     #[test]
     fn pricing_falls_back_to_defaults_when_the_section_is_absent() {
         let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
-        assert_eq!(config.pricing.url, default_pricing_url());
+        assert_eq!(
+            config.pricing.url,
+            "https://raw.githubusercontent.com/dvjn/aegis/main/src/pricing/model_prices.json"
+        );
         assert_eq!(config.pricing.refresh_hours, 12);
         assert!(config.pricing.enabled);
         assert!(config.pricing.overrides.is_empty());

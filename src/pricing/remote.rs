@@ -2,7 +2,6 @@ use super::{ModelPrice, PriceMap, install, store};
 use crate::{config::PricingConfig, gateway::webpki_roots_tls_config};
 use anyhow::{Context, Result, bail};
 use sea_orm::DatabaseConnection;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -73,7 +72,7 @@ async fn refresh_once(
         return Ok(());
     };
 
-    let candidate = prune(&fetched.body).context("upstream model prices could not be pruned")?;
+    let candidate = parse(&fetched.body).context("remote model prices could not be parsed")?;
     let current = super::active_map();
     if let Some(reason) = adoption_rejection(&candidate, &current) {
         tracing::warn!(
@@ -141,39 +140,8 @@ async fn fetch(
     Ok(Some(FetchedBody { body, etag }))
 }
 
-fn prune(body: &[u8]) -> Result<PriceMap> {
-    let Value::Object(upstream) = serde_json::from_slice(body)? else {
-        bail!("upstream prices are not a JSON object");
-    };
-    let mut models = HashMap::new();
-    for (model, entry) in upstream {
-        let Value::Object(entry) = entry else {
-            continue;
-        };
-        let provider = entry.get("litellm_provider").and_then(Value::as_str);
-        if !matches!(provider, Some("anthropic" | "openai")) {
-            continue;
-        }
-        let Some(input) = entry.get("input_cost_per_token").and_then(Value::as_f64) else {
-            continue;
-        };
-        models.insert(
-            model,
-            ModelPrice {
-                input,
-                output: entry
-                    .get("output_cost_per_token")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-                cache_read: entry
-                    .get("cache_read_input_token_cost")
-                    .and_then(Value::as_f64),
-                cache_write: entry
-                    .get("cache_creation_input_token_cost")
-                    .and_then(Value::as_f64),
-            },
-        );
-    }
+fn parse(body: &[u8]) -> Result<PriceMap> {
+    let models: HashMap<String, ModelPrice> = serde_json::from_slice(body)?;
     Ok(PriceMap { models })
 }
 
@@ -203,28 +171,16 @@ fn adoption_rejection(candidate: &PriceMap, current: &PriceMap) -> Option<String
 mod tests {
     use super::*;
 
-    const UPSTREAM: &str = r#"{
+    const CURATED: &str = r#"{
         "claude-sonnet-4-5": {
-            "litellm_provider": "anthropic",
-            "input_cost_per_token": 3e-06,
-            "output_cost_per_token": 1.5e-05,
-            "cache_read_input_token_cost": 3e-07,
-            "cache_creation_input_token_cost": 3.75e-06
+            "input": 3e-06,
+            "output": 1.5e-05,
+            "cache_read": 3e-07,
+            "cache_write": 3.75e-06
         },
         "gpt-4o-mini-tts": {
-            "litellm_provider": "openai",
-            "input_cost_per_token": 0.0000006,
-            "output_cost_per_token": 0.000012
-        },
-        "sample_spec": "this entry is a string, not an object",
-        "gemini-3-pro": {
-            "litellm_provider": "vertex_ai-language-models",
-            "input_cost_per_token": 1e-06,
-            "output_cost_per_token": 2e-06
-        },
-        "whisper-1": {
-            "litellm_provider": "openai",
-            "output_cost_per_token": 0.0001
+            "input": 0.0000006,
+            "output": 0.000012
         }
     }"#;
 
@@ -264,29 +220,27 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_the_metered_anthropic_and_openai_models_only() {
-        let pruned = prune(UPSTREAM.as_bytes()).expect("upstream sample should prune");
-        assert_eq!(pruned.model_count(), 2);
+    fn parsing_reads_the_curated_price_map() {
+        let parsed = parse(CURATED.as_bytes()).expect("curated sample should parse");
+        assert_eq!(parsed.model_count(), 2);
 
-        let sonnet = pruned.price("claude-sonnet-4-5").expect("kept");
+        let sonnet = parsed.price("claude-sonnet-4-5").expect("present");
         assert_eq!(sonnet.input, 3e-06);
         assert_eq!(sonnet.output, 1.5e-05);
         assert_eq!(sonnet.cache_read, Some(3e-07));
         assert_eq!(sonnet.cache_write, Some(3.75e-06));
 
-        let tts = pruned.price("gpt-4o-mini-tts").expect("kept");
+        let tts = parsed.price("gpt-4o-mini-tts").expect("present");
         assert_eq!(tts.input, 6e-07);
         assert_eq!(tts.cache_read, None);
         assert_eq!(tts.cache_write, None);
-
-        assert_eq!(pruned.price("gemini-3-pro"), None);
-        assert_eq!(pruned.price("whisper-1"), None);
     }
 
     #[test]
-    fn a_body_that_is_not_a_json_object_does_not_prune() {
-        assert!(prune(b"[1, 2, 3]").is_err());
-        assert!(prune(b"not json at all").is_err());
+    fn an_invalid_curated_price_map_is_rejected() {
+        assert!(parse(b"[1, 2, 3]").is_err());
+        assert!(parse(b"{\"model\": {\"input\": 0.1}}").is_err());
+        assert!(parse(b"not json at all").is_err());
     }
 
     #[test]
