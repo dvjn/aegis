@@ -1,9 +1,18 @@
 use super::{ModelPrice, PriceMap};
 use crate::config::PricingConfig;
+use crate::providers::Usage;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use std::collections::HashMap;
+
+const BACKFILL_BATCH_SIZE: u64 = 500;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct BackfillStats {
+    pub scanned: u64,
+    pub updated: u64,
+}
 
 pub async fn load_effective_map(
     database: &DatabaseConnection,
@@ -101,6 +110,81 @@ pub async fn latest_etag(database: &DatabaseConnection) -> Result<Option<String>
     }
 }
 
+pub async fn backfill_unknown_costs(
+    database: &DatabaseConnection,
+    map: &PriceMap,
+) -> Result<BackfillStats> {
+    let mut stats = BackfillStats {
+        scanned: 0,
+        updated: 0,
+    };
+    let mut cursor = String::new();
+
+    loop {
+        let rows = database
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT u.request_id, r.requested_model, u.input_tokens, u.output_tokens, \
+                     u.cache_read_tokens, u.cache_write_tokens \
+                     FROM gateway_usage u JOIN gateway_requests r ON r.id = u.request_id \
+                     WHERE u.cost_nanodollars IS NULL \
+                     AND (u.cost_source IS NULL OR u.cost_source = 'unknown') \
+                     AND u.request_id > ? ORDER BY u.request_id LIMIT {BACKFILL_BATCH_SIZE}"
+                ),
+                [cursor.clone().into()],
+            ))
+            .await
+            .context("failed to read unpriced request usage")?;
+        if rows.is_empty() {
+            break;
+        }
+
+        stats.scanned += rows.len() as u64;
+        cursor = rows
+            .last()
+            .expect("a non-empty batch has a final row")
+            .try_get("", "request_id")?;
+
+        let mut updates = Vec::new();
+        for row in rows {
+            let request_id: String = row.try_get("", "request_id")?;
+            let model: Option<String> = row.try_get("", "requested_model")?;
+            let usage = Usage {
+                input_tokens: row.try_get("", "input_tokens")?,
+                output_tokens: row.try_get("", "output_tokens")?,
+                cache_read_tokens: row.try_get("", "cache_read_tokens")?,
+                cache_write_tokens: row.try_get("", "cache_write_tokens")?,
+                reasoning_tokens: None,
+                raw_json: None,
+            };
+            if let Some(cost) = map.cost(model.as_deref(), &usage).nanodollars {
+                updates.push((request_id, cost));
+            }
+        }
+        if updates.is_empty() {
+            continue;
+        }
+
+        let transaction = database.begin().await?;
+        for (request_id, cost) in updates {
+            let result = transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE gateway_usage SET cost_nanodollars = ?, cost_source = 'calculated' \
+                     WHERE request_id = ? AND cost_nanodollars IS NULL \
+                     AND (cost_source IS NULL OR cost_source = 'unknown')",
+                    [cost.into(), request_id.into()],
+                ))
+                .await?;
+            stats.updated += result.rows_affected();
+        }
+        transaction.commit().await?;
+    }
+
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +271,118 @@ mod tests {
             .expect("read")
             .expect("a stored snapshot exists");
         assert_eq!(loaded, replacement);
+    }
+
+    async fn insert_usage(
+        database: &DatabaseConnection,
+        id: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        cost: Option<i64>,
+        source: &str,
+    ) {
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO gateway_requests \
+                 (id, request_id, provider, protocol, method, endpoint, requested_model, \
+                  started_at, request_bytes, response_bytes, client_disconnected) \
+                 VALUES (?, ?, 'claude', 'anthropic_messages', 'POST', '/v1/messages', ?, \
+                         '2026-09-01T00:00:00Z', 0, 0, FALSE)",
+                [id.into(), id.into(), model.into()],
+            ))
+            .await
+            .expect("request should insert");
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO gateway_usage \
+                 (request_id, input_tokens, output_tokens, cost_nanodollars, cost_source) \
+                 VALUES (?, ?, ?, ?, ?)",
+                [
+                    id.into(),
+                    input.into(),
+                    output.into(),
+                    cost.into(),
+                    source.into(),
+                ],
+            ))
+            .await
+            .expect("usage should insert");
+    }
+
+    #[tokio::test]
+    async fn backfill_prices_only_requests_that_are_still_unknown() {
+        let database = database().await;
+        insert_usage(
+            &database,
+            "a",
+            "provider/claude-new-20260903",
+            100,
+            10,
+            None,
+            "unknown",
+        )
+        .await;
+        insert_usage(&database, "b", "still-unknown", 100, 10, None, "unknown").await;
+        insert_usage(&database, "c", "claude-new", 100, 10, Some(7), "calculated").await;
+
+        let map = PriceMap {
+            models: HashMap::from([(
+                "claude-new".to_owned(),
+                ModelPrice {
+                    input: 1e-6,
+                    output: 2e-6,
+                    cache_read: None,
+                    cache_write: None,
+                },
+            )]),
+        };
+        assert_eq!(
+            backfill_unknown_costs(&database, &map)
+                .await
+                .expect("backfill should succeed"),
+            BackfillStats {
+                scanned: 2,
+                updated: 1,
+            }
+        );
+
+        let rows = database
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT request_id, cost_nanodollars, cost_source FROM gateway_usage ORDER BY request_id",
+            ))
+            .await
+            .expect("costs should load");
+        let costs: Vec<(String, Option<i64>, Option<String>)> = rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("", "request_id")?,
+                    row.try_get("", "cost_nanodollars")?,
+                    row.try_get("", "cost_source")?,
+                ))
+            })
+            .collect::<Result<_>>()
+            .expect("cost rows should decode");
+        assert_eq!(
+            costs,
+            vec![
+                ("a".to_owned(), Some(120_000), Some("calculated".to_owned())),
+                ("b".to_owned(), None, Some("unknown".to_owned())),
+                ("c".to_owned(), Some(7), Some("calculated".to_owned())),
+            ]
+        );
+        assert_eq!(
+            backfill_unknown_costs(&database, &map)
+                .await
+                .expect("repeat backfill should succeed"),
+            BackfillStats {
+                scanned: 1,
+                updated: 0,
+            }
+        );
     }
 }

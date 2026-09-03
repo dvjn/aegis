@@ -109,6 +109,33 @@ impl PriceMap {
         }
         None
     }
+
+    fn cost(&self, model: Option<&str>, usage: &Usage) -> Cost {
+        calculate_cost(model.and_then(|model| self.price(model)), usage)
+    }
+}
+
+fn calculate_cost(price: Option<ModelPrice>, usage: &Usage) -> Cost {
+    let Some(price) = price else {
+        return Cost::unknown();
+    };
+    let input = usage.input_tokens.unwrap_or(0);
+    let cache_read = usage.cache_read_tokens.unwrap_or(0);
+    let cache_write = usage.cache_write_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    if input == 0 && cache_read == 0 && cache_write == 0 && output == 0 {
+        return Cost::unknown();
+    }
+
+    let dollars = input as f64 * price.input
+        + cache_read as f64 * price.cache_read.unwrap_or(price.input)
+        + cache_write as f64 * price.cache_write.unwrap_or(0.0)
+        + output as f64 * price.output;
+
+    Cost {
+        nanodollars: Some((dollars * NANODOLLARS_PER_DOLLAR).round() as i64),
+        source: CostSource::Calculated,
+    }
 }
 
 fn active() -> &'static RwLock<Arc<PriceMap>> {
@@ -135,27 +162,29 @@ fn strip_release_date(model: &str) -> Option<&str> {
 }
 
 pub fn cost(model: Option<&str>, usage: &Usage) -> Cost {
-    let Some(price) = model.and_then(price) else {
-        return Cost::unknown();
-    };
+    calculate_cost(model.and_then(price), usage)
+}
 
-    let input = usage.input_tokens.unwrap_or(0);
-    let cache_read = usage.cache_read_tokens.unwrap_or(0);
-    let cache_write = usage.cache_write_tokens.unwrap_or(0);
-    let output = usage.output_tokens.unwrap_or(0);
-    if input == 0 && cache_read == 0 && cache_write == 0 && output == 0 {
-        return Cost::unknown();
+pub async fn backfill_costs(
+    database: &sea_orm::DatabaseConnection,
+    map: &PriceMap,
+) -> anyhow::Result<()> {
+    let stats = store::backfill_unknown_costs(database, map).await?;
+    if stats.updated > 0 {
+        tracing::info!(
+            scanned = stats.scanned,
+            updated = stats.updated,
+            still_unpriced = stats.scanned - stats.updated,
+            "backfilled historical request costs"
+        );
+    } else {
+        tracing::debug!(
+            scanned = stats.scanned,
+            still_unpriced = stats.scanned,
+            "historical request costs need no backfill"
+        );
     }
-
-    let dollars = input as f64 * price.input
-        + cache_read as f64 * price.cache_read.unwrap_or(price.input)
-        + cache_write as f64 * price.cache_write.unwrap_or(0.0)
-        + output as f64 * price.output;
-
-    Cost {
-        nanodollars: Some((dollars * NANODOLLARS_PER_DOLLAR).round() as i64),
-        source: CostSource::Calculated,
-    }
+    Ok(())
 }
 
 #[cfg(test)]
