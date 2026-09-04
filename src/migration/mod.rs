@@ -12,6 +12,7 @@ mod m20260901_000009_normalize_codex_input_tokens;
 mod m20260901_000010_gateway_usage_cost;
 mod m20260901_000011_model_prices;
 mod m20260905_000012_message_content_parts;
+mod m20260905_000013_background_jobs;
 
 pub struct Migrator;
 
@@ -31,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000010_gateway_usage_cost::Migration),
             Box::new(m20260901_000011_model_prices::Migration),
             Box::new(m20260905_000012_message_content_parts::Migration),
+            Box::new(m20260905_000013_background_jobs::Migration),
         ]
     }
 }
