@@ -12,6 +12,7 @@ mod mcp;
 mod migration;
 mod oauth;
 mod origin;
+mod payload_facts;
 mod pricing;
 mod providers;
 mod request_id;
