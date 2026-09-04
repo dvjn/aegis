@@ -183,6 +183,45 @@ impl UsageTotals {
     }
 }
 
+/// Request context composition, summed over the requests of the window.
+/// Sizes are the stored JSON bytes of each part; tokens are estimated at read
+/// time and never stored.
+// TODO: the overview UI does not read this yet; drop the allows once it does.
+#[allow(dead_code)]
+#[derive(Debug, Default, PartialEq, Eq, FromQueryResult, Serialize)]
+pub struct ContextTotals {
+    pub requests: i64,
+    pub tool_definition_bytes: i64,
+    pub system_bytes: i64,
+    pub user_text_bytes: i64,
+    pub assistant_text_bytes: i64,
+    pub thinking_bytes: i64,
+    pub tool_use_bytes: i64,
+    pub tool_result_bytes: i64,
+    pub other_bytes: i64,
+    pub total_bytes: i64,
+    pub tools_offered: i64,
+    pub tools_invoked: i64,
+    pub tool_result_errors: i64,
+    pub cache_breakpoints: i64,
+}
+
+/// Measured over this gateway's captured traffic: stored request bytes divided
+/// by the input tokens the providers reported.
+#[allow(dead_code)]
+const BYTES_PER_TOKEN: f64 = 3.529;
+
+#[allow(dead_code)]
+impl ContextTotals {
+    pub fn tool_bytes(&self) -> i64 {
+        self.tool_definition_bytes + self.tool_use_bytes + self.tool_result_bytes
+    }
+
+    pub fn estimated_tokens(bytes: i64) -> i64 {
+        (bytes as f64 / BYTES_PER_TOKEN).round() as i64
+    }
+}
+
 #[derive(Debug, FromQueryResult, Serialize)]
 pub struct UsageGroup {
     pub label: Option<String>,
@@ -253,6 +292,26 @@ const TOTALS_SQL: &str = "SELECT COUNT(*) requests, \
      COALESCE(SUM(CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END), 0) unpriced \
      {from}";
 
+#[allow(dead_code)]
+const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
+     COALESCE(SUM(m.tool_definition_bytes), 0) tool_definition_bytes, \
+     COALESCE(SUM(m.system_bytes), 0) system_bytes, \
+     COALESCE(SUM(m.user_text_bytes), 0) user_text_bytes, \
+     COALESCE(SUM(m.assistant_text_bytes), 0) assistant_text_bytes, \
+     COALESCE(SUM(m.thinking_bytes), 0) thinking_bytes, \
+     COALESCE(SUM(m.tool_use_bytes), 0) tool_use_bytes, \
+     COALESCE(SUM(m.tool_result_bytes), 0) tool_result_bytes, \
+     COALESCE(SUM(m.other_bytes), 0) other_bytes, \
+     COALESCE(SUM(m.total_bytes), 0) total_bytes, \
+     COALESCE(SUM(m.tools_offered), 0) tools_offered, \
+     COALESCE(SUM(m.tools_invoked), 0) tools_invoked, \
+     COALESCE(SUM(m.tool_result_errors), 0) tool_result_errors, \
+     COALESCE(SUM(m.cache_breakpoints), 0) cache_breakpoints \
+     FROM gateway_requests r \
+     JOIN gateway_keys k ON k.id = r.key_id \
+     JOIN gateway_request_metrics m ON m.request_id = r.id \
+     WHERE k.user_id = ? AND r.started_at >= ? AND r.started_at <= ?";
+
 const BREAKDOWN_SQL: &str = "SELECT {column} label, COUNT(*) requests, \
      {tokens} tokens, \
      COALESCE(SUM(u.cost_nanodollars), 0) cost_nanodollars \
@@ -291,6 +350,20 @@ impl UsageStore {
         let sql = render_sql(TOTALS_SQL, "", window.bucket);
         Ok(
             UsageTotals::find_by_statement(self.statement(&sql, user_id, window))
+                .one(&self.database)
+                .await?
+                .unwrap_or_default(),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub async fn context(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<ContextTotals, sea_orm::DbErr> {
+        Ok(
+            ContextTotals::find_by_statement(self.statement(CONTEXT_SQL, user_id, window))
                 .one(&self.database)
                 .await?
                 .unwrap_or_default(),
@@ -1107,6 +1180,68 @@ mod tests {
             series.requests,
             vec![0; 11],
             "an empty window still has every bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_totals_sum_the_metrics_of_the_window_for_one_user() {
+        let (db, user) = empty_store("user@example.com").await;
+        let other = Uuid::now_v7();
+        db.execute_unprepared(&format!("INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('{other}','o@example.com','o@example.com','user','active',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")).await.unwrap();
+        db.execute_unprepared(&format!("INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at) VALUES('key-2','{other}','agent','[\"claude\"]','2026-01-01T00:00:00Z')")).await.unwrap();
+        let metrics = |id: &str, key: &str, started_at: &str, tools: i64, errors: i64| {
+            let db = db.clone();
+            let statement = format!(
+                "INSERT INTO gateway_requests(id,request_id,provider,protocol,method,endpoint,started_at,request_bytes,response_bytes,client_disconnected,key_id) \
+                 VALUES('{id}','{id}','claude','anthropic_messages','POST','/v1/messages','{started_at}',0,0,FALSE,'{key}'); \
+                 INSERT INTO gateway_request_metrics(request_id,tool_definition_bytes,system_bytes,user_text_bytes,assistant_text_bytes,thinking_bytes,tool_use_bytes,tool_result_bytes,other_bytes,total_bytes,tools_offered,tools_invoked,tool_result_errors,cache_breakpoints,created_at) \
+                 VALUES('{id}',100,20,30,40,5,10,60,1,266,{tools},2,{errors},3,'{started_at}')"
+            );
+            async move { db.execute_unprepared(&statement).await.unwrap() }
+        };
+        metrics("in-1", KEY, "2026-03-02T10:00:00.000Z", 7, 1).await;
+        metrics("in-2", KEY, "2026-03-03T10:00:00.000Z", 8, 0).await;
+        metrics("before", KEY, "2026-02-27T10:00:00.000Z", 9, 4).await;
+        metrics("theirs", "key-2", "2026-03-02T11:00:00.000Z", 9, 4).await;
+
+        let store = UsageStore::new(db);
+        let totals = store
+            .context(user, daily("2026-03-01", "2026-03-03"))
+            .await
+            .unwrap();
+        assert_eq!(
+            totals,
+            ContextTotals {
+                requests: 2,
+                tool_definition_bytes: 200,
+                system_bytes: 40,
+                user_text_bytes: 60,
+                assistant_text_bytes: 80,
+                thinking_bytes: 10,
+                tool_use_bytes: 20,
+                tool_result_bytes: 120,
+                other_bytes: 2,
+                total_bytes: 532,
+                tools_offered: 15,
+                tools_invoked: 4,
+                tool_result_errors: 1,
+                cache_breakpoints: 6,
+            }
+        );
+        assert_eq!(totals.tool_bytes(), 340);
+        assert_eq!(ContextTotals::estimated_tokens(3529), 1000);
+
+        let theirs = store
+            .context(other, daily("2026-03-01", "2026-03-03"))
+            .await
+            .unwrap();
+        assert_eq!(theirs.requests, 1);
+        assert_eq!(
+            store
+                .context(user, daily("2026-04-01", "2026-04-03"))
+                .await
+                .unwrap(),
+            ContextTotals::default()
         );
     }
 }
