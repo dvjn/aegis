@@ -1,4 +1,5 @@
 use crate::{
+    compression::{decode_body, decode_brotli_unsniffable},
     pricing::Cost,
     providers::{Provider, Usage},
 };
@@ -85,8 +86,15 @@ pub(crate) struct SemanticPayload {
     pub parts: Vec<SemanticPart>,
 }
 
+fn parse_body(body: &[u8]) -> Option<serde_json::Value> {
+    if let Ok(root) = serde_json::from_slice(&decode_body(body)) {
+        return Some(root);
+    }
+    serde_json::from_slice(&decode_brotli_unsniffable(body)?).ok()
+}
+
 pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPayload> {
-    let mut root = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let mut root = parse_body(body)?;
     let object = root.as_object_mut()?;
     let paths: &[&'static str] = match protocol {
         "anthropic_messages" => &["system", "messages", "tools"],
@@ -381,6 +389,43 @@ mod tests {
 
     fn outcome(row: &(Option<String>, Option<String>)) -> (bool, bool) {
         (row.0.is_some(), row.1.is_some())
+    }
+
+    const REQUEST_BODY: &[u8] =
+        br#"{"model":"claude-x","system":"be brief","messages":[{"role":"user","content":"hi"}]}"#;
+
+    fn assert_split(body: &[u8]) {
+        let payload = split_request(body, "anthropic_messages").expect("the body must parse");
+        let paths: Vec<_> = payload.parts.iter().map(|part| part.path).collect();
+        assert_eq!(paths, ["system", "messages"]);
+        assert_eq!(payload.parts[1].role.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn splits_a_plain_json_body() {
+        assert_split(REQUEST_BODY);
+    }
+
+    #[test]
+    fn splits_a_gzip_compressed_body() {
+        assert_split(&crate::compression::tests::gzip(REQUEST_BODY));
+    }
+
+    #[test]
+    fn splits_a_zstd_compressed_body() {
+        assert_split(&zstd::encode_all(REQUEST_BODY, 0).unwrap());
+    }
+
+    #[test]
+    fn splits_a_brotli_compressed_body() {
+        assert_split(&crate::compression::tests::brotli(REQUEST_BODY));
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_in_any_encoding_falls_back_to_chunking() {
+        let body = b"not json, not compressed, not anything";
+        assert!(split_request(body, "anthropic_messages").is_none());
+        assert!(!chunk_payload(body).is_empty());
     }
 
     #[tokio::test]

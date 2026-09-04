@@ -1,6 +1,5 @@
-use flate2::read::GzDecoder;
+use crate::compression::{decode_body, decode_brotli_unsniffable};
 use serde_json::Value;
-use std::io::Read;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Provider {
@@ -36,8 +35,7 @@ pub fn requested_model(body: &[u8]) -> Option<String> {
 }
 
 pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
-    let decoded = decode_body(body);
-    let values = json_values(&decoded);
+    let values = decoded_json_values(body);
     let usage = values.iter().rev().find_map(find_usage);
     let Some(value) = usage else {
         return Usage::default();
@@ -76,16 +74,14 @@ pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
     }
 }
 
-fn decode_body(body: &[u8]) -> Vec<u8> {
-    if !body.starts_with(&[0x1f, 0x8b]) {
-        return body.to_vec();
+fn decoded_json_values(body: &[u8]) -> Vec<Value> {
+    let values = json_values(&decode_body(body));
+    if !values.is_empty() {
+        return values;
     }
-    let mut decoded = Vec::new();
-    if GzDecoder::new(body).read_to_end(&mut decoded).is_ok() {
-        decoded
-    } else {
-        body.to_vec()
-    }
+    decode_brotli_unsniffable(body)
+        .map(|decoded| json_values(&decoded))
+        .unwrap_or_default()
 }
 
 fn json_values(body: &[u8]) -> Vec<Value> {
@@ -139,20 +135,39 @@ data: {"type":"message_delta","usage":{"output_tokens":42,"input_tokens":10,"cac
         assert_eq!(usage.cache_read_tokens, Some(8));
     }
 
-    #[test]
-    fn extracts_gzip_compressed_anthropic_sse_usage() {
-        use flate2::{Compression, write::GzEncoder};
-        use std::io::Write;
-
-        let body = br#"event: message_delta
+    const SSE_BODY: &[u8] = br#"event: message_delta
 data: {"type":"message_delta","usage":{"output_tokens":42,"input_tokens":10}}
 
 "#;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(body).unwrap();
-        let usage = extract_usage(Provider::Anthropic, &encoder.finish().unwrap());
+
+    fn assert_sse_usage(body: &[u8]) {
+        let usage = extract_usage(Provider::Anthropic, body);
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(42));
+    }
+
+    #[test]
+    fn extracts_gzip_compressed_anthropic_sse_usage() {
+        assert_sse_usage(&crate::compression::tests::gzip(SSE_BODY));
+    }
+
+    #[test]
+    fn extracts_zstd_compressed_anthropic_sse_usage() {
+        assert_sse_usage(&zstd::encode_all(SSE_BODY, 0).unwrap());
+    }
+
+    #[test]
+    fn extracts_brotli_compressed_anthropic_sse_usage() {
+        assert_sse_usage(&crate::compression::tests::brotli(SSE_BODY));
+    }
+
+    #[test]
+    fn an_undecodable_body_yields_no_usage() {
+        assert!(
+            extract_usage(Provider::Anthropic, b"\x00not a body")
+                .raw_json
+                .is_none()
+        );
     }
 
     #[test]
