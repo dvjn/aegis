@@ -1,7 +1,7 @@
 use crate::{
     compression::decode_body,
     telemetry::{
-        SemanticPayload, StoredPart, StoredPayload, reassemble_request, split_request, timestamp,
+        SemanticPayload, StoredPart, StoredPayload, reassemble_request, split_request, store_blob,
     },
 };
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
@@ -165,26 +165,14 @@ async fn store_semantic(
 }
 
 async fn store(database: &impl ConnectionTrait, payload: StoredPayload) -> Result<String, DbErr> {
-    database
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
-            [
-                payload.id.clone().into(),
-                payload.body.into(),
-                payload.encoding.into(),
-                payload.original_bytes.into(),
-                timestamp().into(),
-            ],
-        ))
-        .await?;
+    store_blob(database, &payload).await?;
     Ok(payload.id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::Migrator;
+    use crate::{migration::Migrator, telemetry::timestamp};
     use sea_orm::{Database, DatabaseConnection};
     use sea_orm_migration::MigratorTrait;
     use sha2::{Digest, Sha256};
@@ -333,7 +321,7 @@ mod tests {
         )
         .unwrap();
         for (position, chunk) in compressed.chunks(8).enumerate() {
-            let id = store(&database, crate::telemetry::encode_payload(chunk).unwrap())
+            let id = store(&database, StoredPayload::new(chunk).unwrap())
                 .await
                 .unwrap();
             database

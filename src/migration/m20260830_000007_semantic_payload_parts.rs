@@ -146,14 +146,15 @@ async fn store_semantic(
 }
 
 async fn store(database: &impl ConnectionTrait, payload: StoredPayload) -> Result<String, DbErr> {
+    let (body, encoding) = payload.encoded();
     database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
             [
                 payload.id.clone().into(),
-                payload.body.into(),
-                payload.encoding.into(),
+                body.into(),
+                encoding.into(),
                 payload.original_bytes.into(),
                 timestamp().into(),
             ],
