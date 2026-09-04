@@ -133,7 +133,7 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
     let gateway = gateway::Gateway::new(
         sink,
         keys.clone(),
-        policies::Pipeline::default(),
+        policies::pipeline(&config),
         config.providers,
         config.max_capture_bytes,
     )

@@ -1,17 +1,44 @@
-use crate::providers::Provider;
-use axum::{body::Bytes, http::StatusCode};
+use axum::body::Bytes;
 use std::{sync::Arc, time::Instant};
+
+pub mod mask;
+pub mod secrets;
 
 /// Evaluation metadata describes what a policy saw in a payload, so reading it
 /// takes the same permission as reading the payload itself.
 pub const EVALUATION_METADATA_SCOPE: &str = "payloads:read";
 
-pub struct RequestContext<'a> {
-    pub provider: Provider,
-    pub model: Option<&'a str>,
-    pub user_id: &'a str,
-    pub key_id: &'a str,
-    pub body: &'a Bytes,
+#[derive(Clone)]
+pub struct RequestContext {
+    pub body: Bytes,
+    pub content_encoding: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum PolicyError {
+    InvalidRequest(String),
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for PolicyError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Internal(error)
+    }
+}
+
+impl From<serde_json::Error> for PolicyError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
+            Self::Internal(error) => write!(formatter, "{error:#}"),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -27,10 +54,6 @@ pub struct Replacement {
 
 pub enum Outcome {
     Allow,
-    Block {
-        status: StatusCode,
-        code: &'static str,
-    },
     Transform {
         body: Bytes,
         restore: RestorationState,
@@ -61,11 +84,13 @@ impl Verdict {
 pub trait RequestPolicy: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> u32;
-    fn evaluate(&self, context: &RequestContext<'_>) -> anyhow::Result<Verdict>;
+    fn evaluate(&self, context: &RequestContext) -> Result<Verdict, PolicyError>;
 }
 
+#[cfg(test)]
 pub struct NoopPolicy;
 
+#[cfg(test)]
 impl RequestPolicy for NoopPolicy {
     fn name(&self) -> &'static str {
         "noop"
@@ -75,7 +100,7 @@ impl RequestPolicy for NoopPolicy {
         1
     }
 
-    fn evaluate(&self, _context: &RequestContext<'_>) -> anyhow::Result<Verdict> {
+    fn evaluate(&self, _context: &RequestContext) -> Result<Verdict, PolicyError> {
         Ok(Verdict::allow())
     }
 }
@@ -93,16 +118,8 @@ pub struct Evaluation {
 
 pub struct Decision {
     pub body: Bytes,
-    pub blocked: Option<Blocked>,
     pub restore: RestorationState,
     pub evaluations: Vec<Evaluation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Blocked {
-    pub status: StatusCode,
-    pub code: &'static str,
-    pub policy: &'static str,
 }
 
 impl Decision {
@@ -118,13 +135,23 @@ impl Decision {
 #[derive(Debug)]
 pub struct PolicyFailure {
     pub policy: &'static str,
-    pub error: anyhow::Error,
+    pub error: PolicyError,
 }
 
 impl std::fmt::Display for PolicyFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "policy {} failed: {:#}", self.policy, self.error)
+        write!(formatter, "policy {} failed: {}", self.policy, self.error)
     }
+}
+
+pub fn pipeline(config: &crate::config::Config) -> Pipeline {
+    if !config.guardrails.enabled {
+        return Pipeline::default();
+    }
+    Pipeline::new(vec![Arc::new(mask::SecretsPolicy::new(
+        config.secret_placeholder_key,
+        config.guardrails.mode,
+    ))])
 }
 
 #[derive(Clone, Default)]
@@ -139,20 +166,11 @@ impl Pipeline {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.policies.is_empty()
-    }
-
-    pub fn evaluate(&self, context: RequestContext<'_>) -> Result<Decision, PolicyFailure> {
-        let mut body = context.body.clone();
+    pub fn evaluate(&self, mut context: RequestContext) -> Result<Decision, PolicyFailure> {
         let mut restore = RestorationState::default();
         let mut evaluations = Vec::with_capacity(self.policies.len());
         for policy in self.policies.iter() {
             let started = Instant::now();
-            let context = RequestContext {
-                body: &body,
-                ..context
-            };
             let verdict = policy.evaluate(&context).map_err(|error| PolicyFailure {
                 policy: policy.name(),
                 error,
@@ -160,7 +178,6 @@ impl Pipeline {
             let duration_micros = started.elapsed().as_micros() as i64;
             let outcome_name = match &verdict.outcome {
                 Outcome::Allow => "allow",
-                Outcome::Block { .. } => "block",
                 Outcome::Transform { .. } => "transform",
             };
             evaluations.push(Evaluation {
@@ -174,30 +191,18 @@ impl Pipeline {
             });
             match verdict.outcome {
                 Outcome::Allow => {}
-                Outcome::Block { status, code } => {
-                    return Ok(Decision {
-                        body,
-                        blocked: Some(Blocked {
-                            status,
-                            code,
-                            policy: policy.name(),
-                        }),
-                        restore,
-                        evaluations,
-                    });
-                }
                 Outcome::Transform {
                     body: transformed,
                     restore: state,
                 } => {
-                    body = transformed;
+                    context.body = transformed;
+                    context.content_encoding = None;
                     restore.replacements.extend(state.replacements);
                 }
             }
         }
         Ok(Decision {
-            body,
-            blocked: None,
+            body: context.body,
             restore,
             evaluations,
         })
@@ -208,39 +213,10 @@ impl Pipeline {
 mod tests {
     use super::*;
 
-    fn context(body: &Bytes) -> RequestContext<'_> {
+    fn context(body: &Bytes) -> RequestContext {
         RequestContext {
-            provider: Provider::Anthropic,
-            model: Some("claude-test"),
-            user_id: "user",
-            key_id: "key",
-            body,
-        }
-    }
-
-    struct Blocker;
-
-    impl RequestPolicy for Blocker {
-        fn name(&self) -> &'static str {
-            "blocker"
-        }
-
-        fn version(&self) -> u32 {
-            3
-        }
-
-        fn evaluate(&self, _context: &RequestContext<'_>) -> anyhow::Result<Verdict> {
-            Ok(Verdict {
-                outcome: Outcome::Block {
-                    status: StatusCode::FORBIDDEN,
-                    code: "blocked_for_test",
-                },
-                findings: Findings {
-                    severity: Some("high"),
-                    match_count: 1,
-                    metadata: serde_json::json!({"reason": "test"}),
-                },
-            })
+            body: body.clone(),
+            content_encoding: None,
         }
     }
 
@@ -255,8 +231,8 @@ mod tests {
             1
         }
 
-        fn evaluate(&self, _context: &RequestContext<'_>) -> anyhow::Result<Verdict> {
-            anyhow::bail!("detector exploded")
+        fn evaluate(&self, _context: &RequestContext) -> Result<Verdict, PolicyError> {
+            Err(anyhow::anyhow!("detector exploded").into())
         }
     }
 
@@ -276,7 +252,6 @@ mod tests {
 
         let decision = pipeline.evaluate(context(&body)).expect("noop never fails");
 
-        assert!(decision.blocked.is_none());
         assert_eq!(decision.body, body);
         assert_eq!(decision.body.as_ptr(), body.as_ptr());
         assert!(decision.restore.replacements.is_empty());
@@ -303,32 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn a_block_stops_the_pipeline_and_names_the_policy() {
-        let body = Bytes::from_static(b"{}");
-        let pipeline = Pipeline::new(vec![
-            Arc::new(NoopPolicy),
-            Arc::new(Blocker),
-            Arc::new(NoopPolicy),
-        ]);
-
-        let decision = pipeline
-            .evaluate(context(&body))
-            .expect("block is not a failure");
-
-        assert_eq!(
-            decision.blocked,
-            Some(Blocked {
-                status: StatusCode::FORBIDDEN,
-                code: "blocked_for_test",
-                policy: "blocker",
-            })
-        );
-        assert_eq!(decision.applied_policies(), "noop,blocker");
-        assert_eq!(decision.evaluations[1].outcome, "block");
-        assert_eq!(decision.evaluations[1].severity, Some("high"));
-    }
-
-    #[test]
     fn a_policy_error_fails_closed_with_the_policy_name() {
         let body = Bytes::from_static(b"{}");
         let pipeline = Pipeline::new(vec![Arc::new(Failing)]);
@@ -339,6 +288,7 @@ mod tests {
             .expect("the failing policy should surface its error");
 
         assert_eq!(failure.policy, "failing");
+        assert!(matches!(failure.error, PolicyError::Internal(_)));
         assert!(failure.to_string().contains("detector exploded"));
     }
 }

@@ -3,7 +3,7 @@ use anyhow::Context;
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
-    policies::{Decision, Pipeline, PolicyFailure, RequestContext},
+    policies::{Decision, Pipeline, PolicyError, PolicyFailure, RequestContext},
     pricing::cost,
     providers::{Provider, extract_usage, requested_model},
     request_id::RequestId,
@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const BLOCKING_POLICY_BYTES: usize = 256 * 1024;
 const POLICY_HEADER: HeaderName = HeaderName::from_static("x-aegis-policy");
 const APPLIED_POLICIES_HEADER: HeaderName = HeaderName::from_static("x-aegis-applied-policies");
 
@@ -177,27 +178,27 @@ impl Gateway {
         };
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
         let model = requested_model(&body);
-        let decision = match self.policies.evaluate(RequestContext {
-            provider,
-            model: model.as_deref(),
-            user_id: &authenticated.user_id,
-            key_id: &authenticated.id,
-            body: &body,
-        }) {
+        let context = RequestContext {
+            body: body.clone(),
+            content_encoding: parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        };
+        let decision = match self.evaluate_policies(context).await? {
             Ok(decision) => decision,
             Err(failure) => return Ok(policy_failure(failure)),
         };
-        if let Some(blocked) = &decision.blocked {
-            return Ok(policy_block(&decision, blocked));
-        }
+        let transformed = decision.body.as_ptr() != body.as_ptr();
+        let applied_policies = decision.applied_policies();
         let Decision {
             body, evaluations, ..
         } = decision;
-        let applied_policies = evaluations
-            .iter()
-            .map(|evaluation| evaluation.policy)
-            .collect::<Vec<_>>()
-            .join(",");
+        if transformed {
+            parts.headers.remove(header::CONTENT_ENCODING);
+            parts.headers.remove(header::CONTENT_LENGTH);
+        }
         let endpoint = parts
             .uri
             .path_and_query()
@@ -333,7 +334,9 @@ impl Gateway {
         let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
-        if let Ok(value) = applied_policies.parse() {
+        if !applied_policies.is_empty()
+            && let Ok(value) = applied_policies.parse()
+        {
             response
                 .headers_mut()
                 .insert(APPLIED_POLICIES_HEADER, value);
@@ -342,6 +345,19 @@ impl Gateway {
             .extensions_mut()
             .insert(crate::access_log::DeferredCompletion);
         Ok(response)
+    }
+}
+
+impl Gateway {
+    async fn evaluate_policies(
+        &self,
+        context: RequestContext,
+    ) -> anyhow::Result<Result<Decision, PolicyFailure>> {
+        if context.body.len() <= BLOCKING_POLICY_BYTES {
+            return Ok(self.policies.evaluate(context));
+        }
+        let policies = self.policies.clone();
+        Ok(tokio::task::spawn_blocking(move || policies.evaluate(context)).await?)
     }
 }
 
@@ -365,37 +381,32 @@ fn authentication_error(error: AuthenticationError) -> Response {
 }
 
 fn policy_failure(failure: PolicyFailure) -> Response {
-    tracing::error!(error = %failure, "request policy failed; refusing to forward");
+    let (status, code, message) = match &failure.error {
+        PolicyError::InvalidRequest(message) => {
+            tracing::warn!(error = %failure, "request policy rejected the request body");
+            (StatusCode::BAD_REQUEST, "invalid_request", message.clone())
+        }
+        PolicyError::Internal(_) => {
+            tracing::error!(error = %failure, "request policy failed; refusing to forward");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "policy_failure",
+                "a request policy failed, so the request was not forwarded".to_owned(),
+            )
+        }
+    };
     let mut response = (
-        StatusCode::INTERNAL_SERVER_ERROR,
+        status,
         axum::Json(json!({
-            "error": "policy_failure",
+            "error": code,
             "policy": failure.policy,
-            "message": "a request policy failed, so the request was not forwarded"
+            "message": message
         })),
     )
         .into_response();
     response
         .headers_mut()
         .insert(POLICY_HEADER, HeaderValue::from_static("failed"));
-    response
-}
-
-fn policy_block(decision: &Decision, blocked: &crate::policies::Blocked) -> Response {
-    let mut response = (
-        blocked.status,
-        axum::Json(json!({
-            "error": blocked.code,
-            "policy": blocked.policy,
-            "message": "the request was blocked by a gateway policy"
-        })),
-    )
-        .into_response();
-    let headers = response.headers_mut();
-    headers.insert(POLICY_HEADER, HeaderValue::from_static("blocked"));
-    if let Ok(value) = decision.applied_policies().parse() {
-        headers.insert(APPLIED_POLICIES_HEADER, value);
-    }
     response
 }
 
