@@ -53,7 +53,7 @@ env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --exts rs,toml -- cargo run -- serve
+exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css -- cargo run -- serve
 '''
 
 [tasks.serve]
