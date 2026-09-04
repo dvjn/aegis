@@ -1,6 +1,8 @@
 pub mod account;
 pub mod authorize;
+pub mod charts;
 pub mod device;
+pub mod format;
 pub mod home;
 pub mod login;
 pub mod permissions;

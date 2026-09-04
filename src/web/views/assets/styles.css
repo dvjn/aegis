@@ -693,6 +693,176 @@ a[role="button"].compact {
   background: var(--accent);
 }
 
+/* --- Charts -------------------------------------------------------------- */
+
+.sparkline {
+  display: inline-block;
+  overflow: visible;
+}
+
+/* The number and its trend share one row; the trend hugs the right edge. */
+.tile-headline {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: var(--space-1);
+}
+
+.tile-headline .tile-value {
+  margin-top: 0;
+}
+
+.tile-trend {
+  flex: none;
+  color: var(--ink-secondary);
+}
+
+.tile-trend .sparkline {
+  width: 96px;
+  height: 28px;
+}
+
+.data-table .col-trend {
+  width: 72px;
+  padding-right: var(--space-3);
+  text-align: right;
+}
+
+.data-table td.col-trend .sparkline {
+  width: 72px;
+  height: 18px;
+  vertical-align: middle;
+}
+
+.stacked {
+  margin-top: var(--space-3);
+}
+
+.stacked-bar {
+  display: block;
+  width: 100%;
+  height: 8px;
+  background: var(--surface-3);
+}
+
+/* Segments and swatches take their colour from the series class; the lines
+   never fill, whatever class they carry. */
+.stacked-bar rect {
+  fill: currentColor;
+}
+
+.chart path,
+.sparkline path {
+  fill: none;
+}
+
+.stacked-legend {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-1) var(--space-4);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.stacked-legend li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* Only the label may shrink, and it clips with an ellipsis; the swatch and
+   the value keep their size so the number is always readable. */
+.legend-label {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-value {
+  flex: none;
+  color: var(--ink-secondary);
+}
+
+.swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  background: currentColor;
+}
+
+/* The chart sits between a card's description and its table. */
+.chart {
+  margin: 0 0 var(--space-4);
+}
+
+.chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.chart-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-tick {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.chart-line {
+  stroke: currentColor;
+}
+
+/* The row's swatch matches the line drawn for it in the chart above. */
+.row-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: var(--space-2);
+  background: currentColor;
+  vertical-align: middle;
+}
+
+.chart-empty {
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Series and segment colours. Swatches and lines use `currentColor`, so one
+   class covers the row dot, the chart line, and the bar segment. Chosen to keep
+   apart on the dark canvas. */
+/* Series colours avoid green and red so they never read as ok / failed. */
+.series-1 { color: #5b8def; }
+.series-2 { color: #e0a458; }
+.series-3 { color: #d47fd8; }
+.series-4 { color: #58c1d8; }
+.series-5 { color: #d4c15f; }
+.series-6 { color: #9fb0c3; }
+.series-7 { color: #9a8cf5; }
+.series-8 { color: #e2b8ff; }
+
+.status-ok { color: #3fbf7f; }
+.status-failed { color: var(--danger); }
+.status-unfinished { color: #e0a458; }
+
+.tokens-cache-read { color: #58c1d8; }
+.tokens-input { color: #5b8def; }
+.tokens-cache-write { color: #d47fd8; }
+.tokens-output { color: #e0a458; }
+
 /* --- Tables -------------------------------------------------------------- */
 
 /* A table keeps its column widths, so a narrow card scrolls it rather than
@@ -740,10 +910,16 @@ a[role="button"].compact {
   border-top: 1px solid var(--line);
 }
 
+/* A long model name clips instead of widening its column; the cell's title
+   attribute carries the full name. */
 .cell-title {
+  max-width: 16rem;
+  overflow: hidden;
   color: var(--ink);
   font-size: 14px;
   font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* A client id or other identifier that qualifies the row title. */

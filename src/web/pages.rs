@@ -29,22 +29,26 @@ pub(super) async fn root(
     };
     let user = principal.user_id();
     let range = Range::from_slug(query.range.as_deref());
-    let totals = state
-        .usage
-        .totals(user, range)
-        .await
-        .map_err(DomainError::from)?;
-    let models = state
-        .usage
-        .by_model(user, range)
-        .await
-        .map_err(DomainError::from)?;
-    let providers = state
-        .usage
-        .by_provider(user, range)
-        .await
-        .map_err(DomainError::from)?;
-    Ok(views::home::page(range, &totals, &models, &providers).into_response())
+    let window = range.window(chrono::Utc::now());
+    let usage = &state.usage;
+    let (totals, series, models, providers, model_series, provider_series) = tokio::join!(
+        usage.totals(user, window),
+        usage.totals_series(user, window),
+        usage.by_model(user, window),
+        usage.by_provider(user, window),
+        usage.series_by_model(user, window),
+        usage.series_by_provider(user, window),
+    );
+    let overview = views::home::Overview {
+        range,
+        totals: &totals.map_err(DomainError::from)?,
+        series: &series.map_err(DomainError::from)?,
+        models: &models.map_err(DomainError::from)?,
+        providers: &providers.map_err(DomainError::from)?,
+        model_series: &model_series.map_err(DomainError::from)?,
+        provider_series: &provider_series.map_err(DomainError::from)?,
+    };
+    Ok(views::home::page(&overview).into_response())
 }
 
 #[derive(Default, Deserialize)]
