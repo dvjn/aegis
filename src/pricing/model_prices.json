@@ -672,6 +672,12 @@
     "input": 0.000002,
     "output": 0.000012
   },
+  "gpt-6-astra": {
+    "cache_read": 0.000001,
+    "cache_write": 0.0000125,
+    "input": 0.00001,
+    "output": 0.00005
+  },
   "gpt-audio": {
     "input": 0.0000025,
     "output": 0.00001
@@ -739,7 +745,7 @@
   "gpt-realtime-2": {
     "cache_read": 4E-7,
     "input": 0.000004,
-    "output": 0.000016
+    "output": 0.000024
   },
   "gpt-realtime-2.1": {
     "cache_read": 4E-7,
