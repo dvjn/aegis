@@ -1,11 +1,12 @@
 use crate::{
     compression::{decode_body, decode_brotli_unsniffable},
+    payload_facts::{self, BlobFact},
     pricing::Cost,
     providers::{Provider, Usage},
 };
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Write};
 use uuid::Uuid;
@@ -115,6 +116,7 @@ pub(crate) struct SemanticPart {
     pub position: i64,
     pub role: Option<String>,
     pub kind: String,
+    pub facts: Vec<BlobFact>,
     pub payload: StoredPayload,
 }
 
@@ -175,11 +177,17 @@ fn part(
         .and_then(serde_json::Value::as_str)
         .unwrap_or(fallback_kind)
         .to_owned();
+    let facts = if path == "tools" {
+        payload_facts::tool_definition(value)
+    } else {
+        payload_facts::extract(value)
+    };
     Some(SemanticPart {
         path,
         position: position as i64,
         role,
         kind,
+        facts,
         payload: StoredPayload::new(&serde_json::to_vec(value).ok()?)?,
     })
 }
@@ -420,8 +428,10 @@ impl SqliteSink {
             ))
             .await?;
         for part in payload.parts {
-            self.store_encoded(&part.payload).await?;
-            self.database
+            let transaction = self.database.begin().await?;
+            store_blob(&transaction, &part.payload).await?;
+            payload_facts::store(&transaction, &part.payload.id, &part.facts).await?;
+            transaction
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, role, kind, part_id) VALUES (?, 'request', ?, ?, ?, ?, ?)",
@@ -435,6 +445,7 @@ impl SqliteSink {
                     ],
                 ))
                 .await?;
+            transaction.commit().await?;
         }
         Ok(())
     }

@@ -13,6 +13,7 @@ mod m20260901_000010_gateway_usage_cost;
 mod m20260901_000011_model_prices;
 mod m20260905_000012_message_content_parts;
 mod m20260905_000013_background_jobs;
+mod m20260905_000014_payload_blob_facts;
 
 pub struct Migrator;
 
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000011_model_prices::Migration),
             Box::new(m20260905_000012_message_content_parts::Migration),
             Box::new(m20260905_000013_background_jobs::Migration),
+            Box::new(m20260905_000014_payload_blob_facts::Migration),
         ]
     }
 }
