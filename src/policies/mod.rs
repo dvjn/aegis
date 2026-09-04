@@ -2,6 +2,10 @@ use crate::providers::Provider;
 use axum::{body::Bytes, http::StatusCode};
 use std::{sync::Arc, time::Instant};
 
+/// Evaluation metadata describes what a policy saw in a payload, so reading it
+/// takes the same permission as reading the payload itself.
+pub const EVALUATION_METADATA_SCOPE: &str = "payloads:read";
+
 pub struct RequestContext<'a> {
     pub provider: Provider,
     pub model: Option<&'a str>,
@@ -254,6 +258,15 @@ mod tests {
         fn evaluate(&self, _context: &RequestContext<'_>) -> anyhow::Result<Verdict> {
             anyhow::bail!("detector exploded")
         }
+    }
+
+    #[test]
+    fn evaluation_metadata_is_read_under_the_superuser_only_payload_scope() {
+        use crate::domain::{SCOPES, role_allows_scope};
+
+        assert!(SCOPES.contains(&EVALUATION_METADATA_SCOPE));
+        assert!(role_allows_scope(EVALUATION_METADATA_SCOPE, "superuser"));
+        assert!(!role_allows_scope(EVALUATION_METADATA_SCOPE, "user"));
     }
 
     #[test]

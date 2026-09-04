@@ -227,6 +227,9 @@ impl Gateway {
                 request_body: &body,
             })
             .await?;
+        self.sink
+            .record_evaluations(capture_id, &evaluations)
+            .await?;
 
         let mut outbound = self
             .client

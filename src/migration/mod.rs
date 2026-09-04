@@ -16,6 +16,7 @@ mod m20260905_000013_background_jobs;
 mod m20260905_000014_payload_blob_facts;
 mod m20260905_000015_request_metrics;
 mod m20260905_000017_part_refs_request_index;
+mod m20260905_000018_policy_evaluations;
 
 pub struct Migrator;
 
@@ -39,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000014_payload_blob_facts::Migration),
             Box::new(m20260905_000015_request_metrics::Migration),
             Box::new(m20260905_000017_part_refs_request_index::Migration),
+            Box::new(m20260905_000018_policy_evaluations::Migration),
         ]
     }
 }
