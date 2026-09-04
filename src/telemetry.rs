@@ -3,6 +3,7 @@ use crate::{
     payload_facts::{self, BlobFact},
     pricing::Cost,
     providers::{Provider, Usage},
+    request_metrics,
 };
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -388,6 +389,7 @@ impl SqliteSink {
                 ))
                 .await?;
         }
+        request_metrics::rollup(&self.database, &record.id.to_string()).await?;
         Ok(())
     }
 

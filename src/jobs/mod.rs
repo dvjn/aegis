@@ -1,5 +1,6 @@
 mod payload_facts_backfill;
 mod payload_resplit;
+mod request_metrics_rollup;
 
 use crate::telemetry::timestamp;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
@@ -12,10 +13,19 @@ pub fn spawn(database: DatabaseConnection) {
         if !run(&database, payload_resplit::NAME, payload_resplit::run).await {
             return;
         }
-        run(
+        if !run(
             &database,
             payload_facts_backfill::NAME,
             payload_facts_backfill::run,
+        )
+        .await
+        {
+            return;
+        }
+        run(
+            &database,
+            request_metrics_rollup::NAME,
+            request_metrics_rollup::run,
         )
         .await;
     });

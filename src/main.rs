@@ -16,6 +16,7 @@ mod payload_facts;
 mod pricing;
 mod providers;
 mod request_id;
+mod request_metrics;
 mod telemetry;
 mod usage;
 mod web;
