@@ -33,35 +33,72 @@ pub struct StartRecord<'a> {
 pub(crate) struct StoredPayload {
     pub id: String,
     pub body: Vec<u8>,
-    pub encoding: &'static str,
     pub original_bytes: i64,
 }
 
-pub(crate) fn encode_payload(body: &[u8]) -> Option<StoredPayload> {
-    if body.is_empty() {
-        return None;
+impl StoredPayload {
+    pub(crate) fn new(body: &[u8]) -> Option<Self> {
+        if body.is_empty() {
+            return None;
+        }
+        let id = Sha256::digest(body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Some(Self {
+            id,
+            original_bytes: body.len() as i64,
+            body: body.to_vec(),
+        })
     }
-    let original_bytes = body.len() as i64;
-    let id = Sha256::digest(body)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    let compressed = encoder
-        .write_all(body)
-        .and_then(|()| encoder.finish())
-        .unwrap_or_default();
-    let (body, encoding) = if !compressed.is_empty() && compressed.len() < body.len() {
-        (compressed, "gzip")
-    } else {
-        (body.to_vec(), "identity")
-    };
-    Some(StoredPayload {
-        id,
-        body,
-        encoding,
-        original_bytes,
-    })
+
+    pub(crate) fn encoded(&self) -> (Vec<u8>, &'static str) {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let compressed = encoder
+            .write_all(&self.body)
+            .and_then(|()| encoder.finish())
+            .unwrap_or_default();
+        if !compressed.is_empty() && compressed.len() < self.body.len() {
+            (compressed, "gzip")
+        } else {
+            (self.body.clone(), "identity")
+        }
+    }
+}
+
+pub(crate) async fn store_blob(
+    database: &impl ConnectionTrait,
+    payload: &StoredPayload,
+) -> Result<bool, sea_orm::DbErr> {
+    if blob_exists(database, &payload.id).await? {
+        return Ok(false);
+    }
+    let (body, encoding) = payload.encoded();
+    let result = database
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                payload.id.clone().into(),
+                body.into(),
+                encoding.into(),
+                payload.original_bytes.into(),
+                timestamp().into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn blob_exists(database: &impl ConnectionTrait, id: &str) -> Result<bool, sea_orm::DbErr> {
+    let row = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM gateway_payload_blobs WHERE id = ?",
+            [id.to_owned().into()],
+        ))
+        .await?;
+    Ok(row.is_some())
 }
 
 pub(crate) fn chunk_payload(body: &[u8]) -> Vec<StoredPayload> {
@@ -69,7 +106,7 @@ pub(crate) fn chunk_payload(body: &[u8]) -> Vec<StoredPayload> {
         return Vec::new();
     }
     fastcdc::v2020::FastCDC::new(body, 4 * 1024, 16 * 1024, 64 * 1024)
-        .filter_map(|chunk| encode_payload(&body[chunk.offset..chunk.offset + chunk.length]))
+        .filter_map(|chunk| StoredPayload::new(&body[chunk.offset..chunk.offset + chunk.length]))
         .collect()
 }
 
@@ -143,7 +180,7 @@ fn part(
         position: position as i64,
         role,
         kind,
-        payload: encode_payload(&serde_json::to_vec(value).ok()?)?,
+        payload: StoredPayload::new(&serde_json::to_vec(value).ok()?)?,
     })
 }
 
@@ -185,7 +222,7 @@ pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPaylo
         return None;
     }
     Some(SemanticPayload {
-        envelope: encode_payload(&serde_json::to_vec(&root).ok()?)?,
+        envelope: StoredPayload::new(&serde_json::to_vec(&root).ok()?)?,
         parts,
     })
 }
@@ -352,7 +389,7 @@ impl SqliteSink {
         body: &[u8],
     ) -> Result<(), sea_orm::DbErr> {
         for (position, payload) in chunk_payload(body).into_iter().enumerate() {
-            let stored = self.store_encoded(payload).await?;
+            self.store_encoded(&payload).await?;
             self.database
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
@@ -360,7 +397,7 @@ impl SqliteSink {
                     [
                         request_id.to_string().into(),
                         (position as i64).into(),
-                        stored.id.into(),
+                        payload.id.into(),
                     ],
                 ))
                 .await?;
@@ -373,7 +410,8 @@ impl SqliteSink {
         request_id: Uuid,
         payload: SemanticPayload,
     ) -> Result<(), sea_orm::DbErr> {
-        let envelope = self.store_encoded(payload.envelope).await?;
+        let envelope = payload.envelope;
+        self.store_encoded(&envelope).await?;
         self.database
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
@@ -382,7 +420,7 @@ impl SqliteSink {
             ))
             .await?;
         for part in payload.parts {
-            let stored = self.store_encoded(part.payload).await?;
+            self.store_encoded(&part.payload).await?;
             self.database
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
@@ -393,7 +431,7 @@ impl SqliteSink {
                         part.position.into(),
                         part.role.into(),
                         part.kind.into(),
-                        stored.id.into(),
+                        part.payload.id.into(),
                     ],
                 ))
                 .await?;
@@ -401,28 +439,16 @@ impl SqliteSink {
         Ok(())
     }
 
-    async fn store_encoded(&self, payload: StoredPayload) -> Result<StoredPayload, sea_orm::DbErr> {
-        self.database
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
-                [
-                    payload.id.clone().into(),
-                    payload.body.clone().into(),
-                    payload.encoding.into(),
-                    payload.original_bytes.into(),
-                    timestamp().into(),
-                ],
-            ))
-            .await?;
-        Ok(payload)
+    async fn store_encoded(&self, payload: &StoredPayload) -> Result<bool, sea_orm::DbErr> {
+        store_blob(&self.database, payload).await
     }
 
     async fn store_payload(&self, body: &[u8]) -> Result<Option<StoredPayload>, sea_orm::DbErr> {
-        let Some(payload) = encode_payload(body) else {
+        let Some(payload) = StoredPayload::new(body) else {
             return Ok(None);
         };
-        Ok(Some(self.store_encoded(payload).await?))
+        self.store_encoded(&payload).await?;
+        Ok(Some(payload))
     }
 
     pub async fn reconcile_interrupted(&self) -> Result<u64, sea_orm::DbErr> {
