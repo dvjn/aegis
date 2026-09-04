@@ -1,6 +1,8 @@
 use super::{AppState, authenticate, csrf_from_token, error::WebError, new_csrf_value, views};
 use crate::{
+    domain::role_allows_scope,
     domain::{DomainError, Password, Principal},
+    policies::EVALUATION_METADATA_SCOPE,
     usage::Range,
 };
 use axum::{
@@ -43,6 +45,7 @@ pub(super) async fn root(
         model_series,
         provider_series,
         key_series,
+        guardrails,
     ) = tokio::join!(
         usage.totals(user, window),
         usage.context(user, window),
@@ -54,11 +57,16 @@ pub(super) async fn root(
         usage.series_by_model(user, window),
         usage.series_by_provider(user, window),
         usage.series_by_key(user, window),
+        usage.guardrails(user, window),
     );
     let elapsed_ms = query_started.elapsed().as_millis() as u64;
     tracing::debug!(elapsed_ms, "dashboard queries completed");
     if elapsed_ms >= 1000 {
         tracing::warn!(elapsed_ms, "slow dashboard queries");
+    }
+    let mut guardrails = guardrails.map_err(DomainError::from)?;
+    if !role_allows_scope(EVALUATION_METADATA_SCOPE, principal.role()) {
+        guardrails.detectors.clear();
     }
     let overview = views::home::Overview {
         range,
@@ -72,6 +80,7 @@ pub(super) async fn root(
         model_series: &model_series.map_err(DomainError::from)?,
         provider_series: &provider_series.map_err(DomainError::from)?,
         key_series: &key_series.map_err(DomainError::from)?,
+        guardrails: &guardrails,
     };
     Ok(views::home::page(&overview).into_response())
 }

@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod domain;
 mod gateway;
+mod guardrails_hourly;
 mod health;
 mod jobs;
 mod mcp;
@@ -14,6 +15,7 @@ mod oauth;
 mod origin;
 mod payload_facts;
 mod payload_parts;
+mod policies;
 mod pricing;
 mod providers;
 mod request_id;
@@ -136,6 +138,7 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
     let gateway = gateway::Gateway::new(
         sink,
         keys.clone(),
+        policies::pipeline(&config.guardrails, config.secret_placeholder_key),
         config.providers,
         config.max_capture_bytes,
     )

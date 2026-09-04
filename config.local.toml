@@ -1,6 +1,19 @@
 http_addr = "127.0.0.1:8765"
 database_url = "sqlite://data/dev.db?mode=rwc"
 
+[guardrails]
+enabled = true
+mode = "mask"
+
+[guardrails.secrets]
+enabled = true
+
+[guardrails.regex]
+enabled = true
+[guardrails.regex.detectors]
+internal_token = '\bint_[a-z0-9]{32}\b'
+employee_id = '\bEMP-\d{6}\b'
+
 [[providers]]
 id = "claude"
 type = "claude_subscription"

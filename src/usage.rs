@@ -207,6 +207,7 @@ impl UsageTotals {
         self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
     }
 
+    #[cfg(test)]
     pub fn unfinished(&self) -> i64 {
         self.requests - self.succeeded - self.failed
     }
@@ -368,6 +369,63 @@ impl LabeledSeries {
     }
 }
 
+/// What the masking policies did to the requests in a window.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GuardrailsSummary {
+    pub requests_scanned: i64,
+    pub requests_masked: i64,
+    /// Detector matches, each replaced by a placeholder in mask mode.
+    pub matches: i64,
+    /// Distinct placeholders, which is distinct masked values because a
+    /// placeholder is a deterministic digest of the value it stands for.
+    pub distinct_values: i64,
+    /// Matches per bucket of the window, in bucket order.
+    pub matches_series: Vec<i64>,
+    /// Most matches first.
+    pub detectors: Vec<DetectorCount>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DetectorCount {
+    pub detector: String,
+    pub matches: i64,
+    /// Distinct masked values this detector produced.
+    pub unique: i64,
+    /// Requests the detector matched in.
+    pub requests: i64,
+}
+
+#[derive(Debug, Default, FromQueryResult)]
+struct GuardrailsCounts {
+    requests_scanned: i64,
+    requests_masked: i64,
+    matches: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DistinctValues {
+    distinct_values: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct GuardrailsPoint {
+    bucket: String,
+    matches: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DetectorMatches {
+    detector: String,
+    matches: i64,
+    requests: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DetectorUnique {
+    detector: String,
+    unique_values: i64,
+}
+
 #[derive(Debug, FromQueryResult)]
 struct TotalsPoint {
     bucket: String,
@@ -511,6 +569,107 @@ const LABELED_SERIES_SQL: &str = "{rows} SELECT {column} label, {bucket} bucket,
      {tokens} tokens \
      FROM r \
      GROUP BY {column}, bucket";
+
+/// The evaluations of the requests in the window's partial edge hours, one
+/// row per evaluation. Whole hours come from the guardrail buckets instead.
+/// Parameters follow [`WINDOW_ROWS_SQL`].
+const EDGE_EVALUATIONS_SQL: &str = "SELECT q.started_at moment, e.request_id, e.outcome, e.match_count, e.metadata \
+     FROM policy_evaluations e \
+     JOIN gateway_requests q ON q.id = e.request_id \
+     JOIN gateway_keys k ON k.id = q.key_id \
+     WHERE e.policy IN ('secrets', 'regex') AND k.user_id = ? \
+     AND ((q.started_at >= ? AND q.started_at < ?) OR (q.started_at >= ? AND q.started_at <= ?))";
+
+/// Scanned and masked requests and their matches, as uniform rows named `r`
+/// with a `moment` column for [`Bucket::sql`].
+const GUARDRAIL_ROWS_SQL: &str = "WITH r AS ( \
+     SELECT moment, 1 scanned, MAX(CASE WHEN outcome = 'transform' THEN 1 ELSE 0 END) masked, \
+     SUM(match_count) matches \
+     FROM ({edge}) GROUP BY request_id \
+     UNION ALL \
+     SELECT h.hour, h.scanned, h.masked, h.matches \
+     FROM gateway_guardrails_hourly h \
+     WHERE h.user_id = ? AND h.hour >= ? AND h.hour < ?)";
+
+/// Metadata that is missing, malformed, or without a detectors object gives
+/// `json_each` a NULL, which yields no rows.
+const DETECTOR_ROWS_SQL: &str = "WITH d AS ( \
+     SELECT j.key detector, CAST(j.value AS INTEGER) matches, 1 requests \
+     FROM ({edge}) v \
+     JOIN json_each(CASE WHEN json_valid(v.metadata) \
+     AND json_type(v.metadata, '$.detectors') = 'object' \
+     THEN json_extract(v.metadata, '$.detectors') END) j \
+     UNION ALL \
+     SELECT h.detector, h.matches, h.requests \
+     FROM gateway_guardrail_detectors_hourly h \
+     WHERE h.user_id = ? AND h.hour >= ? AND h.hour < ?)";
+
+/// A placeholder reads `AEGIS_MASKED_<DETECTOR>_<22 hex>_END`, so the detector
+/// is what sits between the 13 byte prefix and the 27 byte tail.
+const VALUE_ROWS_SQL: &str = "WITH v AS ( \
+     SELECT lower(substr(p.value, 14, length(p.value) - 40)) detector, p.value placeholder \
+     FROM ({edge}) e \
+     JOIN json_each(CASE WHEN json_valid(e.metadata) \
+     AND json_type(e.metadata, '$.placeholders') = 'array' \
+     THEN json_extract(e.metadata, '$.placeholders') END) p \
+     UNION ALL \
+     SELECT h.detector, h.placeholder \
+     FROM gateway_guardrail_values_hourly h \
+     WHERE h.user_id = ? AND h.hour >= ? AND h.hour < ?)";
+
+const GUARDRAILS_COUNTS_SQL: &str = "{rows} SELECT COALESCE(SUM(r.scanned), 0) requests_scanned, \
+     COALESCE(SUM(r.masked), 0) requests_masked, \
+     COALESCE(SUM(r.matches), 0) matches FROM r";
+
+const MATCHES_SERIES_SQL: &str =
+    "{rows} SELECT {bucket} bucket, COALESCE(SUM(r.matches), 0) matches FROM r GROUP BY bucket";
+
+const DETECTOR_MATCHES_SQL: &str = "{rows} SELECT d.detector detector, SUM(d.matches) matches, \
+     SUM(d.requests) requests FROM d GROUP BY d.detector ORDER BY matches DESC, detector";
+
+const DISTINCT_VALUES_SQL: &str =
+    "{rows} SELECT COUNT(DISTINCT v.placeholder) distinct_values FROM v";
+
+const DETECTOR_UNIQUE_SQL: &str = "{rows} SELECT v.detector detector, \
+     COUNT(DISTINCT v.placeholder) unique_values FROM v GROUP BY v.detector";
+
+fn render_guardrail_sql(template: &str, rows: &str, bucket: Bucket) -> String {
+    template
+        .replace("{rows}", &rows.replace("{edge}", EDGE_EVALUATIONS_SQL))
+        .replace("{bucket}", bucket.sql())
+}
+
+/// Lays the points out over every bucket of the window, one series per label,
+/// largest total first. Points outside the window are dropped.
+fn fill_labeled_series(points: Vec<LabeledPoint>, window: Window) -> Vec<LabeledSeries> {
+    let keys = window.bucket_keys();
+    let positions: BTreeMap<&str, usize> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (key.as_str(), index))
+        .collect();
+
+    let mut by_label: BTreeMap<Option<String>, Vec<i64>> = BTreeMap::new();
+    for point in points {
+        let Some(&index) = positions.get(point.bucket.as_str()) else {
+            continue;
+        };
+        by_label
+            .entry(point.label)
+            .or_insert_with(|| vec![0; keys.len()])[index] += point.tokens;
+    }
+    let mut series: Vec<LabeledSeries> = by_label
+        .into_iter()
+        .map(|(label, tokens)| LabeledSeries { label, tokens })
+        .collect();
+    series.sort_by(|left, right| {
+        right
+            .total()
+            .cmp(&left.total())
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    series
+}
 
 fn render_sql(template: &str, column: &str, bucket: Bucket) -> String {
     template
@@ -688,6 +847,94 @@ impl UsageStore {
         self.labeled_series("r.key_name", user_id, window).await
     }
 
+    pub async fn guardrails(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<GuardrailsSummary, sea_orm::DbErr> {
+        let counts = GuardrailsCounts::find_by_statement(self.guardrail_statement(
+            GUARDRAILS_COUNTS_SQL,
+            GUARDRAIL_ROWS_SQL,
+            user_id,
+            window,
+        ))
+        .one(&self.database)
+        .await?
+        .unwrap_or_default();
+        let points = GuardrailsPoint::find_by_statement(self.guardrail_statement(
+            MATCHES_SERIES_SQL,
+            GUARDRAIL_ROWS_SQL,
+            user_id,
+            window,
+        ))
+        .all(&self.database)
+        .await?;
+        let by_bucket: BTreeMap<&str, i64> = points
+            .iter()
+            .map(|point| (point.bucket.as_str(), point.matches))
+            .collect();
+        let matches_series = window
+            .bucket_keys()
+            .iter()
+            .map(|key| by_bucket.get(key.as_str()).copied().unwrap_or(0))
+            .collect();
+        let distinct_values = DistinctValues::find_by_statement(self.guardrail_statement(
+            DISTINCT_VALUES_SQL,
+            VALUE_ROWS_SQL,
+            user_id,
+            window,
+        ))
+        .one(&self.database)
+        .await?
+        .map_or(0, |row| row.distinct_values);
+        let unique: BTreeMap<String, i64> = DetectorUnique::find_by_statement(
+            self.guardrail_statement(DETECTOR_UNIQUE_SQL, VALUE_ROWS_SQL, user_id, window),
+        )
+        .all(&self.database)
+        .await?
+        .into_iter()
+        .map(|row| (row.detector, row.unique_values))
+        .collect();
+        let detectors = DetectorMatches::find_by_statement(self.guardrail_statement(
+            DETECTOR_MATCHES_SQL,
+            DETECTOR_ROWS_SQL,
+            user_id,
+            window,
+        ))
+        .all(&self.database)
+        .await?
+        .into_iter()
+        .map(|row| DetectorCount {
+            unique: unique.get(&row.detector).copied().unwrap_or(0),
+            detector: row.detector,
+            matches: row.matches,
+            requests: row.requests,
+        })
+        .collect();
+        Ok(GuardrailsSummary {
+            requests_scanned: counts.requests_scanned,
+            requests_masked: counts.requests_masked,
+            matches: counts.matches,
+            distinct_values,
+            matches_series,
+            detectors,
+        })
+    }
+
+    fn guardrail_statement(
+        &self,
+        template: &str,
+        rows: &str,
+        user_id: Uuid,
+        window: Window,
+    ) -> Statement {
+        self.window_statement(
+            &render_guardrail_sql(template, rows, window.bucket),
+            user_id,
+            window,
+        )
+    }
+
     async fn breakdown(
         &self,
         column: &str,
@@ -710,33 +957,7 @@ impl UsageStore {
         let points = LabeledPoint::find_by_statement(self.window_statement(&sql, user_id, window))
             .all(&self.database)
             .await?;
-        let keys = window.bucket_keys();
-        let positions: BTreeMap<&str, usize> = keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| (key.as_str(), index))
-            .collect();
-
-        let mut by_label: BTreeMap<Option<String>, Vec<i64>> = BTreeMap::new();
-        for point in points {
-            let Some(&index) = positions.get(point.bucket.as_str()) else {
-                continue;
-            };
-            by_label
-                .entry(point.label)
-                .or_insert_with(|| vec![0; keys.len()])[index] += point.tokens;
-        }
-        let mut series: Vec<LabeledSeries> = by_label
-            .into_iter()
-            .map(|(label, tokens)| LabeledSeries { label, tokens })
-            .collect();
-        series.sort_by(|left, right| {
-            right
-                .total()
-                .cmp(&left.total())
-                .then_with(|| left.label.cmp(&right.label))
-        });
-        Ok(series)
+        Ok(fill_labeled_series(points, window))
     }
 
     fn statement(&self, sql: &str, user_id: Uuid, window: Window) -> Statement {
@@ -773,7 +994,7 @@ impl UsageStore {
 mod tests {
     use super::*;
     use crate::migration::Migrator;
-    use crate::tool_usage_hourly;
+    use crate::{guardrails_hourly, tool_usage_hourly};
     use sea_orm::{ConnectionTrait, Database};
     use sea_orm_migration::MigratorTrait;
 
@@ -838,6 +1059,26 @@ mod tests {
         .unwrap();
         usage_hourly::aggregate(db, Some(id)).await.unwrap();
         tool_usage_hourly::aggregate(db, Some(id)).await.unwrap();
+    }
+
+    async fn evaluate(
+        db: &DatabaseConnection,
+        id: &str,
+        request_id: &str,
+        outcome: &str,
+        match_count: i64,
+        metadata: Option<&str>,
+    ) {
+        let metadata = match metadata {
+            Some(metadata) => format!("'{metadata}'"),
+            None => "NULL".to_owned(),
+        };
+        db.execute_unprepared(&format!(
+            "INSERT INTO policy_evaluations(id,request_id,policy,policy_version,stage,outcome,match_count,duration_micros,metadata,created_at) \
+             VALUES('{id}','{request_id}','secrets',1,'request','{outcome}',{match_count},0,{metadata},'2026-03-01T00:00:00Z')"
+        ))
+        .await
+        .unwrap();
     }
 
     async fn empty_store(email: &str) -> (DatabaseConnection, Uuid) {
@@ -1951,5 +2192,120 @@ mod tests {
                 .unwrap(),
             ContextTotals::default()
         );
+    }
+
+    #[tokio::test]
+    async fn guardrails_summarise_the_masking_policies_and_their_detectors() {
+        let (store, user) = fixture().await;
+        let db = &store.database;
+        evaluate(
+            db,
+            "e-1",
+            "r-hour",
+            "transform",
+            3,
+            Some(r#"{"detectors":{"github_token":2,"aws_access_key_id":1},"placeholders":["AEGIS_MASKED_GITHUB_TOKEN_0123456789abcdef012345_END"]}"#),
+        )
+        .await;
+        evaluate(db, "e-2", "r-hour", "allow", 0, Some("null")).await;
+        evaluate(
+            db,
+            "e-3",
+            "r-days",
+            "transform",
+            1,
+            Some(r#"{"detectors":{"github_token":1}}"#),
+        )
+        .await;
+        evaluate(db, "e-4", "r-weeks", "allow", 0, Some("{not json")).await;
+        evaluate(db, "e-5", "r-weeks", "allow", 0, None).await;
+        evaluate(db, "e-6", "r-weeks", "allow", 0, Some(r#"{"detectors":7}"#)).await;
+        evaluate(
+            db,
+            "e-old",
+            "r-old",
+            "transform",
+            9,
+            Some(r#"{"detectors":{"github_token":9}}"#),
+        )
+        .await;
+        db.execute_unprepared(
+            "INSERT INTO policy_evaluations(id,request_id,policy,policy_version,stage,outcome,match_count,duration_micros,metadata,created_at) \
+             VALUES('e-other','r-hour','other',1,'request','transform',5,0,'{\"detectors\":{\"x\":5}}','2026-03-01T00:00:00Z')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO policy_evaluations(id,request_id,policy,policy_version,stage,outcome,match_count,duration_micros,metadata,created_at) \
+             VALUES('e-regex','r-days','regex',1,'request','transform',2,0,'{\"detectors\":{\"internal_token\":2},\"placeholders\":[\"AEGIS_MASKED_INTERNAL_TOKEN_fedcba9876543210fedcba_END\",\"AEGIS_MASKED_GITHUB_TOKEN_0123456789abcdef012345_END\"]}','2026-03-01T00:00:00Z')",
+        )
+        .await
+        .unwrap();
+
+        db.execute_unprepared(
+            "UPDATE gateway_requests SET completed_at = started_at WHERE completed_at IS NULL",
+        )
+        .await
+        .unwrap();
+        guardrails_hourly::rebuild(db).await.unwrap();
+
+        let window = last(Range::Month);
+        let buckets = window.bucket_keys().len();
+        let summary = store.guardrails(user, window).await.unwrap();
+        assert_eq!(summary.requests_scanned, 3);
+        assert_eq!(summary.requests_masked, 2);
+        assert_eq!(summary.matches, 6);
+        assert_eq!(summary.distinct_values, 2);
+        assert_eq!(
+            summary.detectors,
+            vec![
+                DetectorCount {
+                    detector: "github_token".to_owned(),
+                    matches: 3,
+                    unique: 1,
+                    requests: 2,
+                },
+                DetectorCount {
+                    detector: "internal_token".to_owned(),
+                    matches: 2,
+                    unique: 1,
+                    requests: 1,
+                },
+                DetectorCount {
+                    detector: "aws_access_key_id".to_owned(),
+                    matches: 1,
+                    unique: 0,
+                    requests: 1,
+                },
+            ],
+            "aws has a match but no placeholder in the fixture metadata"
+        );
+        assert_eq!(summary.matches_series.len(), buckets);
+        assert_eq!(summary.matches_series.iter().sum::<i64>(), 6);
+
+        let hourly_rows: i64 = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) n FROM gateway_guardrails_hourly",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert!(hourly_rows >= 2, "whole hours are read from the buckets");
+
+        let day = store.guardrails(user, last(Range::Day)).await.unwrap();
+        assert_eq!(day.requests_scanned, 1);
+        assert_eq!(day.matches, 3);
+        assert_eq!(day.distinct_values, 1);
+
+        let stranger = store
+            .guardrails(Uuid::now_v7(), last(Range::Month))
+            .await
+            .unwrap();
+        assert_eq!(stranger.requests_scanned, 0);
+        assert_eq!(stranger.distinct_values, 0);
+        assert!(stranger.detectors.is_empty());
     }
 }

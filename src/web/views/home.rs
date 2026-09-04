@@ -7,7 +7,8 @@ use super::charts::{
 use super::format::{count_text, money_text, percent_text, token_text};
 use super::{layout_with_nav, signed_in_nav, tools};
 use crate::usage::{
-    ContextTotals, LabeledSeries, Range, ToolUsage, TotalsSeries, UsageGroup, UsageTotals,
+    ContextTotals, GuardrailsSummary, LabeledSeries, Range, ToolUsage, TotalsSeries, UsageGroup,
+    UsageTotals,
 };
 
 /// Everything the overview needs, gathered by the handler in one place.
@@ -23,6 +24,7 @@ pub struct Overview<'a> {
     pub model_series: &'a [LabeledSeries],
     pub provider_series: &'a [LabeledSeries],
     pub key_series: &'a [LabeledSeries],
+    pub guardrails: &'a GuardrailsSummary,
 }
 
 const TILE_SPARKLINE: (u32, u32) = (96, 28);
@@ -40,20 +42,6 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                     (range_switch(overview.range))
                 }
                 div class="overview-grid" {
-                    (tile(
-                        "Requests",
-                        &count_text(totals.requests),
-                        &format!("{} requests", count_text(totals.requests)),
-                        tile_sparkline(&overview.series.requests),
-                        stacked_bar(
-                            &[
-                                ("ok", totals.succeeded as f64, "status-ok"),
-                                ("failed", totals.failed as f64, "status-failed"),
-                                ("unfinished", totals.unfinished() as f64, "status-unfinished"),
-                            ],
-                            &|value| count_text(value as i64),
-                        ),
-                    ))
                     (tile(
                         "Tokens",
                         &token_text(totals.tokens()),
@@ -76,13 +64,15 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                         tile_sparkline(&overview.series.cost_nanodollars),
                         cost_by_model_bar(overview.models),
                     ))
+                    (masked_tile(overview.guardrails))
                     (breakdown_card("Models", "Requests, tokens, and cost by the model each request asked for.", "Model", "grid-half rows-3", overview.models, overview.model_series))
                     (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", "grid-half rows-2", overview.providers, overview.provider_series))
                     (breakdown_card("Keys", "Requests, tokens, and cost by the key that sent them.", "Key", "grid-half rows-2", overview.keys, overview.key_series))
                     (context_card(overview.context))
                     (tools::mcp_card(overview.tools))
-                    (tools::calls_card(overview.tools))
                     (tools::skills_card(overview.tools))
+                    (tools::calls_card(overview.tools))
+                    (detectors_card(overview.guardrails))
                 }
             }
         },
@@ -355,9 +345,114 @@ fn breakdown_card(
     }
 }
 
+const NO_GUARDRAIL_ACTIVITY: &str = "No guardrail activity in this range.";
+
+/// The tile shows this many detectors by matches before the rest become
+/// "others".
+const DETECTOR_SEGMENTS: usize = 3;
+
+fn masked_tile(summary: &GuardrailsSummary) -> Markup {
+    tile(
+        "Masked",
+        &count_text(summary.matches),
+        &format!(
+            "{} values masked in {} of {} requests, {} distinct",
+            count_text(summary.matches),
+            count_text(summary.requests_masked),
+            count_text(summary.requests_scanned),
+            count_text(summary.distinct_values)
+        ),
+        tile_sparkline(&summary.matches_series),
+        matches_by_detector_bar(summary),
+    )
+}
+
+fn matches_by_detector_bar(summary: &GuardrailsSummary) -> Markup {
+    let mut segments: Vec<(String, f64, String)> = summary
+        .detectors
+        .iter()
+        .take(DETECTOR_SEGMENTS)
+        .enumerate()
+        .map(|(index, detector)| {
+            (
+                detector.detector.clone(),
+                detector.matches as f64,
+                series_class(index),
+            )
+        })
+        .collect();
+    if summary.detectors.len() > DETECTOR_SEGMENTS {
+        let others: i64 = summary.detectors[DETECTOR_SEGMENTS..]
+            .iter()
+            .map(|detector| detector.matches)
+            .sum();
+        segments.push(("others".to_owned(), others as f64, "series-6".to_owned()));
+    }
+    let borrowed: Vec<(&str, f64, &str)> = segments
+        .iter()
+        .map(|(label, matches, class)| (label.as_str(), *matches, class.as_str()))
+        .collect();
+    stacked_bar(&borrowed, &|value| count_text(value as i64))
+}
+
+fn detectors_card(summary: &GuardrailsSummary) -> Markup {
+    let segments: Vec<(&str, f64, String)> = summary
+        .detectors
+        .iter()
+        .enumerate()
+        .map(|(index, detector)| {
+            (
+                detector.detector.as_str(),
+                detector.matches as f64,
+                series_class(index),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, f64, &str)> = segments
+        .iter()
+        .map(|(label, matches, class)| (*label, *matches, class.as_str()))
+        .collect();
+    html! {
+        article class="auth-card account-card grid-half rows-2" {
+            h2 { "Detectors" }
+            p { "Matches, distinct values, and requests by detector." }
+            (stacked_bar_without_legend(&borrowed, &|value| count_text(value as i64)))
+            div class="table-wrap" {
+                table class="data-table" {
+                    thead {
+                        tr {
+                            th scope="col" { "Detector" }
+                            th scope="col" class="col-numeric" { "Matches" }
+                            th scope="col" class="col-numeric" { "Unique" }
+                            th scope="col" class="col-numeric" { "Requests" }
+                        }
+                    }
+                    tbody {
+                        @if summary.detectors.is_empty() {
+                            tr { td colspan="4" class="table-empty" { (NO_GUARDRAIL_ACTIVITY) } }
+                        }
+                        @for (detector, (_, _, class)) in summary.detectors.iter().zip(&segments) {
+                            tr {
+                                th scope="row" class="cell-title" title=(detector.detector) {
+                                    span class=(format!("row-swatch {class}")) aria-hidden="true" {}
+                                    (detector.detector)
+                                }
+                                td class="col-numeric" { (count_text(detector.matches)) }
+                                td class="col-numeric" { (count_text(detector.unique)) }
+                                td class="col-numeric" { (count_text(detector.requests)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::DetectorCount;
 
     #[test]
     fn the_overview_renders_with_and_without_traffic() {
@@ -399,6 +494,7 @@ mod tests {
             model_series: &model_series,
             provider_series: &[],
             key_series: &[],
+            guardrails: &GuardrailsSummary::default(),
         })
         .into_string();
         assert!(
@@ -416,10 +512,6 @@ mod tests {
             "the row carries its line's colour"
         );
         assert!(page.contains(r#"<span class="series-1"><svg class="sparkline""#));
-        assert!(
-            page.contains(r#"<div class="tile-value" title="3 requests">3</div>"#),
-            "{page}"
-        );
         assert!(page.contains(r#"title="35 tokens""#));
         assert!(page.contains(r#"title="$0.0015""#));
         assert!(
@@ -429,10 +521,6 @@ mod tests {
         assert!(
             page.contains(r#"<li title="$0.0015 unspecified">"#),
             "the legend entry carries its full text"
-        );
-        assert!(
-            page.contains(r#"<rect class="status-ok" x="0" y="0" width="66.67" height="8"><title>2 ok</title></rect>"#),
-            "{page}"
         );
         assert!(page.contains(r#"<span class="legend-label">"#));
         assert!(
@@ -483,6 +571,7 @@ mod tests {
             model_series: &[],
             provider_series: &[],
             key_series: &key_series,
+            guardrails: &GuardrailsSummary::default(),
         })
         .into_string();
         assert!(page.contains(r#"<h2>Keys</h2>"#), "{page}");
@@ -544,8 +633,9 @@ mod tests {
             r#"grid-half rows-2"><h2>Keys</h2>"#,
             r#"grid-half rows-2"><h2>Context</h2>"#,
             r#"grid-half rows-2"><h2>MCPs</h2>"#,
-            r#"grid-half rows-3"><h2>Tools</h2>"#,
             r#"grid-half rows-2"><h2>Skills</h2>"#,
+            r#"grid-half rows-3"><h2>Tools</h2>"#,
+            r#"grid-half rows-2"><h2>Detectors</h2>"#,
         ]
         .iter()
         .map(|card| {
@@ -697,6 +787,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_guardrail_tiles_and_cards_show_the_summary() {
+        let guardrails = GuardrailsSummary {
+            requests_scanned: 12,
+            requests_masked: 4,
+            matches: 7,
+            distinct_values: 3,
+            matches_series: vec![0, 2, 5, 0, 0, 0, 0, 0],
+            detectors: vec![
+                DetectorCount {
+                    detector: "github_token".to_owned(),
+                    matches: 5,
+                    unique: 2,
+                    requests: 3,
+                },
+                DetectorCount {
+                    detector: "aws_access_key_id".to_owned(),
+                    matches: 2,
+                    unique: 1,
+                    requests: 1,
+                },
+            ],
+        };
+        let page = page(&Overview {
+            range: Range::Week,
+            totals: &UsageTotals::default(),
+            context: &ContextTotals::default(),
+            tools: &ToolUsage::default(),
+            series: &TotalsSeries {
+                requests: vec![0; 8],
+                tokens: vec![0; 8],
+                cost_nanodollars: vec![0; 8],
+            },
+            models: &[],
+            providers: &[],
+            keys: &[],
+            model_series: &[],
+            provider_series: &[],
+            key_series: &[],
+            guardrails: &guardrails,
+        })
+        .into_string();
+
+        assert!(
+            !page.contains(r#"<div class="tile-label">Requests</div>"#),
+            "the requests tile is gone"
+        );
+        assert!(
+            page.contains(r#"<div class="tile-label">Masked</div>"#),
+            "{page}"
+        );
+        assert!(page.contains(
+            r#"<div class="tile-value" title="7 values masked in 4 of 12 requests, 3 distinct">7</div>"#
+        ));
+        assert!(page.contains(
+            r#"<span class="legend-value">5</span> <span class="legend-label">github_token</span>"#
+        ));
+        let tokens_tile = page
+            .find(r#"<div class="tile-label">Tokens</div>"#)
+            .unwrap();
+        let cost_tile = page.find(r#"<div class="tile-label">Cost</div>"#).unwrap();
+        let masked_tile = page
+            .find(r#"<div class="tile-label">Masked</div>"#)
+            .unwrap();
+        assert!(
+            tokens_tile < cost_tile && cost_tile < masked_tile,
+            "Tokens, Cost, Masked"
+        );
+
+        assert!(page.contains("<h2>Detectors</h2>"));
+        assert!(page.contains(
+            r#"<th scope="row" class="cell-title" title="github_token"><span class="row-swatch series-1" aria-hidden="true"></span>github_token</th><td class="col-numeric">5</td><td class="col-numeric">2</td><td class="col-numeric">3</td>"#
+        ), "{page}");
+        assert!(page.contains(
+            r#"title="aws_access_key_id"><span class="row-swatch series-2" aria-hidden="true"></span>aws_access_key_id</th><td class="col-numeric">2</td><td class="col-numeric">1</td><td class="col-numeric">1</td>"#
+        ), "{page}");
+        assert!(page.contains(r#"<h2>Detectors</h2><p>Matches, distinct values, and requests by detector.</p><svg class="stacked-bar""#), "{page}");
+        assert!(!page.contains("No guardrail activity in this range."));
+
+        let mcps_card = page.find("<h2>MCPs</h2>").unwrap();
+        let skills_card = page.find("<h2>Skills</h2>").unwrap();
+        let tools_card = page.find("<h2>Tools</h2>").unwrap();
+        let detectors_card = page.find("<h2>Detectors</h2>").unwrap();
+        assert!(
+            mcps_card < skills_card && skills_card < tools_card && tools_card < detectors_card,
+            "Skills, then Tools, then Detectors"
+        );
+    }
+
+    #[test]
+    fn the_guardrail_cards_say_when_nothing_was_scanned() {
+        let page = page_without_traffic().into_string();
+        assert!(page.contains("<h2>Detectors</h2>"));
+        assert!(page.contains(
+            r#"<div class="tile-value" title="0 values masked in 0 of 0 requests, 0 distinct">0</div>"#
+        ));
+        assert!(
+            page.contains("No guardrail activity in this range."),
+            "{page}"
+        );
+    }
+
     fn page_without_traffic() -> Markup {
         page(&Overview {
             range: Range::Week,
@@ -714,6 +906,7 @@ mod tests {
             model_series: &[],
             provider_series: &[],
             key_series: &[],
+            guardrails: &GuardrailsSummary::default(),
         })
     }
 }
