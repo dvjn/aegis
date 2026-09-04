@@ -7,6 +7,7 @@ mod db;
 mod domain;
 mod gateway;
 mod health;
+mod jobs;
 mod mcp;
 mod migration;
 mod oauth;
@@ -157,6 +158,7 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
         .context("failed to bind HTTP listener")?;
 
     info!(address = %config.http_addr, "server listening");
+    jobs::spawn(database.clone());
     axum::serve(listener, application)
         .with_graceful_shutdown(shutdown_signal(cancellation))
         .await
