@@ -2,7 +2,9 @@ use axum::body::Bytes;
 use std::{sync::Arc, time::Instant};
 
 pub mod mask;
+pub mod restore;
 pub mod secrets;
+pub mod sse;
 
 /// Evaluation metadata describes what a policy saw in a payload, so reading it
 /// takes the same permission as reading the payload itself.

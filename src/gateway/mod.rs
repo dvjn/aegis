@@ -3,7 +3,9 @@ use anyhow::Context;
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
-    policies::{Decision, Pipeline, PolicyError, PolicyFailure, RequestContext},
+    policies::{
+        Decision, Pipeline, PolicyError, PolicyFailure, RequestContext, restore::StreamRestorer,
+    },
     pricing::cost,
     providers::{Provider, extract_usage, requested_model},
     request_id::RequestId,
@@ -193,8 +195,12 @@ impl Gateway {
         let transformed = decision.body.as_ptr() != body.as_ptr();
         let applied_policies = decision.applied_policies();
         let Decision {
-            body, evaluations, ..
+            body,
+            evaluations,
+            restore,
         } = decision;
+        let mut restorer =
+            (!restore.replacements.is_empty()).then(|| StreamRestorer::new(restore.replacements));
         if transformed {
             parts.headers.remove(header::CONTENT_ENCODING);
             parts.headers.remove(header::CONTENT_LENGTH);
@@ -271,6 +277,10 @@ impl Gateway {
                         if first_byte_at.is_none() {
                             first_byte_at = Some(timestamp());
                         }
+                        let chunk = match &mut restorer {
+                            Some(restorer) => Bytes::from(restorer.rewrite_chunk(&chunk)),
+                            None => chunk,
+                        };
                         response_bytes = response_bytes.saturating_add(chunk.len());
                         let remaining = max_capture_bytes.saturating_sub(capture.len());
                         if remaining > 0 {
@@ -287,6 +297,18 @@ impl Gateway {
                         stream_error = Some(message.clone());
                         let _ = sender.send(Err(io::Error::other(message))).await;
                         break;
+                    }
+                }
+            }
+
+            if let Some(restorer) = &mut restorer {
+                let tail = restorer.finish();
+                if !tail.is_empty() && !disconnected && stream_error.is_none() {
+                    response_bytes = response_bytes.saturating_add(tail.len());
+                    let remaining = max_capture_bytes.saturating_sub(capture.len());
+                    capture.extend_from_slice(&tail[..tail.len().min(remaining)]);
+                    if sender.send(Ok(Bytes::from(tail))).await.is_err() {
+                        disconnected = true;
                     }
                 }
             }
