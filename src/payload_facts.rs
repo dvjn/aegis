@@ -10,17 +10,6 @@ const IMAGE: &str = "image";
 const REASONING: &str = "reasoning";
 const MESSAGE: &str = "message";
 
-pub(crate) const BLOCK_TYPES: [&str; 8] = [
-    TOOL_DEFINITION,
-    TOOL_USE,
-    TOOL_RESULT,
-    TEXT,
-    THINKING,
-    IMAGE,
-    REASONING,
-    MESSAGE,
-];
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BlobFact {
     pub block_type: &'static str,
