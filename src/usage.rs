@@ -313,6 +313,14 @@ impl UsageStore {
         self.breakdown("r.provider", user_id, window).await
     }
 
+    pub async fn by_key(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<Vec<UsageGroup>, sea_orm::DbErr> {
+        self.breakdown("k.name", user_id, window).await
+    }
+
     pub async fn totals_series(
         &self,
         user_id: Uuid,
@@ -354,6 +362,14 @@ impl UsageStore {
         window: Window,
     ) -> Result<Vec<LabeledSeries>, sea_orm::DbErr> {
         self.labeled_series("r.provider", user_id, window).await
+    }
+
+    pub async fn series_by_key(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<Vec<LabeledSeries>, sea_orm::DbErr> {
+        self.labeled_series("k.name", user_id, window).await
     }
 
     async fn breakdown(
@@ -779,6 +795,53 @@ mod tests {
             vec![
                 (Some("claude".to_owned()), 2, 1530),
                 (Some("codex".to_owned()), 1, 440),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_breakdown_rolls_every_version_of_a_key_into_one_row() {
+        let (store, user) = fixture().await;
+        let db = &store.database;
+        db.execute_unprepared(&format!(
+            "INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at) VALUES('key-2','{user}','batch','[\"claude\"]','2026-01-01T00:00:00Z')"
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared("UPDATE gateway_requests SET key_id = 'key-2' WHERE id = 'r-weeks'")
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "UPDATE gateway_requests SET key_version_id = 'v-1' WHERE id = 'r-hour'",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "UPDATE gateway_requests SET key_version_id = 'v-2' WHERE id = 'r-days'",
+        )
+        .await
+        .unwrap();
+
+        let keys = store.by_key(user, last(Range::Month)).await.unwrap();
+        assert_eq!(
+            keys.iter()
+                .map(|row| (row.label.clone(), row.requests, row.tokens))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("agent".to_owned()), 2, 1530),
+                (Some("batch".to_owned()), 1, 440),
+            ]
+        );
+
+        let series = store.series_by_key(user, last(Range::Month)).await.unwrap();
+        assert_eq!(
+            series
+                .iter()
+                .map(|line| (line.label.clone(), line.total()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("agent".to_owned()), 1530),
+                (Some("batch".to_owned()), 440)
             ]
         );
     }

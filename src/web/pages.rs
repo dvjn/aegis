@@ -31,13 +31,15 @@ pub(super) async fn root(
     let range = Range::from_slug(query.range.as_deref());
     let window = range.window(chrono::Utc::now());
     let usage = &state.usage;
-    let (totals, series, models, providers, model_series, provider_series) = tokio::join!(
+    let (totals, series, models, providers, keys, model_series, provider_series, key_series) = tokio::join!(
         usage.totals(user, window),
         usage.totals_series(user, window),
         usage.by_model(user, window),
         usage.by_provider(user, window),
+        usage.by_key(user, window),
         usage.series_by_model(user, window),
         usage.series_by_provider(user, window),
+        usage.series_by_key(user, window),
     );
     let overview = views::home::Overview {
         range,
@@ -45,8 +47,10 @@ pub(super) async fn root(
         series: &series.map_err(DomainError::from)?,
         models: &models.map_err(DomainError::from)?,
         providers: &providers.map_err(DomainError::from)?,
+        keys: &keys.map_err(DomainError::from)?,
         model_series: &model_series.map_err(DomainError::from)?,
         provider_series: &provider_series.map_err(DomainError::from)?,
+        key_series: &key_series.map_err(DomainError::from)?,
     };
     Ok(views::home::page(&overview).into_response())
 }

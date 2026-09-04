@@ -12,8 +12,10 @@ pub struct Overview<'a> {
     pub series: &'a TotalsSeries,
     pub models: &'a [UsageGroup],
     pub providers: &'a [UsageGroup],
+    pub keys: &'a [UsageGroup],
     pub model_series: &'a [LabeledSeries],
     pub provider_series: &'a [LabeledSeries],
+    pub key_series: &'a [LabeledSeries],
 }
 
 const TILE_SPARKLINE: (u32, u32) = (96, 28);
@@ -70,7 +72,10 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                 }
                 div class="account-grid account-grid-even" {
                     (breakdown_card("Models", "Requests, tokens, and cost by the model each request asked for.", "Model", overview.models, overview.model_series))
-                    (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", overview.providers, overview.provider_series))
+                    div class="account-column" {
+                        (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", overview.providers, overview.provider_series))
+                        (breakdown_card("Keys", "Requests, tokens, and cost by the key that sent them.", "Key", overview.keys, overview.key_series))
+                    }
                 }
             }
         },
@@ -267,8 +272,10 @@ mod tests {
             series: &series,
             models: &models,
             providers: &[],
+            keys: &[],
             model_series: &model_series,
             provider_series: &[],
+            key_series: &[],
         })
         .into_string();
         assert!(
@@ -323,6 +330,49 @@ mod tests {
 
         let empty = page_without_traffic().into_string();
         assert!(empty.contains("class=\"chart-empty\""));
+    }
+
+    #[test]
+    fn the_keys_card_names_the_key_and_nothing_about_its_versions() {
+        let keys = vec![UsageGroup {
+            label: Some("agent".to_owned()),
+            requests: 4,
+            tokens: 120,
+            cost_nanodollars: 2_000_000,
+        }];
+        let key_series = vec![LabeledSeries {
+            label: Some("agent".to_owned()),
+            tokens: vec![20, 100, 0, 0, 0, 0, 0, 0],
+        }];
+        let page = page(&Overview {
+            range: Range::Week,
+            totals: &UsageTotals::default(),
+            series: &TotalsSeries {
+                requests: vec![0; 8],
+                tokens: vec![0; 8],
+                cost_nanodollars: vec![0; 8],
+            },
+            models: &[],
+            providers: &[],
+            keys: &keys,
+            model_series: &[],
+            provider_series: &[],
+            key_series: &key_series,
+        })
+        .into_string();
+        assert!(page.contains(r#"<h2>Keys</h2>"#), "{page}");
+        assert!(page.contains(r#"<th scope="col">Key</th>"#));
+        assert!(
+            page.contains(r#"<th scope="row" class="cell-title" title="agent">"#),
+            "the row names the key"
+        );
+        for absent in ["version", "Version", "prefix", "Prefix", "sk-"] {
+            assert!(!page.contains(absent), "{absent} leaked into the page");
+        }
+        assert!(
+            page.contains(r#"<div class="account-column">"#),
+            "Keys stacks under Providers"
+        );
     }
 
     #[test]
@@ -384,8 +434,10 @@ mod tests {
             },
             models: &[],
             providers: &[],
+            keys: &[],
             model_series: &[],
             provider_series: &[],
+            key_series: &[],
         })
     }
 }
