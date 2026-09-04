@@ -8,6 +8,7 @@ pub mod login;
 pub mod permissions;
 pub mod register;
 pub mod reset;
+pub mod tools;
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use std::sync::LazyLock;

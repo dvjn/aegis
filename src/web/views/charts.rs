@@ -22,7 +22,9 @@ const MAX_LINES: usize = 6;
 const MIN_SEGMENT_SHARE: f64 = 1.5;
 
 const LINE_CHART_WIDTH: f64 = 800.0;
-const LINE_CHART_HEIGHT: f64 = 220.0;
+/// Two thirds of the earlier 220, so the table under the chart gets the room;
+/// the y tick labels keep their size because the SVG scales with its width.
+const LINE_CHART_HEIGHT: f64 = 150.0;
 const LINE_CHART_LEFT: f64 = 56.0;
 const LINE_CHART_RIGHT: f64 = 16.0;
 const LINE_CHART_TOP: f64 = 12.0;
@@ -46,6 +48,28 @@ pub fn sparkline(values: &[f64], width: u32, height: u32) -> Markup {
 /// Segments are `(label, value, css class)`. Zero segments are left out of
 /// the bar but listed in the legend, so the reader sees the category exists.
 pub fn stacked_bar(segments: &[(&str, f64, &str)], format: &dyn Fn(f64) -> String) -> Markup {
+    html! {
+        div class="stacked" {
+            (stacked_bar_without_legend(segments, format))
+            ul class="stacked-legend" {
+                @for (label, value, class) in segments {
+                    li title=(format!("{} {label}", format(*value))) {
+                        span class=(format!("swatch {class}")) aria-hidden="true" {}
+                        span class="legend-value" { (format(*value)) }
+                        " "
+                        span class="legend-label" { (label) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The bar alone, for a card whose table is the key.
+pub fn stacked_bar_without_legend(
+    segments: &[(&str, f64, &str)],
+    format: &dyn Fn(f64) -> String,
+) -> Markup {
     let shares = segment_shares(
         &segments
             .iter()
@@ -62,23 +86,11 @@ pub fn stacked_bar(segments: &[(&str, f64, &str)], format: &dyn Fn(f64) -> Strin
         })
         .collect();
     html! {
-        div class="stacked" {
-            svg class="stacked-bar" viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true" focusable="false" {
-                @for ((label, value, class), (start, share)) in segments.iter().zip(&placed) {
-                    @if *share > 0.0 {
-                        rect class=(class) x=(coordinate(*start)) y="0" width=(coordinate(*share)) height="8" {
-                            title { (format(*value)) " " (label) }
-                        }
-                    }
-                }
-            }
-            ul class="stacked-legend" {
-                @for (label, value, class) in segments {
-                    li title=(format!("{} {label}", format(*value))) {
-                        span class=(format!("swatch {class}")) aria-hidden="true" {}
-                        span class="legend-value" { (format(*value)) }
-                        " "
-                        span class="legend-label" { (label) }
+        svg class="stacked-bar" viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true" focusable="false" {
+            @for ((label, value, class), (start, share)) in segments.iter().zip(&placed) {
+                @if *share > 0.0 {
+                    rect class=(class) x=(coordinate(*start)) y="0" width=(coordinate(*share)) height="8" {
+                        title { (format(*value)) " " (label) }
                     }
                 }
             }

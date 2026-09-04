@@ -185,9 +185,8 @@ impl UsageTotals {
 
 /// Request context composition, summed over the requests of the window.
 /// Sizes are the stored JSON bytes of each part; tokens are estimated at read
-/// time and never stored.
-// TODO: the overview UI does not read this yet; drop the allows once it does.
-#[allow(dead_code)]
+/// time and never stored. A part's cost is the request's cost apportioned by
+/// the part's share of the request's bytes.
 #[derive(Debug, Default, PartialEq, Eq, FromQueryResult, Serialize)]
 pub struct ContextTotals {
     pub requests: i64,
@@ -204,22 +203,110 @@ pub struct ContextTotals {
     pub tools_invoked: i64,
     pub tool_result_errors: i64,
     pub cache_breakpoints: i64,
+    pub tool_definition_cost_nanodollars: i64,
+    pub system_cost_nanodollars: i64,
+    pub user_text_cost_nanodollars: i64,
+    pub assistant_text_cost_nanodollars: i64,
+    pub thinking_cost_nanodollars: i64,
+    pub tool_use_cost_nanodollars: i64,
+    pub tool_result_cost_nanodollars: i64,
+    pub other_cost_nanodollars: i64,
 }
 
 /// Measured over this gateway's captured traffic: stored request bytes divided
 /// by the input tokens the providers reported.
-#[allow(dead_code)]
-const BYTES_PER_TOKEN: f64 = 3.529;
+pub const BYTES_PER_TOKEN: f64 = 3.529;
 
-#[allow(dead_code)]
 impl ContextTotals {
-    pub fn tool_bytes(&self) -> i64 {
-        self.tool_definition_bytes + self.tool_use_bytes + self.tool_result_bytes
-    }
-
     pub fn estimated_tokens(bytes: i64) -> i64 {
         (bytes as f64 / BYTES_PER_TOKEN).round() as i64
     }
+}
+
+/// One tool over the window. Bytes are what the tool put into the context:
+/// its calls and their results, once per call, and its definition in every
+/// request that carried it. Cost is what those bytes cost in every request
+/// that carried them, apportioned by their share of the request's bytes.
+/// Results whose call was not captured group under no label.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ToolCalls {
+    pub label: Option<String>,
+    pub calls: i64,
+    pub bytes: i64,
+    pub cost_nanodollars: i64,
+}
+
+/// One skill's Skill tool calls over the window, measured like a tool but
+/// without a definition: the calls and the skill bodies they returned.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SkillCalls {
+    pub label: String,
+    pub calls: i64,
+    pub bytes: i64,
+    pub cost_nanodollars: i64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct McpServer {
+    pub label: String,
+    pub calls: i64,
+    pub tools: i64,
+    pub bytes: i64,
+    pub cost_nanodollars: i64,
+}
+
+/// Every tool part of the window's requests, read once.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ToolUsage {
+    /// Ordered by calls, most first, then by name. A tool that was only
+    /// defined, or whose calls fall outside the window, has zero calls.
+    pub tools: Vec<ToolCalls>,
+    /// Ordered by calls, most first, then by name.
+    pub skills: Vec<SkillCalls>,
+}
+
+impl ToolUsage {
+    /// Servers ordered by calls, most first, then by name.
+    pub fn mcp_servers(&self) -> Vec<McpServer> {
+        let mut by_server: BTreeMap<&str, McpServer> = BTreeMap::new();
+        for tool in &self.tools {
+            let Some(name) = tool
+                .label
+                .as_deref()
+                .and_then(crate::payload_facts::mcp_server)
+            else {
+                continue;
+            };
+            let server = by_server.entry(name).or_insert_with(|| McpServer {
+                label: name.to_owned(),
+                ..McpServer::default()
+            });
+            server.calls += tool.calls;
+            server.tools += 1;
+            server.bytes += tool.bytes;
+            server.cost_nanodollars += tool.cost_nanodollars;
+        }
+        let mut servers: Vec<McpServer> = by_server.into_values().collect();
+        servers.sort_by(|left, right| {
+            right
+                .calls
+                .cmp(&left.calls)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        servers
+    }
+}
+
+/// One aggregated row of `TOOL_PARTS_SQL`: a block type of one tool, or of
+/// one skill when the part belongs to a Skill call.
+#[derive(Debug, FromQueryResult)]
+struct ToolPart {
+    block_type: String,
+    label: Option<String>,
+    skill: Option<String>,
+    parts: i64,
+    bytes: i64,
+    cost_nanodollars: i64,
 }
 
 #[derive(Debug, FromQueryResult, Serialize)]
@@ -292,7 +379,6 @@ const TOTALS_SQL: &str = "SELECT COUNT(*) requests, \
      COALESCE(SUM(CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END), 0) unpriced \
      {from}";
 
-#[allow(dead_code)]
 const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
      COALESCE(SUM(m.tool_definition_bytes), 0) tool_definition_bytes, \
      COALESCE(SUM(m.system_bytes), 0) system_bytes, \
@@ -306,11 +392,91 @@ const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
      COALESCE(SUM(m.tools_offered), 0) tools_offered, \
      COALESCE(SUM(m.tools_invoked), 0) tools_invoked, \
      COALESCE(SUM(m.tool_result_errors), 0) tool_result_errors, \
-     COALESCE(SUM(m.cache_breakpoints), 0) cache_breakpoints \
+     COALESCE(SUM(m.cache_breakpoints), 0) cache_breakpoints, \
+     {part_cost:tool_definition_bytes} tool_definition_cost_nanodollars, \
+     {part_cost:system_bytes} system_cost_nanodollars, \
+     {part_cost:user_text_bytes} user_text_cost_nanodollars, \
+     {part_cost:assistant_text_bytes} assistant_text_cost_nanodollars, \
+     {part_cost:thinking_bytes} thinking_cost_nanodollars, \
+     {part_cost:tool_use_bytes} tool_use_cost_nanodollars, \
+     {part_cost:tool_result_bytes} tool_result_cost_nanodollars, \
+     {part_cost:other_bytes} other_cost_nanodollars \
      FROM gateway_requests r \
      JOIN gateway_keys k ON k.id = r.key_id \
      JOIN gateway_request_metrics m ON m.request_id = r.id \
+     LEFT JOIN gateway_usage u ON u.request_id = r.id \
      WHERE k.user_id = ? AND r.started_at >= ? AND r.started_at <= ?";
+
+const PART_COST_SQL: &str = "COALESCE(CAST(SUM(CASE WHEN m.total_bytes > 0 \
+     THEN u.cost_nanodollars * 1.0 * m.{part} / m.total_bytes ELSE 0 END) AS INTEGER), 0)";
+
+const CONTEXT_PARTS: [&str; 8] = [
+    "tool_definition_bytes",
+    "system_bytes",
+    "user_text_bytes",
+    "assistant_text_bytes",
+    "thinking_bytes",
+    "tool_use_bytes",
+    "tool_result_bytes",
+    "other_bytes",
+];
+
+fn context_sql() -> String {
+    CONTEXT_PARTS
+        .iter()
+        .fold(CONTEXT_SQL.to_owned(), |sql, part| {
+            sql.replace(
+                &format!("{{part_cost:{part}}}"),
+                &PART_COST_SQL.replace("{part}", part),
+            )
+        })
+}
+
+/// Calls and results count once per call, however many later requests
+/// replay them; definitions count once per request that carried them, and
+/// every part costs its byte share of every request that carried it. The
+/// window's references are grouped by blob first, so each blob and its facts
+/// are read once. A result carries no tool name or skill, so it borrows them
+/// from the call it answers. A blob holding several definitions splits its
+/// bytes between them.
+const TOOL_PARTS_SQL: &str = "WITH refs AS MATERIALIZED ( \
+     SELECT p.part_id, COUNT(*) sent, \
+     SUM(COALESCE(u.cost_nanodollars * 1.0 / m.total_bytes, 0)) cost_per_byte \
+     FROM gateway_requests r \
+     JOIN gateway_keys k ON k.id = r.key_id \
+     JOIN gateway_payload_part_refs p ON p.request_id = r.id AND p.direction = 'request' \
+     LEFT JOIN gateway_request_metrics m ON m.request_id = r.id AND m.total_bytes > 0 \
+     LEFT JOIN gateway_usage u ON u.request_id = r.id \
+     WHERE k.user_id = ? AND r.started_at >= ? AND r.started_at <= ? \
+     GROUP BY p.part_id), \
+     parts AS MATERIALIZED ( \
+     SELECT f.block_type, \
+     CASE WHEN f.block_type = 'tool_result' THEN (SELECT MIN(x.tool_name) FROM gateway_payload_blob_facts x \
+     WHERE x.tool_use_id = f.tool_use_id AND x.block_type = 'tool_use') ELSE f.tool_name END label, \
+     CASE WHEN f.block_type = 'tool_result' THEN (SELECT MIN(x.skill_name) FROM gateway_payload_blob_facts x \
+     WHERE x.tool_use_id = f.tool_use_id AND x.block_type = 'tool_use') ELSE f.skill_name END skill, \
+     COALESCE(f.tool_use_id, f.blob_id) call_id, \
+     b.original_bytes bytes, \
+     refs.sent, \
+     refs.cost_per_byte, \
+     CASE WHEN f.block_type = 'tool_definition' THEN (SELECT COUNT(*) FROM gateway_payload_blob_facts x \
+     WHERE x.blob_id = f.blob_id) ELSE 1 END facts \
+     FROM refs \
+     JOIN gateway_payload_blob_facts f ON f.blob_id = refs.part_id \
+     JOIN gateway_payload_blobs b ON b.id = refs.part_id \
+     WHERE f.block_type IN ('tool_definition', 'tool_use', 'tool_result')) \
+     SELECT block_type, label, skill, SUM(sent) parts, \
+     CAST(SUM(bytes * sent * 1.0 / facts) AS INTEGER) bytes, \
+     CAST(SUM(bytes * cost_per_byte / facts) AS INTEGER) cost_nanodollars \
+     FROM parts WHERE block_type = 'tool_definition' GROUP BY label \
+     UNION ALL \
+     SELECT block_type, label, skill, COUNT(*) parts, \
+     COALESCE(SUM(bytes), 0) bytes, \
+     CAST(COALESCE(SUM(cost), 0) AS INTEGER) cost_nanodollars \
+     FROM (SELECT block_type, call_id, MIN(label) label, MIN(skill) skill, MAX(bytes) bytes, \
+     SUM(bytes * cost_per_byte) cost \
+     FROM parts WHERE block_type <> 'tool_definition' GROUP BY block_type, call_id) \
+     GROUP BY block_type, label, skill";
 
 const BREAKDOWN_SQL: &str = "SELECT {column} label, COUNT(*) requests, \
      {tokens} tokens, \
@@ -356,18 +522,66 @@ impl UsageStore {
         )
     }
 
-    #[allow(dead_code)]
     pub async fn context(
         &self,
         user_id: Uuid,
         window: Window,
     ) -> Result<ContextTotals, sea_orm::DbErr> {
         Ok(
-            ContextTotals::find_by_statement(self.statement(CONTEXT_SQL, user_id, window))
+            ContextTotals::find_by_statement(self.statement(&context_sql(), user_id, window))
                 .one(&self.database)
                 .await?
                 .unwrap_or_default(),
         )
+    }
+
+    pub async fn tool_usage(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<ToolUsage, sea_orm::DbErr> {
+        let parts = ToolPart::find_by_statement(self.statement(TOOL_PARTS_SQL, user_id, window))
+            .all(&self.database)
+            .await?;
+        let mut tools: BTreeMap<Option<String>, ToolCalls> = BTreeMap::new();
+        let mut skills: BTreeMap<String, SkillCalls> = BTreeMap::new();
+        for part in parts {
+            let tool = tools.entry(part.label.clone()).or_default();
+            tool.bytes += part.bytes;
+            tool.cost_nanodollars += part.cost_nanodollars;
+            if part.block_type == "tool_use" {
+                tool.calls += part.parts;
+            }
+            if let Some(skill) = part.skill {
+                let skill = skills.entry(skill).or_default();
+                skill.bytes += part.bytes;
+                skill.cost_nanodollars += part.cost_nanodollars;
+                if part.block_type == "tool_use" {
+                    skill.calls += part.parts;
+                }
+            }
+        }
+        let mut tools: Vec<ToolCalls> = tools
+            .into_iter()
+            .map(|(label, tool)| ToolCalls { label, ..tool })
+            .collect();
+        tools.sort_by(|left, right| {
+            right
+                .calls
+                .cmp(&left.calls)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        let mut skills: Vec<SkillCalls> = skills
+            .into_iter()
+            .map(|(label, skill)| SkillCalls { label, ..skill })
+            .collect();
+        skills.sort_by(|left, right| {
+            right
+                .calls
+                .cmp(&left.calls)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        Ok(ToolUsage { tools, skills })
     }
 
     pub async fn by_model(
@@ -1183,6 +1397,315 @@ mod tests {
         );
     }
 
+    /// `(block_type, tool_name, skill_name, tool_use_id, is_error)`.
+    type Fact<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<bool>,
+    );
+
+    /// One captured request part: a blob referenced by the request, carrying
+    /// its facts.
+    async fn part(
+        db: &DatabaseConnection,
+        request_id: &str,
+        position: i64,
+        blob_id: &str,
+        bytes: i64,
+        facts: &[Fact<'_>],
+    ) {
+        db.execute_unprepared(&format!(
+            "INSERT OR IGNORE INTO gateway_payload_blobs(id,body,encoding,original_bytes,created_at) \
+             VALUES('{blob_id}',x'00','identity',{bytes},'2026-03-01T00:00:00Z')"
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared(&format!(
+            "INSERT INTO gateway_payload_part_refs(request_id,direction,path,position,kind,part_id) \
+             VALUES('{request_id}','request','tools',{position},'tools','{blob_id}')"
+        ))
+        .await
+        .unwrap();
+        for (ordinal, (block_type, tool_name, skill_name, tool_use_id, is_error)) in
+            facts.iter().enumerate()
+        {
+            let quoted =
+                |value: Option<&str>| value.map_or("NULL".to_owned(), |value| format!("'{value}'"));
+            let is_error = is_error.map_or("NULL".to_owned(), |flag| i32::from(flag).to_string());
+            let mcp_server = quoted(tool_name.and_then(crate::payload_facts::mcp_server));
+            db.execute_unprepared(&format!(
+                "INSERT OR IGNORE INTO gateway_payload_blob_facts(blob_id,ordinal,block_type,tool_name,mcp_server,skill_name,tool_use_id,is_error) \
+                 VALUES('{blob_id}',{ordinal},'{block_type}',{},{mcp_server},{},{},{is_error})",
+                quoted(*tool_name),
+                quoted(*skill_name),
+                quoted(*tool_use_id),
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn tool_fixture() -> (UsageStore, Uuid) {
+        let (db, user) = empty_store("tools@example.com").await;
+        for (id, started_at) in [
+            ("t-1", "2026-03-01T10:00:00.000Z"),
+            ("t-2", "2026-03-02T10:00:00.000Z"),
+            ("t-out", "2026-03-09T10:00:00.000Z"),
+        ] {
+            record(&db, id, "claude", Some("opus"), started_at, 1, 1).await;
+        }
+        let definition = |name: &'static str| ("tool_definition", Some(name), None, None, None);
+        for (request, position) in [("t-1", 0), ("t-2", 0), ("t-out", 0)] {
+            part(
+                &db,
+                request,
+                position,
+                "def-bash",
+                1_000,
+                &[definition("Bash")],
+            )
+            .await;
+            part(
+                &db,
+                request,
+                position + 1,
+                "def-mcp",
+                3_000,
+                &[definition(
+                    "mcp__claude_ai_Microsoft_365__outlook_send_mail",
+                )],
+            )
+            .await;
+        }
+        part(&db, "t-1", 2, "def-read", 500, &[definition("Read")]).await;
+        part(
+            &db,
+            "t-2",
+            2,
+            "def-codex",
+            4_000,
+            &[definition("exec"), definition("wait")],
+        )
+        .await;
+        part(
+            &db,
+            "t-1",
+            3,
+            "call-bash-1",
+            100,
+            &[("tool_use", Some("Bash"), None, Some("toolu_1"), None)],
+        )
+        .await;
+        part(
+            &db,
+            "t-1",
+            4,
+            "result-bash-1",
+            5_000,
+            &[("tool_result", None, None, Some("toolu_1"), Some(true))],
+        )
+        .await;
+        for request in ["t-1", "t-2"] {
+            part(
+                &db,
+                request,
+                5,
+                "call-bash-2",
+                100,
+                &[("tool_use", Some("Bash"), None, Some("toolu_2"), None)],
+            )
+            .await;
+            part(
+                &db,
+                request,
+                6,
+                "result-bash-2",
+                2_000,
+                &[("tool_result", None, None, Some("toolu_2"), Some(false))],
+            )
+            .await;
+        }
+        part(
+            &db,
+            "t-2",
+            7,
+            "call-skill",
+            100,
+            &[(
+                "tool_use",
+                Some("Skill"),
+                Some("unslop"),
+                Some("toolu_3"),
+                None,
+            )],
+        )
+        .await;
+        for request in ["t-1", "t-2"] {
+            part(
+                &db,
+                request,
+                12,
+                "result-skill",
+                900,
+                &[("tool_result", None, None, Some("toolu_3"), Some(false))],
+            )
+            .await;
+        }
+        db.execute_unprepared(
+            "INSERT INTO gateway_request_metrics(request_id,total_bytes,created_at) VALUES('t-1',10000,'2026-03-01T10:00:00Z'),('t-2',20000,'2026-03-02T10:00:00Z'); \
+             UPDATE gateway_usage SET cost_nanodollars = 1000000 WHERE request_id IN ('t-1','t-2')",
+        )
+        .await
+        .unwrap();
+        part(
+            &db,
+            "t-2",
+            8,
+            "result-orphan",
+            700,
+            &[("tool_result", None, None, Some("toolu_lost"), Some(true))],
+        )
+        .await;
+        part(
+            &db,
+            "t-out",
+            9,
+            "call-read",
+            100,
+            &[("tool_use", Some("Read"), None, Some("toolu_4"), None)],
+        )
+        .await;
+        part(
+            &db,
+            "t-2",
+            10,
+            "result-read",
+            300,
+            &[("tool_result", None, None, Some("toolu_4"), Some(false))],
+        )
+        .await;
+        for request in ["t-1", "t-2"] {
+            part(
+                &db,
+                request,
+                11,
+                "call-glob",
+                100,
+                &[("tool_use", Some("Glob"), None, None, None)],
+            )
+            .await;
+        }
+        (UsageStore::new(db), user)
+    }
+
+    #[tokio::test]
+    async fn tool_usage_counts_each_call_once_and_costs_every_request_that_carried_it() {
+        let (store, user) = tool_fixture().await;
+        let usage = store
+            .tool_usage(user, daily("2026-03-01", "2026-03-02"))
+            .await
+            .unwrap();
+        let tool = |label: Option<&str>, calls, bytes, cost_nanodollars| ToolCalls {
+            label: label.map(str::to_owned),
+            calls,
+            bytes,
+            cost_nanodollars,
+        };
+        assert_eq!(
+            usage.tools,
+            vec![
+                tool(Some("Bash"), 2, 9_200, 975_000),
+                tool(Some("Glob"), 1, 100, 15_000),
+                tool(Some("Skill"), 1, 1_000, 140_000),
+                tool(None, 0, 700, 35_000),
+                tool(Some("Read"), 0, 800, 65_000),
+                tool(Some("exec"), 0, 2_000, 100_000),
+                tool(
+                    Some("mcp__claude_ai_Microsoft_365__outlook_send_mail"),
+                    0,
+                    6_000,
+                    450_000,
+                ),
+                tool(Some("wait"), 0, 2_000, 100_000),
+            ],
+            "Bash: its definition in both requests (2,000 bytes), two calls counted once each \
+             (200), and their results (7,000); every part costs its byte share of each request \
+             that carried it, 100 per byte in t-1 and 50 in t-2. A call without an id counts \
+             once by blob. A result whose call fell before the window, or was never captured, \
+             still adds its bytes. The codex container splits between exec and wait."
+        );
+        assert_eq!(
+            usage.skills,
+            vec![SkillCalls {
+                label: "unslop".to_owned(),
+                calls: 1,
+                bytes: 1_000,
+                cost_nanodollars: 140_000,
+            }],
+            "the Skill call and the body it returned, once each; the body replayed by t-1 \
+             costs that request its share too"
+        );
+        assert_eq!(
+            usage.mcp_servers(),
+            vec![McpServer {
+                label: "claude_ai_Microsoft_365".to_owned(),
+                calls: 0,
+                tools: 1,
+                bytes: 6_000,
+                cost_nanodollars: 450_000,
+            }]
+        );
+
+        let stranger = store
+            .tool_usage(Uuid::now_v7(), daily("2026-03-01", "2026-03-02"))
+            .await
+            .unwrap();
+        assert_eq!(stranger, ToolUsage::default());
+    }
+
+    #[test]
+    fn mcp_servers_order_by_calls_then_name() {
+        let tool = |label: &str, calls, bytes| ToolCalls {
+            label: Some(label.to_owned()),
+            calls,
+            bytes,
+            cost_nanodollars: bytes * 10,
+        };
+        let usage = ToolUsage {
+            tools: vec![
+                tool("mcp__b__x", 5, 1),
+                tool("mcp__a__y", 2, 10),
+                tool("Bash", 100, 500),
+                tool("mcp__c__z", 0, 900),
+                tool("mcp__d__z", 0, 100),
+                tool("mcp__a__w", 0, 5),
+            ],
+            skills: vec![],
+        };
+        assert_eq!(
+            usage
+                .mcp_servers()
+                .iter()
+                .map(|server| (
+                    server.label.as_str(),
+                    server.calls,
+                    server.tools,
+                    server.bytes,
+                    server.cost_nanodollars
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("b", 5, 1, 1, 10),
+                ("a", 2, 2, 15, 150),
+                ("c", 0, 1, 900, 9_000),
+                ("d", 0, 1, 100, 1_000)
+            ],
+            "a server with no calls sorts by name, not by size; a plain tool belongs to no server"
+        );
+    }
+
     #[tokio::test]
     async fn context_totals_sum_the_metrics_of_the_window_for_one_user() {
         let (db, user) = empty_store("user@example.com").await;
@@ -1201,6 +1724,11 @@ mod tests {
         };
         metrics("in-1", KEY, "2026-03-02T10:00:00.000Z", 7, 1).await;
         metrics("in-2", KEY, "2026-03-03T10:00:00.000Z", 8, 0).await;
+        db.execute_unprepared(
+            "INSERT INTO gateway_usage(request_id,input_tokens,output_tokens,cost_nanodollars) VALUES('in-1',1,1,266000)",
+        )
+        .await
+        .unwrap();
         metrics("before", KEY, "2026-02-27T10:00:00.000Z", 9, 4).await;
         metrics("theirs", "key-2", "2026-03-02T11:00:00.000Z", 9, 4).await;
 
@@ -1226,9 +1754,17 @@ mod tests {
                 tools_invoked: 4,
                 tool_result_errors: 1,
                 cache_breakpoints: 6,
-            }
+                tool_definition_cost_nanodollars: 100_000,
+                system_cost_nanodollars: 20_000,
+                user_text_cost_nanodollars: 30_000,
+                assistant_text_cost_nanodollars: 40_000,
+                thinking_cost_nanodollars: 5_000,
+                tool_use_cost_nanodollars: 10_000,
+                tool_result_cost_nanodollars: 60_000,
+                other_cost_nanodollars: 1_000,
+            },
+            "the priced request's cost is split by each part's share of its bytes; the unpriced one adds nothing"
         );
-        assert_eq!(totals.tool_bytes(), 340);
         assert_eq!(ContextTotals::estimated_tokens(3529), 1000);
 
         let theirs = store
