@@ -1,42 +1,59 @@
+mod payload_facts_backfill;
 mod payload_resplit;
 
 use crate::telemetry::timestamp;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 use std::time::Instant;
 
+/// Each job reads what the one before it wrote, so the chain stops at the
+/// first failure instead of recording a pass over half-converted rows.
 pub fn spawn(database: DatabaseConnection) {
-    tokio::spawn(async move { run(&database).await });
+    tokio::spawn(async move {
+        if !run(&database, payload_resplit::NAME, payload_resplit::run).await {
+            return;
+        }
+        run(
+            &database,
+            payload_facts_backfill::NAME,
+            payload_facts_backfill::run,
+        )
+        .await;
+    });
 }
 
-async fn run(database: &DatabaseConnection) {
-    let name = payload_resplit::NAME;
+async fn run(
+    database: &DatabaseConnection,
+    name: &str,
+    job: impl AsyncFnOnce(&DatabaseConnection) -> Result<u64, DbErr>,
+) -> bool {
     match completed(database, name).await {
-        Ok(true) => return,
+        Ok(true) => return true,
         Ok(false) => {}
         Err(error) => {
             tracing::error!(%error, name, "failed to read the background job state");
-            return;
+            return false;
         }
     }
     tracing::info!(name, "background job started");
     let started = Instant::now();
-    let converted = match payload_resplit::run(database).await {
-        Ok(converted) => converted,
+    let processed = match job(database).await {
+        Ok(processed) => processed,
         Err(error) => {
             tracing::error!(%error, name, "background job failed");
-            return;
+            return false;
         }
     };
     if let Err(error) = record(database, name).await {
         tracing::error!(%error, name, "failed to record the completed background job");
-        return;
+        return false;
     }
     tracing::info!(
         name,
-        converted,
+        processed,
         elapsed_ms = started.elapsed().as_millis(),
         "background job finished"
     );
+    true
 }
 
 async fn completed(database: &DatabaseConnection, name: &str) -> Result<bool, DbErr> {
@@ -77,5 +94,28 @@ mod tests {
         record(&database, "example").await.unwrap();
         assert!(completed(&database, "example").await.unwrap());
         assert!(!completed(&database, "other").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_is_not_recorded_and_reports_the_failure() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&database, None).await.unwrap();
+
+        let failed = run(&database, "failing", async |_| {
+            Err(DbErr::Custom("boom".to_owned()))
+        })
+        .await;
+        assert!(!failed);
+        assert!(!completed(&database, "failing").await.unwrap());
+
+        assert!(run(&database, "passing", async |_| Ok(1)).await);
+        assert!(completed(&database, "passing").await.unwrap());
+        assert!(
+            run(&database, "passing", async |_| Err(DbErr::Custom(
+                "boom".to_owned()
+            )))
+            .await,
+            "a recorded job is skipped without running"
+        );
     }
 }
