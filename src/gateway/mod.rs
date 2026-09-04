@@ -3,6 +3,7 @@ use anyhow::Context;
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
+    policies::{Decision, Pipeline, PolicyFailure, RequestContext},
     pricing::cost,
     providers::{Provider, extract_usage, requested_model},
     request_id::RequestId,
@@ -14,7 +15,7 @@ mod http;
 use axum::{
     body::{Body, Bytes, to_bytes},
     extract::Request,
-    http::{HeaderMap, HeaderName, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -25,6 +26,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const POLICY_HEADER: HeaderName = HeaderName::from_static("x-aegis-policy");
+const APPLIED_POLICIES_HEADER: HeaderName = HeaderName::from_static("x-aegis-applied-policies");
 
 pub(crate) fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
@@ -47,6 +50,7 @@ pub struct Gateway {
     client: reqwest::Client,
     sink: SqliteSink,
     keys: KeyStore,
+    policies: Pipeline,
     providers: Arc<HashMap<String, ProviderTarget>>,
     max_capture_bytes: usize,
 }
@@ -79,6 +83,7 @@ impl Gateway {
     pub fn new(
         sink: SqliteSink,
         keys: KeyStore,
+        policies: Pipeline,
         providers: Vec<ProviderConfig>,
         max_capture_bytes: usize,
     ) -> anyhow::Result<Self> {
@@ -111,6 +116,7 @@ impl Gateway {
             client,
             sink,
             keys,
+            policies,
             providers: Arc::new(providers),
             max_capture_bytes,
         })
@@ -170,6 +176,28 @@ impl Gateway {
             Err(error) => return Ok(authentication_error(error)),
         };
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
+        let model = requested_model(&body);
+        let decision = match self.policies.evaluate(RequestContext {
+            provider,
+            model: model.as_deref(),
+            user_id: &authenticated.user_id,
+            key_id: &authenticated.id,
+            body: &body,
+        }) {
+            Ok(decision) => decision,
+            Err(failure) => return Ok(policy_failure(failure)),
+        };
+        if let Some(blocked) = &decision.blocked {
+            return Ok(policy_block(&decision, blocked));
+        }
+        let Decision {
+            body, evaluations, ..
+        } = decision;
+        let applied_policies = evaluations
+            .iter()
+            .map(|evaluation| evaluation.policy)
+            .collect::<Vec<_>>()
+            .join(",");
         let endpoint = parts
             .uri
             .path_and_query()
@@ -178,7 +206,6 @@ impl Gateway {
         let route_prefix = format!("/providers/{provider_id}");
         let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
         let upstream_url = target.upstream_url(upstream_path);
-        let model = requested_model(&body);
         let span = tracing::Span::current();
         span.record("user_id", tracing::field::display(&authenticated.user_id));
         span.record("key_id", tracing::field::display(&authenticated.id));
@@ -303,6 +330,11 @@ impl Gateway {
         let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
+        if let Ok(value) = applied_policies.parse() {
+            response
+                .headers_mut()
+                .insert(APPLIED_POLICIES_HEADER, value);
+        }
         response
             .extensions_mut()
             .insert(crate::access_log::DeferredCompletion);
@@ -327,6 +359,41 @@ fn authentication_error(error: AuthenticationError) -> Response {
         })),
     )
         .into_response()
+}
+
+fn policy_failure(failure: PolicyFailure) -> Response {
+    tracing::error!(error = %failure, "request policy failed; refusing to forward");
+    let mut response = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(json!({
+            "error": "policy_failure",
+            "policy": failure.policy,
+            "message": "a request policy failed, so the request was not forwarded"
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(POLICY_HEADER, HeaderValue::from_static("failed"));
+    response
+}
+
+fn policy_block(decision: &Decision, blocked: &crate::policies::Blocked) -> Response {
+    let mut response = (
+        blocked.status,
+        axum::Json(json!({
+            "error": blocked.code,
+            "policy": blocked.policy,
+            "message": "the request was blocked by a gateway policy"
+        })),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(POLICY_HEADER, HeaderValue::from_static("blocked"));
+    if let Ok(value) = decision.applied_policies().parse() {
+        headers.insert(APPLIED_POLICIES_HEADER, value);
+    }
+    response
 }
 
 fn filtered_headers(headers: &HeaderMap) -> HeaderMap {
