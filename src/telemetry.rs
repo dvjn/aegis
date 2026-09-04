@@ -7,7 +7,7 @@ use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::{collections::BTreeMap, io::Write};
 use uuid::Uuid;
 
 const INTERRUPTED_AFTER: TimeDelta = TimeDelta::minutes(15);
@@ -74,7 +74,7 @@ pub(crate) fn chunk_payload(body: &[u8]) -> Vec<StoredPayload> {
 }
 
 pub(crate) struct SemanticPart {
-    pub path: &'static str,
+    pub path: String,
     pub position: i64,
     pub role: Option<String>,
     pub kind: String,
@@ -86,6 +86,12 @@ pub(crate) struct SemanticPayload {
     pub parts: Vec<SemanticPart>,
 }
 
+pub(crate) struct StoredPart {
+    pub path: String,
+    pub position: i64,
+    pub body: Vec<u8>,
+}
+
 fn parse_body(body: &[u8]) -> Option<serde_json::Value> {
     if let Ok(root) = serde_json::from_slice(&decode_body(body)) {
         return Some(root);
@@ -93,42 +99,86 @@ fn parse_body(body: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice(&decode_brotli_unsniffable(body)?).ok()
 }
 
+fn split_paths(protocol: &str) -> Option<&'static [&'static str]> {
+    match protocol {
+        "anthropic_messages" => Some(&["system", "messages", "tools"]),
+        "openai_responses" => Some(&["instructions", "input", "tools"]),
+        _ => None,
+    }
+}
+
+fn content_block_path(position: usize) -> String {
+    format!("messages/{position}/content")
+}
+
+fn take_elements(value: &mut serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(items) => std::mem::take(items),
+        serde_json::Value::Null => Vec::new(),
+        _ => vec![std::mem::replace(value, serde_json::Value::Null)],
+    }
+}
+
+fn take_content_blocks(message: &mut serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match message.get_mut("content") {
+        Some(serde_json::Value::Array(blocks)) => Some(std::mem::take(blocks)),
+        _ => None,
+    }
+}
+
+fn part(
+    path: String,
+    position: usize,
+    role: Option<String>,
+    fallback_kind: &str,
+    value: &serde_json::Value,
+) -> Option<SemanticPart> {
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback_kind)
+        .to_owned();
+    Some(SemanticPart {
+        path,
+        position: position as i64,
+        role,
+        kind,
+        payload: encode_payload(&serde_json::to_vec(value).ok()?)?,
+    })
+}
+
 pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPayload> {
     let mut root = parse_body(body)?;
     let object = root.as_object_mut()?;
-    let paths: &[&'static str] = match protocol {
-        "anthropic_messages" => &["system", "messages", "tools"],
-        "openai_responses" => &["instructions", "input", "tools"],
-        _ => return None,
-    };
     let mut parts = Vec::new();
-    for path in paths {
+    for path in split_paths(protocol)? {
         let Some(value) = object.get_mut(*path) else {
             continue;
         };
-        let values = match value {
-            serde_json::Value::Array(items) => std::mem::take(items),
-            serde_json::Value::Null => Vec::new(),
-            _ => vec![std::mem::replace(value, serde_json::Value::Null)],
-        };
-        for (position, value) in values.into_iter().enumerate() {
+        for (position, mut value) in take_elements(value).into_iter().enumerate() {
             let role = value
                 .get("role")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
-            let kind = value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(path)
-                .to_owned();
-            let encoded = serde_json::to_vec(&value).ok()?;
-            parts.push(SemanticPart {
+            let blocks = (protocol == "anthropic_messages" && *path == "messages")
+                .then(|| take_content_blocks(&mut value))
+                .flatten();
+            parts.push(part(
+                (*path).to_owned(),
+                position,
+                role.clone(),
                 path,
-                position: position as i64,
-                role,
-                kind,
-                payload: encode_payload(&encoded)?,
-            });
+                &value,
+            )?);
+            for (block_position, block) in blocks.into_iter().flatten().enumerate() {
+                parts.push(part(
+                    content_block_path(position),
+                    block_position,
+                    role.clone(),
+                    "content",
+                    &block,
+                )?);
+            }
         }
     }
     if parts.is_empty() {
@@ -138,6 +188,57 @@ pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPaylo
         envelope: encode_payload(&serde_json::to_vec(&root).ok()?)?,
         parts,
     })
+}
+
+pub(crate) fn reassemble_request(
+    envelope: &[u8],
+    parts: Vec<StoredPart>,
+    protocol: &str,
+) -> Option<Vec<u8>> {
+    let mut grouped: BTreeMap<String, Vec<(i64, serde_json::Value)>> = BTreeMap::new();
+    for stored in parts {
+        grouped
+            .entry(stored.path)
+            .or_default()
+            .push((stored.position, serde_json::from_slice(&stored.body).ok()?));
+    }
+    for values in grouped.values_mut() {
+        values.sort_by_key(|(position, _)| *position);
+    }
+    let ordered = |values: Vec<(i64, serde_json::Value)>| {
+        values
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+    };
+
+    let mut root: serde_json::Value = serde_json::from_slice(envelope).ok()?;
+    let object = root.as_object_mut()?;
+    for path in split_paths(protocol)? {
+        let Some(slot) = object.get_mut(*path) else {
+            continue;
+        };
+        let values = ordered(grouped.remove(*path).unwrap_or_default());
+        match slot {
+            serde_json::Value::Array(items) => *items = values,
+            _ => {
+                if let Some(value) = values.into_iter().next() {
+                    *slot = value;
+                }
+            }
+        }
+    }
+    if let Some(serde_json::Value::Array(messages)) = object.get_mut("messages") {
+        for (position, message) in messages.iter_mut().enumerate() {
+            let Some(blocks) = grouped.remove(&content_block_path(position)) else {
+                continue;
+            };
+            if let Some(serde_json::Value::Array(content)) = message.get_mut("content") {
+                *content = ordered(blocks);
+            }
+        }
+    }
+    serde_json::to_vec(&root).ok()
 }
 
 pub struct CompletionRecord<'a> {
@@ -396,7 +497,11 @@ mod tests {
 
     fn assert_split(body: &[u8]) {
         let payload = split_request(body, "anthropic_messages").expect("the body must parse");
-        let paths: Vec<_> = payload.parts.iter().map(|part| part.path).collect();
+        let paths: Vec<_> = payload
+            .parts
+            .iter()
+            .map(|part| part.path.as_str())
+            .collect();
         assert_eq!(paths, ["system", "messages"]);
         assert_eq!(payload.parts[1].role.as_deref(), Some("user"));
     }
@@ -419,6 +524,169 @@ mod tests {
     #[test]
     fn splits_a_brotli_compressed_body() {
         assert_split(&crate::compression::tests::brotli(REQUEST_BODY));
+    }
+
+    const MIXED_CONTENT_BODY: &[u8] = br#"{
+        "model": "claude-x",
+        "system": [{"type": "text", "text": "be brief"}],
+        "messages": [
+            {"role": "user", "content": "plain string content"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "weighing it up", "signature": "sig"},
+                    {"type": "text", "text": "let me look"},
+                    {"type": "tool_use", "id": "call_1", "name": "read", "input": {"path": "a.rs"}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "file body"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+                ]
+            }
+        ],
+        "tools": [{"name": "read", "input_schema": {"type": "object"}}]
+    }"#;
+
+    fn part_body(part: &SemanticPart) -> Vec<u8> {
+        decode_body(&part.payload.body)
+    }
+
+    fn stored_parts(payload: &SemanticPayload) -> Vec<StoredPart> {
+        payload
+            .parts
+            .iter()
+            .map(|part| StoredPart {
+                path: part.path.clone(),
+                position: part.position,
+                body: part_body(part),
+            })
+            .collect()
+    }
+
+    fn indexed(payload: &SemanticPayload) -> Vec<(&str, i64, &str, Option<&str>)> {
+        payload
+            .parts
+            .iter()
+            .map(|part| {
+                (
+                    part.path.as_str(),
+                    part.position,
+                    part.kind.as_str(),
+                    part.role.as_deref(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn message_content_blocks_are_indexed_under_their_message() {
+        let payload =
+            split_request(MIXED_CONTENT_BODY, "anthropic_messages").expect("the body must parse");
+        assert_eq!(
+            indexed(&payload),
+            [
+                ("system", 0, "text", None),
+                ("messages", 0, "messages", Some("user")),
+                ("messages", 1, "messages", Some("assistant")),
+                ("messages/1/content", 0, "thinking", Some("assistant")),
+                ("messages/1/content", 1, "text", Some("assistant")),
+                ("messages/1/content", 2, "tool_use", Some("assistant")),
+                ("messages", 2, "messages", Some("user")),
+                ("messages/2/content", 0, "tool_result", Some("user")),
+                ("messages/2/content", 1, "image", Some("user")),
+                ("tools", 0, "tools", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_shell_does_not_repeat_the_bytes_of_its_content_blocks() {
+        let payload =
+            split_request(MIXED_CONTENT_BODY, "anthropic_messages").expect("the body must parse");
+        let shells: Vec<serde_json::Value> = payload
+            .parts
+            .iter()
+            .filter(|part| part.path == "messages")
+            .map(|part| serde_json::from_slice(&part_body(part)).unwrap())
+            .collect();
+        assert_eq!(
+            shells,
+            [
+                serde_json::json!({"role": "user", "content": "plain string content"}),
+                serde_json::json!({"role": "assistant", "content": []}),
+                serde_json::json!({"role": "user", "content": []}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_string_content_message_keeps_a_single_row() {
+        let payload =
+            split_request(REQUEST_BODY, "anthropic_messages").expect("the body must parse");
+        assert_eq!(
+            indexed(&payload),
+            [
+                ("system", 0, "system", None),
+                ("messages", 0, "messages", Some("user")),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_input_items_are_not_split_any_further() {
+        let body = br#"{"model":"gpt-x","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let payload = split_request(body, "openai_responses").expect("the body must parse");
+        assert_eq!(indexed(&payload), [("input", 0, "message", Some("user"))]);
+    }
+
+    fn assert_round_trips(body: &[u8], protocol: &str) {
+        let payload = split_request(body, protocol).expect("the body must parse");
+        let envelope = decode_body(&payload.envelope.body);
+        let rebuilt = reassemble_request(&envelope, stored_parts(&payload), protocol)
+            .expect("the parts must reassemble");
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let rebuilt: serde_json::Value = serde_json::from_slice(&rebuilt).unwrap();
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn a_message_mixing_every_content_kind_reassembles_into_the_original_body() {
+        assert_round_trips(MIXED_CONTENT_BODY, "anthropic_messages");
+    }
+
+    #[test]
+    fn scalar_and_absent_fields_reassemble_into_the_original_body() {
+        assert_round_trips(REQUEST_BODY, "anthropic_messages");
+        assert_round_trips(
+            br#"{"model":"gpt-x","instructions":"be brief","input":"hi","tools":[]}"#,
+            "openai_responses",
+        );
+        assert_round_trips(
+            br#"{"model":"claude-x","system":null,"messages":[{"role":"user","content":[]}]}"#,
+            "anthropic_messages",
+        );
+    }
+
+    #[test]
+    fn splitting_an_already_split_body_is_stable() {
+        let once = split_request(MIXED_CONTENT_BODY, "anthropic_messages").unwrap();
+        let envelope = decode_body(&once.envelope.body);
+        let rebuilt =
+            reassemble_request(&envelope, stored_parts(&once), "anthropic_messages").unwrap();
+        let twice = split_request(&rebuilt, "anthropic_messages").unwrap();
+        assert_eq!(indexed(&once), indexed(&twice));
+        assert_eq!(once.envelope.id, twice.envelope.id);
+        let ids = |payload: &SemanticPayload| {
+            payload
+                .parts
+                .iter()
+                .map(|part| part.payload.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&once), ids(&twice));
     }
 
     #[test]
