@@ -29,6 +29,13 @@ pub(crate) fn money_text(nanodollars: i64) -> String {
     }
 }
 
+pub(crate) fn percent_text(part: i64, whole: i64) -> String {
+    if whole <= 0 {
+        return "0.0%".to_owned();
+    }
+    format!("{:.1}%", part as f64 * 100.0 / whole as f64)
+}
+
 pub(crate) fn token_text(value: i64) -> String {
     match value {
         0 => "0".to_owned(),
@@ -40,7 +47,7 @@ pub(crate) fn token_text(value: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_text, money_text, token_text};
+    use super::{count_text, money_text, percent_text, token_text};
 
     #[test]
     fn numbers_read_as_summaries() {
@@ -56,6 +63,13 @@ mod tests {
         ] {
             assert_eq!(token_text(value), expected, "tokens {value}");
         }
+    }
+
+    #[test]
+    fn shares_read_as_tenths_of_a_percent() {
+        assert_eq!(percent_text(5847, 10_000), "58.5%");
+        assert_eq!(percent_text(1, 0), "0.0%");
+        assert_eq!(percent_text(0, 10), "0.0%");
     }
 
     #[test]

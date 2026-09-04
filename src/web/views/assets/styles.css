@@ -209,12 +209,6 @@ main.account-shell {
   align-items: start;
 }
 
-/* Two readings of the same shape carry equal weight, unlike the account page
-   where tables and forms want different room. */
-.account-grid-even {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
 .account-column {
   display: flex;
   flex-direction: column;
@@ -285,6 +279,77 @@ main.home-shell p {
 
 .auth-card h2 + .table-wrap {
   margin-top: var(--space-4);
+}
+
+/* The bar and the table keep the gap a chart and its table have. Written to
+   outrank the closing-table rule below, which resets every margin. */
+.auth-card > .stacked-bar + .table-wrap:last-child {
+  margin-top: var(--space-4);
+}
+
+/* --- Overview grid ------------------------------------------------------- */
+
+/* Twelve columns over a fixed row unit. The tiles share the first row at
+   their natural height; every card below spans half the columns and as many
+   row units as its content needs. The unit is fixed rather than a floor so
+   both columns keep the same row lines: a card that grew its own row would
+   leave a gap beside the cards across from it. Content that outgrows a card
+   scrolls inside it. */
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-template-rows: auto;
+  grid-auto-rows: 172px;
+  gap: var(--space-4);
+}
+
+.overview-grid > .tile {
+  grid-column: span 4;
+  grid-row: 1;
+}
+
+.grid-half {
+  grid-column: span 6;
+}
+
+.grid-full {
+  grid-column: span 12;
+}
+
+.rows-1 {
+  grid-row: span 1;
+}
+
+.rows-2 {
+  grid-row: span 2;
+}
+
+.rows-3 {
+  grid-row: span 3;
+}
+
+/* The table takes what the title, subtitle, and chart leave and scrolls
+   inside it with its header pinned. */
+.overview-grid > .account-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.overview-grid > .account-card > .table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* The rule under the header is drawn as an inset shadow: a border would
+   scroll away with the rows while the sticky header stays. */
+.overview-grid > .account-card thead th {
+  position: sticky;
+  top: 0;
+  border-bottom: 0;
+  background: var(--surface-1);
+  box-shadow: inset 0 -1px var(--line);
 }
 
 /* A table that closes a card runs to its edges. Inset, it would draw a second
@@ -619,13 +684,6 @@ a[role="button"].compact {
 
 /* --- Tiles and ranges ---------------------------------------------------- */
 
-.tile-row {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--space-4);
-  margin-bottom: var(--space-4);
-}
-
 /* Same padding as a card, so a tile label sits on the column line the headings
    and table cells below it share. */
 .tile {
@@ -828,6 +886,7 @@ a[role="button"].compact {
 /* The row's swatch matches the line drawn for it in the chart above. */
 .row-swatch {
   display: inline-block;
+  flex: none;
   width: 8px;
   height: 8px;
   margin-right: var(--space-2);
@@ -863,6 +922,17 @@ a[role="button"].compact {
 .tokens-cache-write { color: #d47fd8; }
 .tokens-output { color: #e0a458; }
 
+/* The prose parts share the warm end of the palette and the tool parts the
+   cool end, so the two halves of the payload read apart in the bar. */
+.context-tool-definitions { color: #5b8def; }
+.context-tool-calls { color: #9a8cf5; }
+.context-tool-results { color: #58c1d8; }
+.context-system { color: #e0a458; }
+.context-user { color: #d4c15f; }
+.context-assistant { color: #d47fd8; }
+.context-thinking { color: #b8a27a; }
+.context-other { color: #9fb0c3; }
+
 /* --- Tables -------------------------------------------------------------- */
 
 /* A table keeps its column widths, so a narrow card scrolls it rather than
@@ -887,15 +957,14 @@ a[role="button"].compact {
   vertical-align: middle;
 }
 
-/* Every body row reserves the height of the compact buttons it may hold, so a
-   row with actions is no taller than one without. */
-.data-table tbody th,
-.data-table tbody td {
+/* Every row reserves the height of the compact buttons a body row may hold, so
+   a row with actions is no taller than one without, and the header matches. */
+.data-table th,
+.data-table td {
   height: var(--control-height-sm);
 }
 
 .data-table thead th {
-  padding-bottom: var(--space-1);
   border-bottom: 1px solid var(--line);
   color: var(--muted);
   font-size: 11px;
@@ -946,6 +1015,7 @@ a[role="button"].compact {
 .data-table .col-numeric {
   text-align: right;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* The action column is sized by its buttons; the flexible columns give up
@@ -974,6 +1044,17 @@ a[role="button"].compact {
   color: var(--muted);
   font-size: 13px;
 }
+
+/* Four columns in a half-width card: the tool name gives up room and the long
+   header may wrap, so the table does not scroll. */
+.tool-table .cell-title {
+  max-width: 12rem;
+}
+
+.tool-table thead th {
+  white-space: normal;
+}
+
 
 .chip-row {
   display: flex;
@@ -1156,10 +1237,24 @@ a[role="button"].compact {
 
 /* Two columns of tables stop fitting well before the phone breakpoint. */
 @media (max-width: 60rem) {
-  .account-grid,
-  .account-grid-even,
-  .tile-row {
+  .account-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* One column, each card as tall as its content. */
+  .overview-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-auto-rows: auto;
+  }
+
+  .overview-grid > .tile,
+  .grid-half,
+  .grid-full,
+  .rows-1,
+  .rows-2,
+  .rows-3 {
+    grid-column: auto;
+    grid-row: auto;
   }
 }
 

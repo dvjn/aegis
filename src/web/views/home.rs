@@ -1,14 +1,21 @@
 use maud::{Markup, html};
 
-use super::charts::{Series, line_chart, row_series_class, series_class, sparkline, stacked_bar};
-use super::format::{count_text, money_text, token_text};
-use super::{layout_with_nav, signed_in_nav};
-use crate::usage::{LabeledSeries, Range, TotalsSeries, UsageGroup, UsageTotals};
+use super::charts::{
+    Series, line_chart, row_series_class, series_class, sparkline, stacked_bar,
+    stacked_bar_without_legend,
+};
+use super::format::{count_text, money_text, percent_text, token_text};
+use super::{layout_with_nav, signed_in_nav, tools};
+use crate::usage::{
+    ContextTotals, LabeledSeries, Range, ToolUsage, TotalsSeries, UsageGroup, UsageTotals,
+};
 
 /// Everything the overview needs, gathered by the handler in one place.
 pub struct Overview<'a> {
     pub range: Range,
     pub totals: &'a UsageTotals,
+    pub context: &'a ContextTotals,
+    pub tools: &'a ToolUsage,
     pub series: &'a TotalsSeries,
     pub models: &'a [UsageGroup],
     pub providers: &'a [UsageGroup],
@@ -32,7 +39,7 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                     h1 class="page-title" { "Overview" }
                     (range_switch(overview.range))
                 }
-                div class="tile-row" {
+                div class="overview-grid" {
                     (tile(
                         "Requests",
                         &count_text(totals.requests),
@@ -69,17 +76,129 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                         tile_sparkline(&overview.series.cost_nanodollars),
                         cost_by_model_bar(overview.models),
                     ))
-                }
-                div class="account-grid account-grid-even" {
-                    (breakdown_card("Models", "Requests, tokens, and cost by the model each request asked for.", "Model", overview.models, overview.model_series))
-                    div class="account-column" {
-                        (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", overview.providers, overview.provider_series))
-                        (breakdown_card("Keys", "Requests, tokens, and cost by the key that sent them.", "Key", overview.keys, overview.key_series))
-                    }
+                    (breakdown_card("Models", "Requests, tokens, and cost by the model each request asked for.", "Model", "grid-half rows-3", overview.models, overview.model_series))
+                    (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", "grid-half rows-2", overview.providers, overview.provider_series))
+                    (breakdown_card("Keys", "Requests, tokens, and cost by the key that sent them.", "Key", "grid-half rows-2", overview.keys, overview.key_series))
+                    (context_card(overview.context))
+                    (tools::mcp_card(overview.tools))
+                    (tools::calls_card(overview.tools))
+                    (tools::skills_card(overview.tools))
                 }
             }
         },
     )
+}
+
+/// One part of the request payload: its label, bytes, apportioned cost, and
+/// colour class.
+struct ContextPart {
+    label: &'static str,
+    bytes: i64,
+    cost_nanodollars: i64,
+    class: &'static str,
+}
+
+/// What a turn is built from, in the order it reaches the model, in one fixed
+/// order whatever the sizes, so the same row is in the same place on every
+/// visit.
+fn context_parts(context: &ContextTotals) -> [ContextPart; 8] {
+    let part = |label, bytes, cost_nanodollars, class| ContextPart {
+        label,
+        bytes,
+        cost_nanodollars,
+        class,
+    };
+    [
+        part(
+            "system",
+            context.system_bytes,
+            context.system_cost_nanodollars,
+            "context-system",
+        ),
+        part(
+            "tool definition",
+            context.tool_definition_bytes,
+            context.tool_definition_cost_nanodollars,
+            "context-tool-definitions",
+        ),
+        part(
+            "user",
+            context.user_text_bytes,
+            context.user_text_cost_nanodollars,
+            "context-user",
+        ),
+        part(
+            "thinking",
+            context.thinking_bytes,
+            context.thinking_cost_nanodollars,
+            "context-thinking",
+        ),
+        part(
+            "assistant",
+            context.assistant_text_bytes,
+            context.assistant_text_cost_nanodollars,
+            "context-assistant",
+        ),
+        part(
+            "tool call",
+            context.tool_use_bytes,
+            context.tool_use_cost_nanodollars,
+            "context-tool-calls",
+        ),
+        part(
+            "tool result",
+            context.tool_result_bytes,
+            context.tool_result_cost_nanodollars,
+            "context-tool-results",
+        ),
+        part(
+            "other",
+            context.other_bytes,
+            context.other_cost_nanodollars,
+            "context-other",
+        ),
+    ]
+}
+
+fn context_card(context: &ContextTotals) -> Markup {
+    let parts = context_parts(context);
+    let estimated = |bytes: i64| token_text(ContextTotals::estimated_tokens(bytes));
+    let segments: Vec<(&str, f64, &str)> = parts
+        .iter()
+        .map(|part| (part.label, part.bytes as f64, part.class))
+        .collect();
+    html! {
+        article class="auth-card account-card grid-half rows-2" {
+            h2 { "Context" }
+            p { "Estimated tokens in request payloads by part." }
+            (stacked_bar_without_legend(&segments, &|value| estimated(value as i64)))
+            div class="table-wrap" {
+                table class="data-table" {
+                    thead {
+                        tr {
+                            th scope="col" { "Part" }
+                            th scope="col" class="col-numeric" { "Tokens" }
+                            th scope="col" class="col-numeric" { "Share" }
+                            th scope="col" class="col-numeric" { "Cost" }
+                        }
+                    }
+                    tbody {
+                        @for part in &parts {
+                            tr {
+                                th scope="row" class="cell-title" title=(part.label) {
+                                    span class=(format!("row-swatch {}", part.class)) aria-hidden="true" {}
+                                    (part.label)
+                                }
+                                td class="col-numeric" { (estimated(part.bytes)) }
+                                td class="col-numeric" { (percent_text(part.bytes, context.total_bytes)) }
+                                td class="col-numeric" { (money_text(part.cost_nanodollars)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn range_switch(current: Range) -> Markup {
@@ -168,10 +287,12 @@ fn chart_series(series: &[LabeledSeries]) -> Vec<Series> {
         .collect()
 }
 
+/// `placement` is the card's span classes in the overview grid.
 fn breakdown_card(
     title: &str,
     blurb: &str,
     column: &str,
+    placement: &str,
     rows: &[UsageGroup],
     series: &[LabeledSeries],
 ) -> Markup {
@@ -184,7 +305,7 @@ fn breakdown_card(
             .map(|index| (row_series_class(index, series.len()), &series[index].tokens))
     };
     html! {
-        article class="auth-card account-card" {
+        article class=(format!("auth-card account-card {placement}")) {
             h2 { (title) }
             p { (blurb) }
             (line_chart(&chart_series(series), &|value| token_text(value as i64)))
@@ -269,6 +390,8 @@ mod tests {
         let page = page(&Overview {
             range: Range::Week,
             totals: &totals,
+            context: &ContextTotals::default(),
+            tools: &ToolUsage::default(),
             series: &series,
             models: &models,
             providers: &[],
@@ -347,6 +470,8 @@ mod tests {
         let page = page(&Overview {
             range: Range::Week,
             totals: &UsageTotals::default(),
+            context: &ContextTotals::default(),
+            tools: &ToolUsage::default(),
             series: &TotalsSeries {
                 requests: vec![0; 8],
                 tokens: vec![0; 8],
@@ -370,8 +495,67 @@ mod tests {
             assert!(!page.contains(absent), "{absent} leaked into the page");
         }
         assert!(
-            page.contains(r#"<div class="account-column">"#),
-            "Keys stacks under Providers"
+            page.contains(
+                r#"<article class="auth-card account-card grid-half rows-2"><h2>Keys</h2>"#
+            ),
+            "Keys takes half the columns and two row units"
+        );
+    }
+
+    #[test]
+    fn the_overview_is_one_twelve_column_grid_with_a_fixed_row_unit() {
+        let styles = include_str!("assets/styles.css");
+        assert!(styles.contains(
+            ".overview-grid {\n  display: grid;\n  grid-template-columns: repeat(12, minmax(0, 1fr));\n  grid-template-rows: auto;\n  grid-auto-rows: 172px;"
+        ));
+        assert!(
+            styles.contains(".overview-grid > .tile {\n  grid-column: span 4;\n  grid-row: 1;")
+        );
+        assert!(styles.contains(".grid-half {\n  grid-column: span 6;"));
+        assert!(styles.contains(".rows-3 {\n  grid-row: span 3;"));
+        assert!(styles.contains(
+            ".overview-grid > .account-card > .table-wrap {\n  flex: 1;\n  min-height: 0;\n  overflow-y: auto;"
+        ));
+        assert!(
+            styles.contains(
+                ".overview-grid > .account-card thead th {\n  position: sticky;\n  top: 0;"
+            )
+        );
+
+        let page = page_without_traffic().into_string();
+        assert_eq!(page.matches(r#"<article class="tile">"#).count(), 3);
+        assert!(
+            page.contains(
+                r#"<article class="auth-card account-card grid-half rows-3"><h2>Models</h2>"#
+            ),
+            "Models is three units tall beside Providers and Keys at two each: {page}"
+        );
+        assert!(page.contains(
+            r#"<article class="auth-card account-card grid-half rows-2"><h2>Providers</h2>"#
+        ));
+        assert!(
+            !page.contains("account-column"),
+            "no column wrappers: the grid places every card"
+        );
+        assert!(!page.contains("tile-row"));
+        let order: Vec<usize> = [
+            r#"grid-half rows-3"><h2>Models</h2>"#,
+            r#"grid-half rows-2"><h2>Providers</h2>"#,
+            r#"grid-half rows-2"><h2>Keys</h2>"#,
+            r#"grid-half rows-2"><h2>Context</h2>"#,
+            r#"grid-half rows-2"><h2>MCPs</h2>"#,
+            r#"grid-half rows-3"><h2>Tools</h2>"#,
+            r#"grid-half rows-2"><h2>Skills</h2>"#,
+        ]
+        .iter()
+        .map(|card| {
+            page.find(card)
+                .unwrap_or_else(|| panic!("{card} in {page}"))
+        })
+        .collect();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "auto-placement in this order puts Models (3) over Context (2) on the left, Providers (2), Keys (2), Skills (2) on the right, Tools on the left beside the slot Skills leaves, then MCP servers across the row: {order:?}"
         );
     }
 
@@ -382,6 +566,7 @@ mod tests {
             line.starts_with(".series-")
                 || line.starts_with(".status-")
                 || line.starts_with(".tokens-")
+                || line.starts_with(".context-")
         }) {
             assert!(!rule.contains("fill"), "{rule}");
         }
@@ -423,10 +608,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_context_card_keeps_every_part_in_one_fixed_order() {
+        let context = ContextTotals {
+            requests: 4,
+            tool_definition_bytes: 3_228_000,
+            system_bytes: 1_000_000,
+            user_text_bytes: 500_000,
+            assistant_text_bytes: 400_000,
+            thinking_bytes: 253_000,
+            tool_use_bytes: 619_000,
+            tool_result_bytes: 2_000_000,
+            other_bytes: 0,
+            total_bytes: 8_000_000,
+            tools_offered: 40,
+            tools_invoked: 6,
+            tool_result_errors: 1,
+            cache_breakpoints: 8,
+            tool_definition_cost_nanodollars: 40_350_000,
+            system_cost_nanodollars: 12_500_000,
+            user_text_cost_nanodollars: 6_250_000,
+            assistant_text_cost_nanodollars: 5_000_000,
+            thinking_cost_nanodollars: 3_162_500,
+            tool_use_cost_nanodollars: 7_737_500,
+            tool_result_cost_nanodollars: 25_000_000,
+            other_cost_nanodollars: 0,
+        };
+        let card = context_card(&context).into_string();
+        assert!(
+            card.contains(
+                r#"<h2>Context</h2><p>Estimated tokens in request payloads by part.</p>"#
+            ),
+            "{card}"
+        );
+        let order: Vec<usize> = [
+            "system",
+            "tool definition",
+            "user",
+            "thinking",
+            "assistant",
+            "tool call",
+            "tool result",
+            "other",
+        ]
+        .iter()
+        .map(|label| card.find(&format!(r#"title="{label}""#)).unwrap())
+        .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+        assert!(
+            card.contains(r#"<rect class="context-tool-definitions" x="12.5" y="0" width="40.35" height="8"><title>914.7k tool definition</title></rect>"#),
+            "{card}"
+        );
+        assert!(!card.contains("stacked-legend"), "the table is the key");
+        assert!(!card.contains("MB"), "sizes read as tokens, never bytes");
+        assert!(
+            !card.contains("est."),
+            "the estimate is not repeated in every header"
+        );
+        assert!(
+            card.contains(r#"<th scope="col" class="col-numeric">Tokens</th><th scope="col" class="col-numeric">Share</th><th scope="col" class="col-numeric">Cost</th>"#)
+        );
+        assert!(
+            card.contains(r#"<td class="col-numeric">566.7k</td><td class="col-numeric">25.0%</td><td class="col-numeric">$0.03</td>"#),
+            "{card}"
+        );
+        assert!(
+            card.contains(r#"<span class="row-swatch context-other" aria-hidden="true"></span>other</th><td class="col-numeric">0</td><td class="col-numeric">0.0%</td><td class="col-numeric">$0.00</td>"#),
+            "an empty part keeps its row: {card}"
+        );
+        for absent in ["tool-related", "requests", "bytes per token"] {
+            assert!(!card.contains(absent), "{absent} is a derived sentence");
+        }
+
+        let page = page_without_traffic().into_string();
+        assert!(
+            page.contains(r#"<h2>Keys</h2>"#) && page.contains(r#"<h2>Context</h2>"#),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                r#"<article class="auth-card account-card grid-half rows-2"><h2>Context</h2>"#
+            ),
+            "Context takes half the columns and two row units"
+        );
+        assert!(
+            !page.contains("section-title"),
+            "no separator between the cards"
+        );
+    }
+
     fn page_without_traffic() -> Markup {
         page(&Overview {
             range: Range::Week,
             totals: &UsageTotals::default(),
+            context: &ContextTotals::default(),
+            tools: &ToolUsage::default(),
             series: &TotalsSeries {
                 requests: vec![0; 8],
                 tokens: vec![0; 8],
