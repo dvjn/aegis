@@ -1,6 +1,7 @@
 mod access_log;
 mod api_keys;
 mod app;
+mod compression;
 mod config;
 mod db;
 mod domain;
