@@ -13,7 +13,6 @@ mod migration;
 mod oauth;
 mod origin;
 mod payload_facts;
-#[allow(dead_code)]
 mod policies;
 mod pricing;
 mod providers;

@@ -338,6 +338,34 @@ impl LabeledSeries {
     }
 }
 
+/// What the secrets policy did to the requests in a window.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GuardrailsSummary {
+    pub requests_scanned: i64,
+    pub requests_masked: i64,
+    pub placeholders_substituted: i64,
+    pub detectors: Vec<DetectorCount>,
+}
+
+impl GuardrailsSummary {
+    pub fn is_empty(&self) -> bool {
+        self.requests_scanned == 0
+    }
+}
+
+#[derive(Debug, FromQueryResult, PartialEq, Eq, Serialize)]
+pub struct DetectorCount {
+    pub detector: String,
+    pub matches: i64,
+}
+
+#[derive(Debug, Default, FromQueryResult)]
+struct GuardrailsCounts {
+    requests_scanned: i64,
+    requests_masked: i64,
+    placeholders_substituted: i64,
+}
+
 #[derive(Debug, FromQueryResult)]
 struct TotalsPoint {
     bucket: String,
@@ -494,6 +522,35 @@ const LABELED_SERIES_SQL: &str = "SELECT {column} label, {bucket} bucket, \
      {tokens} tokens \
      {from} \
      GROUP BY {column}, bucket";
+
+const SECRETS_FROM_SQL: &str = "FROM policy_evaluations e \
+     JOIN gateway_requests r ON r.id = e.request_id \
+     JOIN gateway_keys k ON k.id = r.key_id";
+
+const SECRETS_WHERE_SQL: &str = "WHERE e.policy = 'secrets' \
+     AND k.user_id = ? AND r.started_at >= ? AND r.started_at <= ?";
+
+const GUARDRAILS_COUNTS_SQL: &str = "SELECT COUNT(DISTINCT e.request_id) requests_scanned, \
+     COUNT(DISTINCT CASE WHEN e.outcome = 'transform' THEN e.request_id END) requests_masked, \
+     COALESCE(SUM(e.match_count), 0) placeholders_substituted \
+     {secrets_from} {secrets_where}";
+
+/// Metadata that is missing, malformed, or without a detectors object gives
+/// `json_each` a NULL, which yields no rows.
+const DETECTOR_COUNTS_SQL: &str = "SELECT d.key detector, \
+     COALESCE(SUM(CAST(d.value AS INTEGER)), 0) matches \
+     {secrets_from} \
+     JOIN json_each(CASE WHEN json_valid(e.metadata) \
+     AND json_type(e.metadata, '$.detectors') = 'object' \
+     THEN json_extract(e.metadata, '$.detectors') END) d \
+     {secrets_where} \
+     GROUP BY d.key ORDER BY matches DESC, detector";
+
+fn render_secrets_sql(template: &str) -> String {
+    template
+        .replace("{secrets_from}", SECRETS_FROM_SQL)
+        .replace("{secrets_where}", SECRETS_WHERE_SQL)
+}
 
 fn render_sql(template: &str, column: &str, bucket: Bucket) -> String {
     template
@@ -659,6 +716,30 @@ impl UsageStore {
         self.labeled_series("k.name", user_id, window).await
     }
 
+    pub async fn guardrails(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<GuardrailsSummary, sea_orm::DbErr> {
+        let counts_sql = render_secrets_sql(GUARDRAILS_COUNTS_SQL);
+        let counts =
+            GuardrailsCounts::find_by_statement(self.statement(&counts_sql, user_id, window))
+                .one(&self.database)
+                .await?
+                .unwrap_or_default();
+        let detectors_sql = render_secrets_sql(DETECTOR_COUNTS_SQL);
+        let detectors =
+            DetectorCount::find_by_statement(self.statement(&detectors_sql, user_id, window))
+                .all(&self.database)
+                .await?;
+        Ok(GuardrailsSummary {
+            requests_scanned: counts.requests_scanned,
+            requests_masked: counts.requests_masked,
+            placeholders_substituted: counts.placeholders_substituted,
+            detectors,
+        })
+    }
+
     async fn breakdown(
         &self,
         column: &str,
@@ -783,6 +864,26 @@ mod tests {
     async fn complete(db: &DatabaseConnection, id: &str, status: i32) {
         db.execute_unprepared(&format!(
             "UPDATE gateway_requests SET http_status = {status} WHERE id = '{id}'"
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn evaluate(
+        db: &DatabaseConnection,
+        id: &str,
+        request_id: &str,
+        outcome: &str,
+        match_count: i64,
+        metadata: Option<&str>,
+    ) {
+        let metadata = match metadata {
+            Some(metadata) => format!("'{metadata}'"),
+            None => "NULL".to_owned(),
+        };
+        db.execute_unprepared(&format!(
+            "INSERT INTO policy_evaluations(id,request_id,policy,policy_version,stage,outcome,match_count,duration_micros,metadata,created_at) \
+             VALUES('{id}','{request_id}','secrets',1,'request','{outcome}',{match_count},0,{metadata},'2026-03-01T00:00:00Z')"
         ))
         .await
         .unwrap();
@@ -1779,5 +1880,79 @@ mod tests {
                 .unwrap(),
             ContextTotals::default()
         );
+    }
+
+    #[tokio::test]
+    async fn guardrails_count_secrets_evaluations_and_their_detectors() {
+        let (store, user) = fixture().await;
+        let db = &store.database;
+        evaluate(
+            db,
+            "e-1",
+            "r-hour",
+            "transform",
+            3,
+            Some(r#"{"detectors":{"github_token":2,"aws_access_key_id":1},"placeholders":["AEGIS_SECRET_1_END"]}"#),
+        )
+        .await;
+        evaluate(db, "e-2", "r-hour", "allow", 0, Some("null")).await;
+        evaluate(
+            db,
+            "e-3",
+            "r-days",
+            "transform",
+            1,
+            Some(r#"{"detectors":{"github_token":1}}"#),
+        )
+        .await;
+        evaluate(db, "e-4", "r-weeks", "allow", 0, Some("{not json")).await;
+        evaluate(db, "e-5", "r-weeks", "allow", 0, None).await;
+        evaluate(db, "e-6", "r-weeks", "allow", 0, Some(r#"{"detectors":7}"#)).await;
+        evaluate(
+            db,
+            "e-old",
+            "r-old",
+            "transform",
+            9,
+            Some(r#"{"detectors":{"github_token":9}}"#),
+        )
+        .await;
+        db.execute_unprepared(
+            "INSERT INTO policy_evaluations(id,request_id,policy,policy_version,stage,outcome,match_count,duration_micros,metadata,created_at) \
+             VALUES('e-other','r-hour','other',1,'request','transform',5,0,'{\"detectors\":{\"x\":5}}','2026-03-01T00:00:00Z')",
+        )
+        .await
+        .unwrap();
+
+        let summary = store.guardrails(user, last(Range::Month)).await.unwrap();
+        assert_eq!(
+            summary,
+            GuardrailsSummary {
+                requests_scanned: 3,
+                requests_masked: 2,
+                placeholders_substituted: 4,
+                detectors: vec![
+                    DetectorCount {
+                        detector: "github_token".to_owned(),
+                        matches: 3,
+                    },
+                    DetectorCount {
+                        detector: "aws_access_key_id".to_owned(),
+                        matches: 1,
+                    },
+                ],
+            }
+        );
+
+        let day = store.guardrails(user, last(Range::Day)).await.unwrap();
+        assert_eq!(day.requests_scanned, 1);
+        assert_eq!(day.placeholders_substituted, 3);
+
+        let stranger = store
+            .guardrails(Uuid::now_v7(), last(Range::Month))
+            .await
+            .unwrap();
+        assert!(stranger.is_empty());
+        assert!(stranger.detectors.is_empty());
     }
 }
