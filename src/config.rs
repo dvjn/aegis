@@ -97,7 +97,7 @@ struct FileConfig {
     database_url: String,
     #[serde(default = "default_max_capture_bytes")]
     max_capture_bytes: usize,
-    #[serde(default = "default_providers")]
+    #[serde(default)]
     providers: Vec<ProviderConfig>,
     #[serde(default)]
     public_url: Option<String>,
@@ -113,7 +113,7 @@ impl Default for FileConfig {
             http_addr: default_http_addr(),
             database_url: default_database_url(),
             max_capture_bytes: default_max_capture_bytes(),
-            providers: default_providers(),
+            providers: Vec::new(),
             public_url: None,
             registration_enabled: false,
             pricing: PricingConfig::default(),
@@ -339,23 +339,6 @@ fn default_pricing_enabled() -> bool {
     true
 }
 
-fn default_providers() -> Vec<ProviderConfig> {
-    vec![
-        ProviderConfig {
-            id: "claude".into(),
-            kind: ProviderKind::ClaudeSubscription {
-                base_url: default_anthropic_base_url(),
-            },
-        },
-        ProviderConfig {
-            id: "codex".into(),
-            kind: ProviderKind::CodexSubscription {
-                base_url: default_codex_base_url(),
-            },
-        },
-    ]
-}
-
 fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
     let mut ids = HashSet::new();
     for provider in providers {
@@ -428,7 +411,7 @@ mod tests {
         let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
         assert_eq!(config.http_addr, default_http_addr());
         assert_eq!(config.database_url, default_database_url());
-        assert_eq!(config.providers.len(), 2);
+        assert!(config.providers.is_empty());
     }
 
     #[test]

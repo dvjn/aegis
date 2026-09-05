@@ -10,7 +10,7 @@ TARGETS = "{{ env.BUILD_TARGETS | default(value='x86_64-unknown-linux-musl:amd64
 
 [tasks.local-bootstrap]
 description = "Create the standard local account and API key when absent"
-env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8765" }
+env = { AEGIS_CONFIG = "config.local.toml" }
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -49,7 +49,7 @@ printf 'Local server: http://127.0.0.1:8765\nEmail: admin@example.com\nPassword:
 [tasks.dev]
 description = "Run the local server with live reload"
 depends = ["local-bootstrap"]
-env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8765" }
+env = { AEGIS_CONFIG = "config.local.toml" }
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -59,7 +59,7 @@ exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --ext
 [tasks.serve]
 description = "Run the local server once, without live reload"
 depends = ["local-bootstrap"]
-env = { DATABASE_URL = "sqlite://data/dev.db?mode=rwc", HTTP_ADDR = "127.0.0.1:8765" }
+env = { AEGIS_CONFIG = "config.local.toml" }
 run = "cargo run -- serve"
 
 [tasks.health]
