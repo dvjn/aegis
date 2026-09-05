@@ -307,6 +307,11 @@ impl SqliteSink {
                     .as_deref()
                     .map(request_metrics::PreparedMetrics::chunks)
             });
+        let tools = semantic_payload
+            .as_ref()
+            .map(crate::analytics_facts::PreparedTools::semantic)
+            .transpose()?
+            .unwrap_or_default();
         let transaction = begin_immediate(&self.database).await?;
         transaction
             .execute_raw(Statement::from_sql_and_values(
@@ -342,6 +347,7 @@ impl SqliteSink {
         if let Some(metrics) = metrics {
             metrics.store(&transaction, &id.to_string()).await?;
         }
+        tools.store(&transaction, &id.to_string()).await?;
         transaction.commit().await?;
         Ok(id)
     }

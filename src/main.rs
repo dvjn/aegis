@@ -1,4 +1,5 @@
 mod access_log;
+mod analytics_facts;
 mod api_keys;
 mod app;
 mod compression;

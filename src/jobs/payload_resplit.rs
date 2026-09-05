@@ -150,6 +150,7 @@ async fn replace_if_unchanged(
     payload: SemanticPayload,
 ) -> Result<bool, DbErr> {
     let metrics = PreparedMetrics::semantic(&payload);
+    let tools = crate::analytics_facts::PreparedTools::semantic(&payload)?;
     let transaction = begin_immediate(database).await?;
     if source_state(&transaction, request).await? != *state {
         transaction.rollback().await?;
@@ -171,6 +172,7 @@ async fn replace_if_unchanged(
         ))
         .await?;
     metrics.store(&transaction, &request.id).await?;
+    tools.store(&transaction, &request.id).await?;
     transaction.commit().await?;
     Ok(true)
 }
