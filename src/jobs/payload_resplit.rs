@@ -1,6 +1,7 @@
 use crate::{
     compression::decode_body,
     db::begin_immediate,
+    request_metrics::PreparedMetrics,
     telemetry::{SemanticPayload, StoredPart, reassemble_request, split_request, store_blob},
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
@@ -148,6 +149,7 @@ async fn replace_if_unchanged(
     state: &SourceState,
     payload: SemanticPayload,
 ) -> Result<bool, DbErr> {
+    let metrics = PreparedMetrics::semantic(&payload);
     let transaction = begin_immediate(database).await?;
     if source_state(&transaction, request).await? != *state {
         transaction.rollback().await?;
@@ -161,6 +163,14 @@ async fn replace_if_unchanged(
         ))
         .await?;
     store_semantic(&transaction, &request.id, payload).await?;
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM gateway_request_metrics WHERE request_id = ?",
+            [request.id.clone().into()],
+        ))
+        .await?;
+    metrics.store(&transaction, &request.id).await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -454,6 +464,60 @@ mod tests {
         assert_eq!(source_state(db, &request).await.unwrap(), changed);
         assert_eq!(run(db).await.unwrap(), 1);
         db.close_by_ref().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resplitting_replaces_stale_metrics_and_revises_the_request() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&database, None).await.unwrap();
+        message_level_capture(&database).await;
+        crate::request_metrics::rollup(&database, REQUEST_ID)
+            .await
+            .unwrap();
+        let before = crate::request_metrics::tests::metrics(&database, REQUEST_ID)
+            .await
+            .unwrap();
+        assert_eq!(before.tool_result_bytes, 0);
+        let revision = || {
+            Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT revision FROM gateway_analytics_revisions WHERE request_id = ?",
+                [REQUEST_ID.into()],
+            )
+        };
+        let first: i64 = database
+            .query_one_raw(revision())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "revision")
+            .unwrap();
+        assert_eq!(run(&database).await.unwrap(), 1);
+        let prepared = crate::request_metrics::tests::metrics(&database, REQUEST_ID)
+            .await
+            .unwrap();
+        assert!(prepared.tool_result_bytes > 0);
+        let next: i64 = database
+            .query_one_raw(revision())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "revision")
+            .unwrap();
+        assert!(next > first);
+        database
+            .execute_unprepared("DELETE FROM gateway_request_metrics")
+            .await
+            .unwrap();
+        crate::request_metrics::rollup(&database, REQUEST_ID)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::request_metrics::tests::metrics(&database, REQUEST_ID)
+                .await
+                .unwrap(),
+            prepared
+        );
     }
 
     #[tokio::test]

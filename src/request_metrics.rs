@@ -1,5 +1,6 @@
-use crate::telemetry::timestamp;
+use crate::telemetry::{SemanticPayload, StoredPayload, timestamp};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
+use std::collections::{HashMap, HashSet};
 
 const COMPONENT_SQL: &str = "CASE
     WHEN r.path = 'tools' OR r.kind = 'additional_tools' THEN 'tool_definition'
@@ -54,6 +55,108 @@ FROM (SELECT b.original_bytes bytes, {component} component
       JOIN gateway_payload_blobs b ON b.id = r.part_id
       WHERE r.request_id = ?1 AND r.direction = 'request')
 HAVING COUNT(*) > 0";
+
+/// Context totals prepared before acquiring the SQLite writer.
+/// Byte buckets follow COMPONENT_SQL; counters count facts per reference, not per blob.
+#[derive(Default)]
+pub(crate) struct PreparedMetrics {
+    bytes: [i64; 8],
+    tools_offered: i64,
+    tools_invoked: i64,
+    tool_result_errors: i64,
+    cache_breakpoints: i64,
+}
+
+impl PreparedMetrics {
+    pub(crate) fn semantic(payload: &SemanticPayload) -> Self {
+        let mut metrics = Self::default();
+        let paths: HashSet<_> = payload
+            .parts
+            .iter()
+            .map(|part| part.path.as_str())
+            .collect();
+        // Shared blobs keep the first fact at each ordinal, just like INSERT OR IGNORE.
+        let mut facts = HashMap::new();
+        for part in &payload.parts {
+            let stored = facts
+                .entry(part.payload.id.as_str())
+                .or_insert_with(Vec::new);
+            stored.extend(part.facts.iter().skip(stored.len()));
+        }
+        for part in &payload.parts {
+            let component = if part.path == "tools" || part.kind == "additional_tools" {
+                0
+            } else if matches!(part.path.as_str(), "system" | "instructions") {
+                1
+            } else if matches!(
+                part.kind.as_str(),
+                "thinking" | "redacted_thinking" | "reasoning"
+            ) {
+                4
+            } else if matches!(
+                part.kind.as_str(),
+                "tool_use" | "server_tool_use" | "function_call" | "custom_tool_call"
+            ) {
+                5
+            } else if matches!(
+                part.kind.as_str(),
+                "tool_result"
+                    | "web_search_tool_result"
+                    | "function_call_output"
+                    | "custom_tool_call_output"
+            ) {
+                6
+            } else if matches!(part.kind.as_str(), "text" | "message")
+                || (part.kind == "messages"
+                    && !paths.contains(format!("messages/{}/content", part.position).as_str()))
+            {
+                match part.role.as_deref() {
+                    Some("user") => 2,
+                    Some("assistant") => 3,
+                    Some("system" | "developer") => 1,
+                    _ => 7,
+                }
+            } else {
+                7
+            };
+            metrics.bytes[component] += part.payload.original_bytes;
+            for fact in &facts[part.payload.id.as_str()] {
+                metrics.tools_offered += i64::from(fact.block_type == "tool_definition");
+                metrics.tools_invoked += i64::from(fact.block_type == "tool_use");
+                metrics.tool_result_errors +=
+                    i64::from(fact.block_type == "tool_result" && fact.is_error == Some(true));
+                metrics.cache_breakpoints += i64::from(fact.cache_ttl.is_some());
+            }
+        }
+        metrics
+    }
+
+    pub(crate) fn chunks(payloads: &[StoredPayload]) -> Self {
+        let mut metrics = Self::default();
+        metrics.bytes[7] = payloads.iter().map(|payload| payload.original_bytes).sum();
+        metrics
+    }
+
+    pub(crate) async fn store(
+        &self,
+        database: &impl ConnectionTrait,
+        request_id: &str,
+    ) -> Result<(), DbErr> {
+        let mut values = vec![request_id.to_owned().into()];
+        values.extend(self.bytes.iter().copied().map(Into::into));
+        values.extend([
+            self.bytes.iter().sum::<i64>().into(),
+            self.tools_offered.into(),
+            self.tools_invoked.into(),
+            self.tool_result_errors.into(),
+            self.cache_breakpoints.into(),
+            timestamp().into(),
+        ]);
+        database.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO gateway_request_metrics (request_id, tool_definition_bytes, system_bytes, user_text_bytes, assistant_text_bytes, thinking_bytes, tool_use_bytes, tool_result_bytes, other_bytes, total_bytes, tools_offered, tools_invoked, tool_result_errors, cache_breakpoints, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)).await?;
+        Ok(())
+    }
+}
 
 pub(crate) async fn rollup(
     database: &impl ConnectionTrait,
@@ -165,7 +268,7 @@ pub(crate) mod tests {
         let database = database().await;
         let request_id = started(&database, Provider::Anthropic, ANTHROPIC_BODY.as_bytes()).await;
 
-        assert!(rollup(&database, &request_id).await.unwrap());
+        assert!(metrics(&database, &request_id).await.is_some());
         let json = |text: &str| json_len(serde_json::from_str(text).unwrap());
         let shell = |role: &str| json_len(serde_json::json!({"role": role, "content": []}));
         let expected = Metrics {
@@ -269,7 +372,7 @@ pub(crate) mod tests {
         let database = database().await;
         let request_id = started(&database, Provider::Codex, CODEX_BODY.as_bytes()).await;
 
-        assert!(rollup(&database, &request_id).await.unwrap());
+        assert!(metrics(&database, &request_id).await.is_some());
         let json = |text: &str| json_len(serde_json::from_str(text).unwrap());
         let rolled = metrics(&database, &request_id).await.unwrap();
         assert_eq!(
@@ -340,9 +443,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn completing_a_request_writes_its_metrics() {
+    async fn completing_a_request_preserves_its_creation_metrics() {
         let database = database().await;
         let request_id = started(&database, Provider::Codex, CODEX_BODY.as_bytes()).await;
+        let prepared = metrics(&database, &request_id).await;
+        assert!(prepared.is_some());
         SqliteSink::new(database.clone())
             .complete(CompletionRecord {
                 id: Uuid::parse_str(&request_id).unwrap(),
@@ -361,10 +466,45 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            metrics(&database, &request_id).await.unwrap().tools_invoked,
-            2
-        );
+        assert_eq!(metrics(&database, &request_id).await, prepared);
+    }
+
+    #[tokio::test]
+    async fn prepared_metrics_match_legacy_sql() {
+        let containers = br#"{"messages":[
+            {"role":"user","content":[]},
+            {"role":"assistant","content":[{"type":"text","text":"same"},{"type":"text","text":"same"}]},
+            {"type":"message","role":"developer","content":[{"type":"text","text":"same"}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true,"cache_control":{}}]},
+            {"role":"user","content":[{"type":"tool_result","is_error":true,"cache_control":{}}]}
+        ],"tools":[{"name":"read"},{"name":"read"}]}"#;
+        let chunks = vec![b'x'; 200_000];
+        for (provider, body) in [
+            (Provider::Anthropic, ANTHROPIC_BODY.as_bytes()),
+            (Provider::Codex, CODEX_BODY.as_bytes()),
+            (Provider::Anthropic, containers.as_slice()),
+            (Provider::Anthropic, chunks.as_slice()),
+            (Provider::Codex, b"{}".as_slice()),
+            (Provider::Anthropic, b"".as_slice()),
+        ] {
+            let database = database().await;
+            let request_id = started(&database, provider, body).await;
+            let prepared = metrics(&database, &request_id).await;
+            assert_eq!(prepared.is_some(), !body.is_empty());
+            database
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM gateway_request_metrics WHERE request_id = ?",
+                    [request_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                rollup(&database, &request_id).await.unwrap(),
+                prepared.is_some()
+            );
+            assert_eq!(metrics(&database, &request_id).await, prepared);
+        }
     }
 
     #[tokio::test]

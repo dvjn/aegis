@@ -62,6 +62,11 @@ mod tests {
         let anthropic = started(&database, Provider::Anthropic, ANTHROPIC_BODY.as_bytes()).await;
         let codex = started(&database, Provider::Codex, CODEX_BODY.as_bytes()).await;
         let empty = started(&database, Provider::Codex, b"").await;
+        // Model history captured before ingestion began preparing metrics.
+        database
+            .execute_unprepared("DELETE FROM gateway_request_metrics")
+            .await
+            .unwrap();
 
         assert_eq!(run(&database).await.unwrap(), 2);
         let first = metrics(&database, &anthropic).await.unwrap();

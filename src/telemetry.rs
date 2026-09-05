@@ -299,6 +299,14 @@ impl SqliteSink {
         let semantic_payload = split_request(record.request_body, protocol);
         let chunked_payload = (semantic_payload.is_none() && !record.request_body.is_empty())
             .then(|| chunk_payload(record.request_body));
+        let metrics = semantic_payload
+            .as_ref()
+            .map(request_metrics::PreparedMetrics::semantic)
+            .or_else(|| {
+                chunked_payload
+                    .as_deref()
+                    .map(request_metrics::PreparedMetrics::chunks)
+            });
         let transaction = begin_immediate(&self.database).await?;
         transaction
             .execute_raw(Statement::from_sql_and_values(
@@ -331,6 +339,9 @@ impl SqliteSink {
                 [id.to_string().into()],
             ))
             .await?;
+        if let Some(metrics) = metrics {
+            metrics.store(&transaction, &id.to_string()).await?;
+        }
         transaction.commit().await?;
         Ok(id)
     }
@@ -397,7 +408,6 @@ impl SqliteSink {
                 ))
                 .await?;
         }
-        request_metrics::rollup(&transaction, &record.id.to_string()).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -535,13 +545,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creation_metrics_failure_rolls_back_payload_and_request_writes() {
+        let db = crate::request_metrics::tests::database().await;
+        db.execute_unprepared("CREATE TRIGGER reject_metrics BEFORE INSERT ON gateway_request_metrics BEGIN SELECT RAISE(ABORT, 'injected metrics failure'); END").await.unwrap();
+        let result = SqliteSink::new(db.clone())
+            .start(StartRecord {
+                request_id: "req",
+                key_id: "key",
+                key_version_id: "version",
+                provider_id: "claude",
+                provider: Provider::Anthropic,
+                method: "POST",
+                endpoint: "/v1/messages",
+                requested_model: None,
+                request_body: REQUEST_BODY,
+            })
+            .await;
+        assert!(result.is_err());
+        for table in [
+            "gateway_requests",
+            "gateway_payloads",
+            "gateway_payload_blobs",
+            "gateway_payload_part_refs",
+            "gateway_payload_blob_facts",
+            "gateway_payload_envelopes",
+            "gateway_request_metrics",
+        ] {
+            let row = db
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT COUNT(*) count FROM {table}"),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "count").unwrap(), 0, "{table}");
+        }
+    }
+
+    #[tokio::test]
     async fn completion_rolls_back_every_write_and_repeated_completion_is_idempotent() {
         let fixture = crate::db::tests::FileDatabase::new().await;
         let db = &fixture.database;
         let id =
             crate::request_metrics::tests::started(db, Provider::Anthropic, REQUEST_BODY).await;
         let sink = SqliteSink::new(db.clone());
-        db.execute_unprepared("CREATE TRIGGER reject_metrics BEFORE INSERT ON gateway_request_metrics BEGIN SELECT RAISE(ABORT, 'injected metrics failure'); END").await.unwrap();
+        db.execute_unprepared("CREATE TRIGGER reject_usage BEFORE INSERT ON gateway_usage BEGIN SELECT RAISE(ABORT, 'injected usage failure'); END").await.unwrap();
         assert!(finish(&sink, Uuid::parse_str(&id).unwrap()).await.is_err());
         let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
             "SELECT (SELECT COUNT(*) FROM gateway_requests WHERE completed_at IS NOT NULL) completed, (SELECT COUNT(*) FROM gateway_payloads WHERE response_body_id IS NOT NULL) responses, (SELECT COUNT(*) FROM gateway_usage) usages, (SELECT COUNT(*) FROM gateway_payload_blobs WHERE original_bytes = 8) response_blobs"
@@ -549,7 +598,7 @@ mod tests {
         for column in ["completed", "responses", "usages", "response_blobs"] {
             assert_eq!(row.try_get::<i64>("", column).unwrap(), 0, "{column}");
         }
-        db.execute_unprepared("DROP TRIGGER reject_metrics")
+        db.execute_unprepared("DROP TRIGGER reject_usage")
             .await
             .unwrap();
         for _ in 0..2 {
