@@ -1,4 +1,5 @@
 mod access_log;
+mod analytics;
 mod analytics_facts;
 mod api_keys;
 mod app;
@@ -161,14 +162,127 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
         .await
         .context("failed to bind HTTP listener")?;
 
+    let analytics = match start_analytics(&config.analytics, &database, cancellation.clone()).await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "analytics unavailable; capture remains enabled");
+            None
+        }
+    };
     info!(address = %config.http_addr, "server listening");
     jobs::spawn(database.clone());
-    axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal(cancellation))
+    let result = axum::serve(listener, application)
+        .with_graceful_shutdown(shutdown_signal(cancellation.clone()))
         .await
-        .context("HTTP server failed")?;
+        .context("HTTP server failed");
+    cancellation.cancel();
+    if let Some(runtime) = analytics {
+        runtime.shutdown().await;
+    }
+    result?;
     info!("server stopped");
     Ok(())
+}
+
+struct AnalyticsRuntime {
+    worker: tokio::task::JoinHandle<()>,
+    status: tokio::task::JoinHandle<()>,
+    reader: DatabaseConnection,
+}
+
+impl AnalyticsRuntime {
+    async fn shutdown(self) {
+        if let Err(error) = self.worker.await {
+            tracing::warn!(%error, "analytics worker stopped unexpectedly");
+        }
+        if let Err(error) = self.status.await {
+            tracing::warn!(%error, "analytics status observer stopped unexpectedly");
+        }
+        if let Err(error) = self.reader.close().await {
+            tracing::warn!(%error, "failed to close analytics reader");
+        }
+    }
+}
+
+async fn start_analytics(
+    config: &config::AnalyticsConfig,
+    database: &DatabaseConnection,
+    cancellation: CancellationToken,
+) -> Result<Option<AnalyticsRuntime>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let source_path = database
+        .get_sqlite_connection_pool()
+        .connect_options()
+        .get_filename()
+        .to_path_buf();
+    if let Some(parent) = config
+        .database_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).context("failed to create analytics directory")?;
+    }
+    let source = analytics::source::Source::open(database.clone(), &source_path).await?;
+    let store = analytics::sqlite::SqliteStore::open(
+        &source_path,
+        &config.database_path,
+        &source.source_id,
+    )
+    .await?;
+    // Keep a separate read-only pool ready; dashboard cutover is a later, gated layer.
+    let reader = match store.reader().await {
+        Ok(reader) => reader,
+        Err(error) => {
+            store.close().await?;
+            return Err(error);
+        }
+    };
+    let worker = match analytics::worker::Worker::new(
+        source,
+        store,
+        analytics::source::Limits {
+            request_count: config.batch_requests,
+            child_rows: config.max_child_rows,
+            bytes: config.max_batch_bytes,
+            snapshot_duration: std::time::Duration::from_millis(config.max_snapshot_ms),
+        },
+        std::time::Duration::from_secs(config.interval_seconds),
+        analytics::worker::MAX_BATCHES_PER_ATTEMPT,
+    )
+    .await
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            reader.close().await?;
+            return Err(error);
+        }
+    };
+    let mut status = worker.status();
+    let status = tokio::spawn(async move {
+        while status.changed().await.is_ok() {
+            let current = status.borrow_and_update().clone();
+            if let analytics::worker::Availability::Unavailable(error) = &current.availability {
+                tracing::warn!(%error, "analytics projection unavailable");
+            }
+            tracing::info!(state = ?current.availability,
+                published_at = ?current.published.as_ref().map(|b| b.observed_at.as_str()),
+                published_revision = ?current.published.as_ref().map(|b| b.revision),
+                pending_count = ?current.pending_count,
+                oldest_pending_at = ?current.oldest_pending_at,
+                oldest_pending_reason = current.oldest_pending_at_unavailable_reason,
+                processing_ms = current.processing_duration.as_millis() as u64,
+                batch_ms = current.last_batch_duration.as_millis() as u64,
+                "analytics projection status");
+        }
+    });
+    Ok(Some(AnalyticsRuntime {
+        worker: tokio::spawn(worker.run(cancellation)),
+        status,
+        reader,
+    }))
 }
 
 async fn bootstrap_user(

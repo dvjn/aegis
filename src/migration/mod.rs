@@ -18,6 +18,7 @@ mod m20260905_000015_request_metrics;
 mod m20260905_000017_part_refs_request_index;
 mod m20260906_000018_analytics_revisions;
 mod m20260906_000019_analytics_tool_facts;
+mod m20260906_000020_analytics_source_identity;
 
 pub struct Migrator;
 
@@ -43,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000017_part_refs_request_index::Migration),
             Box::new(m20260906_000018_analytics_revisions::Migration),
             Box::new(m20260906_000019_analytics_tool_facts::Migration),
+            Box::new(m20260906_000020_analytics_source_identity::Migration),
         ]
     }
 }

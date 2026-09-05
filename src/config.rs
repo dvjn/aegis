@@ -8,7 +8,7 @@ use std::{
     env, fs,
     io::{ErrorKind, Write},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -23,6 +23,49 @@ pub struct Config {
     pub auth: AuthConfig,
     pub oauth: OAuthConfig,
     pub pricing: PricingConfig,
+    pub analytics: AnalyticsConfig,
+}
+
+/// Projection remains opt-in until snapshot parity and load gates pass.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalyticsConfig {
+    pub enabled: bool,
+    pub database_path: PathBuf,
+    pub interval_seconds: u64,
+    pub batch_requests: usize,
+    pub max_child_rows: usize,
+    pub max_batch_bytes: usize,
+    pub max_snapshot_ms: u64,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database_path: PathBuf::from("data/analytics.db"),
+            interval_seconds: 300,
+            batch_requests: 32,
+            max_child_rows: 100_000,
+            max_batch_bytes: 16 * 1024 * 1024,
+            max_snapshot_ms: 5_000,
+        }
+    }
+}
+
+fn validate_analytics(config: &AnalyticsConfig) -> Result<()> {
+    if config.database_path.as_os_str().is_empty() {
+        bail!("analytics.database_path must not be empty");
+    }
+    if config.interval_seconds == 0
+        || config.batch_requests == 0
+        || config.max_child_rows == 0
+        || config.max_batch_bytes == 0
+        || config.max_snapshot_ms == 0
+    {
+        bail!("analytics interval and batch limits must be greater than zero");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -105,6 +148,8 @@ struct FileConfig {
     registration_enabled: bool,
     #[serde(default)]
     pricing: PricingConfig,
+    #[serde(default)]
+    analytics: AnalyticsConfig,
 }
 
 impl Default for FileConfig {
@@ -117,6 +162,7 @@ impl Default for FileConfig {
             public_url: None,
             registration_enabled: false,
             pricing: PricingConfig::default(),
+            analytics: AnalyticsConfig::default(),
         }
     }
 }
@@ -169,6 +215,21 @@ impl Config {
                 .context("PRICING_ENABLED must be true or false")?;
         }
         validate_pricing(&pricing)?;
+        let mut analytics = file.analytics;
+        if let Some(enabled) = optional_var("ANALYTICS_ENABLED")? {
+            analytics.enabled = enabled
+                .parse()
+                .context("ANALYTICS_ENABLED must be true or false")?;
+        }
+        if let Some(path) = optional_var("ANALYTICS_DATABASE_PATH")? {
+            analytics.database_path = path.into();
+        }
+        if let Some(interval) = optional_var("ANALYTICS_INTERVAL_SECONDS")? {
+            analytics.interval_seconds = interval
+                .parse()
+                .context("ANALYTICS_INTERVAL_SECONDS must be a positive integer")?;
+        }
+        validate_analytics(&analytics)?;
 
         let smtp = smtp_config()?;
         let root_key = root_key()?;
@@ -194,6 +255,7 @@ impl Config {
                 key_id: "v1".into(),
             },
             pricing,
+            analytics,
         })
     }
 }
@@ -412,6 +474,51 @@ mod tests {
         assert_eq!(config.http_addr, default_http_addr());
         assert_eq!(config.database_url, default_database_url());
         assert!(config.providers.is_empty());
+    }
+
+    #[test]
+    fn analytics_defaults_to_opt_in_five_minute_projection() {
+        let config: FileConfig = toml::from_str("").unwrap();
+        assert!(!config.analytics.enabled);
+        assert_eq!(config.analytics.interval_seconds, 300);
+        assert_eq!(
+            config.analytics.database_path,
+            PathBuf::from("data/analytics.db")
+        );
+        validate_analytics(&config.analytics).unwrap();
+    }
+
+    #[test]
+    fn analytics_rejects_zero_limits_and_unknown_options() {
+        for option in [
+            "interval_seconds",
+            "batch_requests",
+            "max_child_rows",
+            "max_batch_bytes",
+            "max_snapshot_ms",
+        ] {
+            let config: FileConfig = toml::from_str(&format!("[analytics]\n{option} = 0")).unwrap();
+            assert!(validate_analytics(&config.analytics).is_err(), "{option}");
+        }
+        let config: FileConfig = toml::from_str("[analytics]\ndatabase_path = ''").unwrap();
+        assert!(validate_analytics(&config.analytics).is_err());
+        assert!(toml::from_str::<FileConfig>("[analytics]\nintervel_seconds = 60").is_err());
+    }
+
+    #[test]
+    fn analytics_accepts_explicit_storage_and_bounds() {
+        let config: FileConfig = toml::from_str("[analytics]\nenabled = true\ndatabase_path = 'data/reports.db'\ninterval_seconds = 60\nbatch_requests = 8\nmax_child_rows = 5000\nmax_batch_bytes = 1048576\nmax_snapshot_ms = 1000").unwrap();
+        validate_analytics(&config.analytics).unwrap();
+        assert!(config.analytics.enabled);
+        assert_eq!(
+            config.analytics.database_path,
+            PathBuf::from("data/reports.db")
+        );
+        assert_eq!(config.analytics.interval_seconds, 60);
+        assert_eq!(config.analytics.batch_requests, 8);
+        assert_eq!(config.analytics.max_child_rows, 5000);
+        assert_eq!(config.analytics.max_batch_bytes, 1048576);
+        assert_eq!(config.analytics.max_snapshot_ms, 1000);
     }
 
     #[test]

@@ -2,6 +2,17 @@
 # database_url = "sqlite://data/aegis.db?mode=rwc"
 # max_capture_bytes = 16777216
 
+# Facts-only projection is opt-in; dashboard reads do not switch with this flag.
+# Existing history requires a separately validated backfill before publication.
+# [analytics]
+# enabled = false
+# database_path = "data/analytics.db"
+# interval_seconds = 300
+# batch_requests = 32
+# max_child_rows = 100000
+# max_batch_bytes = 16777216
+# max_snapshot_ms = 5000
+
 # Add entries to name accounts or configure additional accounts.
 [[providers]]
 id = "claude-personal"
