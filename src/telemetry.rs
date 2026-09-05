@@ -37,6 +37,7 @@ pub(crate) struct StoredPayload {
     pub id: String,
     pub body: Vec<u8>,
     pub original_bytes: i64,
+    encoding: &'static str,
 }
 
 impl StoredPayload {
@@ -48,24 +49,25 @@ impl StoredPayload {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let compressed = encoder
+            .write_all(body)
+            .and_then(|()| encoder.finish())
+            .unwrap_or_default();
+        let (stored, encoding) = if !compressed.is_empty() && compressed.len() < body.len() {
+            (compressed, "gzip")
+        } else {
+            (body.to_vec(), "identity")
+        };
         Some(Self {
             id,
             original_bytes: body.len() as i64,
-            body: body.to_vec(),
+            body: stored,
+            encoding,
         })
     }
-
     pub(crate) fn encoded(&self) -> (Vec<u8>, &'static str) {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        let compressed = encoder
-            .write_all(&self.body)
-            .and_then(|()| encoder.finish())
-            .unwrap_or_default();
-        if !compressed.is_empty() && compressed.len() < self.body.len() {
-            (compressed, "gzip")
-        } else {
-            (self.body.clone(), "identity")
-        }
+        (self.body.clone(), self.encoding)
     }
 }
 
@@ -73,15 +75,14 @@ pub(crate) async fn store_blob(
     database: &impl ConnectionTrait,
     payload: &StoredPayload,
 ) -> Result<bool, sea_orm::DbErr> {
-    let (body, encoding) = payload.encoded();
     let result = database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
             [
                 payload.id.clone().into(),
-                body.into(),
-                encoding.into(),
+                payload.body.clone().into(),
+                payload.encoding.into(),
                 payload.original_bytes.into(),
                 timestamp().into(),
             ],
@@ -335,13 +336,26 @@ impl SqliteSink {
     }
 
     pub async fn complete(&self, record: CompletionRecord<'_>) -> Result<(), sea_orm::DbErr> {
-        self.database
+        let response_payload = StoredPayload::new(record.response_body);
+        let completed_at = timestamp();
+        self.complete_once(&record, response_payload.as_ref(), &completed_at)
+            .await
+    }
+
+    async fn complete_once(
+        &self,
+        record: &CompletionRecord<'_>,
+        response_payload: Option<&StoredPayload>,
+        completed_at: &str,
+    ) -> Result<(), sea_orm::DbErr> {
+        let transaction = begin_immediate(&self.database).await?;
+        transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE gateway_requests SET first_byte_at = ?, completed_at = ?, http_status = ?, response_bytes = ?, client_disconnected = ?, error_message = ? WHERE id = ?",
                 [
                     record.first_byte_at.map(str::to_owned).into(),
-                    timestamp().into(),
+                    completed_at.to_owned().into(),
                     i32::from(record.status).into(),
                     (record.response_bytes as i64).into(),
                     record.client_disconnected.into(),
@@ -350,20 +364,22 @@ impl SqliteSink {
                 ],
             ))
             .await?;
-        let response_payload = self.store_payload(record.response_body).await?;
-        self.database
+        if let Some(payload) = response_payload {
+            store_blob(&transaction, payload).await?;
+        }
+        transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE gateway_payloads SET response_body_id = ?, response_truncated = ? WHERE request_id = ?",
                 [
-                    response_payload.map(|payload| payload.id).into(),
+                    response_payload.map(|payload| payload.id.clone()).into(),
                     record.response_truncated.into(),
                     record.id.to_string().into(),
                 ],
             ))
             .await?;
         if record.usage.raw_json.is_some() {
-            self.database
+            transaction
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "INSERT OR REPLACE INTO gateway_usage (request_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, raw_usage_json, cost_nanodollars, cost_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -381,7 +397,8 @@ impl SqliteSink {
                 ))
                 .await?;
         }
-        request_metrics::rollup(&self.database, &record.id.to_string()).await?;
+        request_metrics::rollup(&transaction, &record.id.to_string()).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -442,22 +459,10 @@ impl SqliteSink {
         Ok(())
     }
 
-    async fn store_encoded(&self, payload: &StoredPayload) -> Result<bool, sea_orm::DbErr> {
-        store_blob(&self.database, payload).await
-    }
-
-    async fn store_payload(&self, body: &[u8]) -> Result<Option<StoredPayload>, sea_orm::DbErr> {
-        let Some(payload) = StoredPayload::new(body) else {
-            return Ok(None);
-        };
-        self.store_encoded(&payload).await?;
-        Ok(Some(payload))
-    }
-
     pub async fn reconcile_interrupted(&self) -> Result<u64, sea_orm::DbErr> {
         let cutoff = (Utc::now() - INTERRUPTED_AFTER).to_rfc3339_opts(SecondsFormat::Millis, true);
-        let result = self
-            .database
+        let result = crate::db::writer(&self.database)
+            .await?
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE gateway_requests SET completed_at = ?, error_message = ? \
@@ -474,9 +479,9 @@ impl SqliteSink {
     }
 
     pub async fn fail(&self, id: Uuid, message: &str) {
-        if let Err(error) = self
-            .database
-            .execute_raw(Statement::from_sql_and_values(
+        let result =
+            async {
+                crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE gateway_requests SET completed_at = ?, error_message = ? WHERE id = ?",
                 [
@@ -486,7 +491,9 @@ impl SqliteSink {
                 ],
             ))
             .await
-        {
+            }
+            .await;
+        if let Err(error) = result {
             tracing::error!(%error, %id, "failed to persist gateway failure");
         }
     }
@@ -503,6 +510,103 @@ mod tests {
     use chrono::DateTime;
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
+
+    async fn finish(sink: &SqliteSink, id: Uuid) -> Result<(), sea_orm::DbErr> {
+        sink.complete(CompletionRecord {
+            id,
+            status: 200,
+            first_byte_at: None,
+            response_body: b"response",
+            response_bytes: 8,
+            response_truncated: false,
+            client_disconnected: false,
+            usage: &Usage {
+                input_tokens: Some(10),
+                raw_json: Some("{}".into()),
+                ..Default::default()
+            },
+            cost: Cost {
+                nanodollars: Some(100),
+                source: crate::pricing::CostSource::Calculated,
+            },
+            error_message: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn completion_rolls_back_every_write_and_repeated_completion_is_idempotent() {
+        let fixture = crate::db::tests::FileDatabase::new().await;
+        let db = &fixture.database;
+        let id =
+            crate::request_metrics::tests::started(db, Provider::Anthropic, REQUEST_BODY).await;
+        let sink = SqliteSink::new(db.clone());
+        db.execute_unprepared("CREATE TRIGGER reject_metrics BEFORE INSERT ON gateway_request_metrics BEGIN SELECT RAISE(ABORT, 'injected metrics failure'); END").await.unwrap();
+        assert!(finish(&sink, Uuid::parse_str(&id).unwrap()).await.is_err());
+        let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT (SELECT COUNT(*) FROM gateway_requests WHERE completed_at IS NOT NULL) completed, (SELECT COUNT(*) FROM gateway_payloads WHERE response_body_id IS NOT NULL) responses, (SELECT COUNT(*) FROM gateway_usage) usages, (SELECT COUNT(*) FROM gateway_payload_blobs WHERE original_bytes = 8) response_blobs"
+        )).await.unwrap().unwrap();
+        for column in ["completed", "responses", "usages", "response_blobs"] {
+            assert_eq!(row.try_get::<i64>("", column).unwrap(), 0, "{column}");
+        }
+        db.execute_unprepared("DROP TRIGGER reject_metrics")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            finish(&sink, Uuid::parse_str(&id).unwrap()).await.unwrap();
+        }
+        let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT (SELECT COUNT(*) FROM gateway_usage) usages, (SELECT COUNT(*) FROM gateway_request_metrics) metrics, (SELECT SUM(input_tokens) FROM gateway_usage) tokens"
+        )).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "usages").unwrap(), 1);
+        assert_eq!(row.try_get::<i64>("", "metrics").unwrap(), 1);
+        assert_eq!(row.try_get::<i64>("", "tokens").unwrap(), 10);
+        db.close_by_ref().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn captures_complete_while_reporting_connections_are_occupied() {
+        let fixture = crate::db::tests::FileDatabase::new().await;
+        let reporting = crate::db::reporting_connection(&fixture.url, &fixture.database)
+            .await
+            .unwrap();
+        use sea_orm::TransactionTrait;
+        let reader_one = reporting.begin().await.unwrap();
+        let reader_two = reporting.begin().await.unwrap();
+        reader_one
+            .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
+            .await
+            .unwrap();
+        reader_two
+            .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
+            .await
+            .unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"model":"claude-x", "messages":[{"role":"user","content":"long capture ".repeat(20000)}]})).unwrap();
+        let captures = (0..8).map(|_| async {
+            let id = crate::request_metrics::tests::started(
+                &fixture.database,
+                Provider::Anthropic,
+                &body,
+            )
+            .await;
+            finish(
+                &SqliteSink::new(fixture.database.clone()),
+                Uuid::parse_str(&id).unwrap(),
+            )
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures_util::future::join_all(captures),
+        )
+        .await
+        .unwrap();
+        reader_one.rollback().await.unwrap();
+        reader_two.rollback().await.unwrap();
+        reporting.close().await.unwrap();
+        fixture.database.close_by_ref().await.unwrap();
+    }
 
     async fn record(db: &DatabaseConnection, id: &str, started_at: &str, status: Option<i32>) {
         let status = match status {

@@ -3,7 +3,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "requested_model_backfill";
 
-const SCAN_BATCH: i64 = 256;
+const SCAN_BATCH: i64 = 32;
 
 struct Request {
     id: String,
@@ -41,6 +41,8 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
             updated += result.rows_affected();
         }
         transaction.commit().await?;
+        tracing::debug!(job = NAME, after = %after, "background job batch committed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

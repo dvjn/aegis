@@ -7,7 +7,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "payload_facts_backfill";
 
-const SCAN_BATCH: i64 = 512;
+const SCAN_BATCH: i64 = 32;
 
 struct Blob {
     id: String,
@@ -45,6 +45,8 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
             extracted += 1;
         }
         transaction.commit().await?;
+        tracing::debug!(job = NAME, after = %after, "background job batch committed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

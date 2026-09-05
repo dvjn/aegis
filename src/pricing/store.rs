@@ -3,10 +3,10 @@ use crate::config::PricingConfig;
 use crate::providers::Usage;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use std::collections::HashMap;
 
-const BACKFILL_BATCH_SIZE: u64 = 500;
+const BACKFILL_BATCH_SIZE: u64 = 32;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BackfillStats {
@@ -58,7 +58,7 @@ pub async fn store_snapshot(
     etag: Option<&str>,
     sha256: &str,
 ) -> Result<()> {
-    let transaction = database.begin().await?;
+    let transaction = crate::db::begin_immediate(database).await?;
     transaction
         .execute_raw(Statement::from_string(
             DbBackend::Sqlite,
@@ -166,7 +166,7 @@ pub async fn backfill_unknown_costs(
             continue;
         }
 
-        let transaction = database.begin().await?;
+        let transaction = crate::db::begin_immediate(database).await?;
         for (request_id, cost) in updates {
             let result = transaction
                 .execute_raw(Statement::from_sql_and_values(
@@ -180,6 +180,7 @@ pub async fn backfill_unknown_costs(
             stats.updated += result.rows_affected();
         }
         transaction.commit().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     Ok(stats)

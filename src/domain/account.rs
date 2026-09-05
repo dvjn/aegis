@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
-    QueryFilter, Set, SqliteTransactionMode, TransactionOptions, TransactionTrait, sea_query::Expr,
+    QueryFilter, Set, sea_query::Expr,
 };
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -105,17 +105,11 @@ impl AccountService {
         self.config.registration_enabled
     }
 
-    async fn begin_immediate(&self) -> Result<DatabaseTransaction, DomainError> {
-        self.db
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| {
-                tracing::debug!(%error, "could not start immediate transaction");
-                DomainError::TemporarilyUnavailable
-            })
+    async fn begin_immediate(&self) -> Result<crate::db::WriteTransaction, DomainError> {
+        crate::db::begin_immediate(&self.db).await.map_err(|error| {
+            tracing::debug!(%error, "could not start immediate transaction");
+            DomainError::TemporarilyUnavailable
+        })
     }
 
     pub async fn register(&self, email: &str, password: &Password) -> Result<(), DomainError> {

@@ -121,7 +121,8 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
         .context("failed to initialize identity services")?,
     );
     let keys = KeyStore::new(database.clone());
-    let usage = usage::UsageStore::new(database.clone());
+    let reporting_database = db::reporting_connection(&config.database_url, &database).await?;
+    let usage = usage::UsageStore::new(reporting_database);
     let sink = telemetry::SqliteSink::new(database.clone());
     match sink.reconcile_interrupted().await {
         Ok(0) => {}

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use rand::Rng;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
-    QueryFilter, QueryOrder, Set, Statement, TransactionTrait, sea_query::Expr,
+    QueryFilter, QueryOrder, Set, Statement, sea_query::Expr,
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -325,7 +325,7 @@ impl AuthService {
             revocation_reason: Set(None),
             user_agent: Set(user_agent.and_then(sanitize_user_agent)),
         }
-        .insert(&self.db)
+        .insert(&crate::db::writer(&self.db).await?)
         .await?;
         Ok(IssuedSession {
             token: SessionToken(format!(
@@ -353,7 +353,7 @@ impl AuthService {
             )
             .filter(auth_sessions::Column::Id.eq(session_id.to_string()))
             .filter(auth_sessions::Column::RevokedAt.is_null())
-            .exec(&self.db)
+            .exec(&crate::db::writer(&self.db).await?)
             .await?;
         if updated.rows_affected == 0 {
             return Err(DomainError::InvalidCredentials);
@@ -446,7 +446,7 @@ impl AuthService {
                 .filter(auth_sessions::Column::Id.eq(id.to_string()))
                 .filter(auth_sessions::Column::UserId.eq(user_id.to_string()))
                 .filter(auth_sessions::Column::RevokedAt.is_null())
-                .exec(&self.db)
+                .exec(&crate::db::writer(&self.db).await?)
                 .await?;
         }
         Ok(Principal {
@@ -475,7 +475,7 @@ impl AuthService {
             .filter(auth_sessions::Column::Id.eq(session_id.to_string()))
             .filter(auth_sessions::Column::UserId.eq(principal.user_id().to_string()))
             .filter(auth_sessions::Column::RevokedAt.is_null())
-            .exec(&self.db)
+            .exec(&crate::db::writer(&self.db).await?)
             .await?;
         Ok(())
     }
@@ -544,7 +544,7 @@ impl AuthService {
             .filter(auth_sessions::Column::Id.eq(session_id.to_string()))
             .filter(auth_sessions::Column::UserId.eq(principal.user_id().to_string()))
             .filter(auth_sessions::Column::RevokedAt.is_null())
-            .exec(&self.db)
+            .exec(&crate::db::writer(&self.db).await?)
             .await?;
         if result.rows_affected == 0 {
             return Err(DomainError::NotFound);
@@ -615,7 +615,7 @@ pub async fn bootstrap_superuser(
     let hash = hash_password(password_pepper, password).await?;
     let now = Utc::now().to_rfc3339();
     let id = Uuid::now_v7();
-    let tx = db.begin().await?;
+    let tx = crate::db::begin_immediate(db).await?;
     let result = tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,email_verified_at,created_at,updated_at) SELECT ?,?,?,'superuser','active',0,?,?,? WHERE NOT EXISTS (SELECT 1 FROM users WHERE role='superuser' AND status='active')",
         vec![id.to_string().into(), normalized.into(), display.into(), now.clone().into(), now.clone().into(), now.clone().into()])).await?;

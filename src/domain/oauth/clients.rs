@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Set,
-    Statement, TransactionTrait,
+    Statement,
 };
 use url::Url;
 use uuid::Uuid;
@@ -103,7 +103,7 @@ impl OAuthService {
         let now = self.clock.now().to_rfc3339();
         let grant_types = registration.grant_types.join(" ");
         let response_types = registration.response_types.join(" ");
-        let tx = self.db.begin().await?;
+        let tx = crate::db::begin_immediate(&self.db).await?;
         let inserted = tx
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,

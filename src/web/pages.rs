@@ -31,6 +31,7 @@ pub(super) async fn root(
     let range = Range::from_slug(query.range.as_deref());
     let window = range.window(chrono::Utc::now());
     let usage = &state.usage;
+    let query_started = std::time::Instant::now();
     let (
         totals,
         context,
@@ -54,6 +55,11 @@ pub(super) async fn root(
         usage.series_by_provider(user, window),
         usage.series_by_key(user, window),
     );
+    let elapsed_ms = query_started.elapsed().as_millis() as u64;
+    tracing::debug!(elapsed_ms, "dashboard queries completed");
+    if elapsed_ms >= 1000 {
+        tracing::warn!(elapsed_ms, "slow dashboard queries");
+    }
     let overview = views::home::Overview {
         range,
         totals: &totals.map_err(DomainError::from)?,
