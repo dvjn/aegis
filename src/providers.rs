@@ -27,11 +27,11 @@ pub struct Usage {
 }
 
 pub fn requested_model(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("model")?
-        .as_str()
-        .map(str::to_owned)
+    let decoded = decode_body(body);
+    let value = serde_json::from_slice::<Value>(&decoded).ok().or_else(|| {
+        decode_brotli_unsniffable(body).and_then(|decoded| serde_json::from_slice(&decoded).ok())
+    })?;
+    value.get("model")?.as_str().map(str::to_owned)
 }
 
 pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
@@ -122,6 +122,25 @@ fn integer(value: &Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REQUEST: &[u8] = br#"{"model":"gpt-5.6-sol","input":"hello"}"#;
+
+    #[test]
+    fn extracts_requested_model_from_compressed_bodies() {
+        assert_eq!(requested_model(REQUEST).as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            requested_model(&crate::compression::tests::gzip(REQUEST)).as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            requested_model(&zstd::encode_all(REQUEST, 0).unwrap()).as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            requested_model(&crate::compression::tests::brotli(REQUEST)).as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
 
     #[test]
     fn extracts_anthropic_sse_usage() {

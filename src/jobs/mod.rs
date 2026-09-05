@@ -1,6 +1,7 @@
 mod payload_facts_backfill;
 mod payload_resplit;
 mod request_metrics_rollup;
+mod requested_model_backfill;
 
 use crate::telemetry::timestamp;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
@@ -11,6 +12,21 @@ use std::time::Instant;
 pub fn spawn(database: DatabaseConnection) {
     tokio::spawn(async move {
         if !run(&database, payload_resplit::NAME, payload_resplit::run).await {
+            return;
+        }
+        if !run(
+            &database,
+            requested_model_backfill::NAME,
+            requested_model_backfill::run,
+        )
+        .await
+        {
+            return;
+        }
+        if let Err(error) =
+            crate::pricing::backfill_costs(&database, &crate::pricing::active_map()).await
+        {
+            tracing::error!(%error, "failed to price requests after the model backfill");
             return;
         }
         if !run(
