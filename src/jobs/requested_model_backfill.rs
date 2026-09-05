@@ -1,5 +1,5 @@
-use crate::providers::requested_model;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+use crate::{db::begin_immediate, providers::requested_model};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "requested_model_backfill";
 
@@ -19,17 +19,23 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
             return Ok(updated);
         };
         after = last.id.clone();
-        let transaction = database.begin().await?;
-        for request in batch {
-            let Some(model) = requested_model(&request.envelope) else {
-                continue;
-            };
+        let updates: Vec<_> = batch
+            .into_iter()
+            .filter_map(|request| {
+                requested_model(&request.envelope).map(|model| (request.id, model))
+            })
+            .collect();
+        if updates.is_empty() {
+            continue;
+        }
+        let transaction = begin_immediate(database).await?;
+        for (request_id, model) in updates {
             let result = transaction
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "UPDATE gateway_requests SET requested_model = ?
                      WHERE id = ? AND requested_model IS NULL",
-                    [model.into(), request.id.into()],
+                    [model.into(), request_id.into()],
                 ))
                 .await?;
             updated += result.rows_affected();

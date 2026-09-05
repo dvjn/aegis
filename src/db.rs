@@ -1,6 +1,9 @@
 use crate::migration::Migrator;
 use anyhow::{Context, Result};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, sqlx::sqlite::SqliteJournalMode};
+use sea_orm::{
+    ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, DbErr,
+    SqliteTransactionMode, TransactionOptions, TransactionTrait, sqlx::sqlite::SqliteJournalMode,
+};
 use sea_orm_migration::MigratorTrait;
 use std::{path::Path, time::Duration};
 
@@ -22,6 +25,15 @@ pub async fn connect(database_url: &str) -> Result<DatabaseConnection> {
         .await
         .context("failed to apply database migrations")?;
     Ok(database)
+}
+
+pub async fn begin_immediate(database: &DatabaseConnection) -> Result<DatabaseTransaction, DbErr> {
+    database
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await
 }
 
 fn ensure_sqlite_parent(database_url: &str) -> Result<()> {

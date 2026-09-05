@@ -1,8 +1,9 @@
 use crate::{
     compression::decode_body,
+    db::begin_immediate,
     telemetry::{SemanticPayload, StoredPart, reassemble_request, split_request, store_blob},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "payload_resplit";
 
@@ -23,7 +24,7 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
         };
         after = last.id.clone();
         for request in batch {
-            let transaction = database.begin().await?;
+            let transaction = begin_immediate(database).await?;
             if resplit(&transaction, &request).await? {
                 converted += 1;
             }

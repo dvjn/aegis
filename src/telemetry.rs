@@ -1,5 +1,6 @@
 use crate::{
     compression::{decode_body, decode_brotli_unsniffable},
+    db::begin_immediate,
     payload_facts::{self, BlobFact},
     pricing::Cost,
     providers::{Provider, Usage},
@@ -7,7 +8,7 @@ use crate::{
 };
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Write};
 use uuid::Uuid;
@@ -72,9 +73,6 @@ pub(crate) async fn store_blob(
     database: &impl ConnectionTrait,
     payload: &StoredPayload,
 ) -> Result<bool, sea_orm::DbErr> {
-    if blob_exists(database, &payload.id).await? {
-        return Ok(false);
-    }
     let (body, encoding) = payload.encoded();
     let result = database
         .execute_raw(Statement::from_sql_and_values(
@@ -90,17 +88,6 @@ pub(crate) async fn store_blob(
         ))
         .await?;
     Ok(result.rows_affected() > 0)
-}
-
-async fn blob_exists(database: &impl ConnectionTrait, id: &str) -> Result<bool, sea_orm::DbErr> {
-    let row = database
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT 1 FROM gateway_payload_blobs WHERE id = ?",
-            [id.to_owned().into()],
-        ))
-        .await?;
-    Ok(row.is_some())
 }
 
 pub(crate) fn chunk_payload(body: &[u8]) -> Vec<StoredPayload> {
@@ -307,7 +294,12 @@ impl SqliteSink {
 
     pub async fn start(&self, record: StartRecord<'_>) -> Result<Uuid, sea_orm::DbErr> {
         let id = Uuid::now_v7();
-        self.database
+        let protocol = record.provider.protocol();
+        let semantic_payload = split_request(record.request_body, protocol);
+        let chunked_payload = (semantic_payload.is_none() && !record.request_body.is_empty())
+            .then(|| chunk_payload(record.request_body));
+        let transaction = begin_immediate(&self.database).await?;
+        transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -326,19 +318,19 @@ impl SqliteSink {
                 ],
             ))
             .await?;
-        let protocol = record.provider.protocol();
-        if let Some(payload) = split_request(record.request_body, protocol) {
-            self.store_semantic_payload(id, payload).await?;
-        } else if !record.request_body.is_empty() {
-            self.store_chunked_payload(id, record.request_body).await?;
+        if let Some(payload) = semantic_payload {
+            Self::store_semantic_payload(&transaction, id, payload).await?;
+        } else if let Some(payloads) = chunked_payload {
+            Self::store_chunked_payload(&transaction, id, payloads).await?;
         }
-        self.database
+        transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO gateway_payloads (request_id, request_body_id) VALUES (?, NULL)",
                 [id.to_string().into()],
             ))
             .await?;
+        transaction.commit().await?;
         Ok(id)
     }
 
@@ -394,13 +386,13 @@ impl SqliteSink {
     }
 
     async fn store_chunked_payload(
-        &self,
+        database: &impl ConnectionTrait,
         request_id: Uuid,
-        body: &[u8],
+        payloads: Vec<StoredPayload>,
     ) -> Result<(), sea_orm::DbErr> {
-        for (position, payload) in chunk_payload(body).into_iter().enumerate() {
-            self.store_encoded(&payload).await?;
-            self.database
+        for (position, payload) in payloads.into_iter().enumerate() {
+            store_blob(database, &payload).await?;
+            database
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, kind, part_id) VALUES (?, 'request', '$bytes', ?, 'chunk', ?)",
@@ -416,13 +408,13 @@ impl SqliteSink {
     }
 
     async fn store_semantic_payload(
-        &self,
+        database: &impl ConnectionTrait,
         request_id: Uuid,
         payload: SemanticPayload,
     ) -> Result<(), sea_orm::DbErr> {
         let envelope = payload.envelope;
-        self.store_encoded(&envelope).await?;
-        self.database
+        store_blob(database, &envelope).await?;
+        database
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO gateway_payload_envelopes (request_id, direction, body_id) VALUES (?, 'request', ?)",
@@ -430,10 +422,9 @@ impl SqliteSink {
             ))
             .await?;
         for part in payload.parts {
-            let transaction = self.database.begin().await?;
-            store_blob(&transaction, &part.payload).await?;
-            payload_facts::store(&transaction, &part.payload.id, &part.facts).await?;
-            transaction
+            store_blob(database, &part.payload).await?;
+            payload_facts::store(database, &part.payload.id, &part.facts).await?;
+            database
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, role, kind, part_id) VALUES (?, 'request', ?, ?, ?, ?, ?)",
@@ -447,7 +438,6 @@ impl SqliteSink {
                     ],
                 ))
                 .await?;
-            transaction.commit().await?;
         }
         Ok(())
     }
