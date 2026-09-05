@@ -571,16 +571,15 @@ mod tests {
             .await
             .unwrap();
         use sea_orm::TransactionTrait;
-        let reader_one = reporting.begin().await.unwrap();
-        let reader_two = reporting.begin().await.unwrap();
-        reader_one
-            .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
-            .await
-            .unwrap();
-        reader_two
-            .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
-            .await
-            .unwrap();
+        let mut readers = Vec::new();
+        for _ in 0..10 {
+            let reader = reporting.begin().await.unwrap();
+            reader
+                .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
+                .await
+                .unwrap();
+            readers.push(reader);
+        }
         let body = serde_json::to_vec(&serde_json::json!({"model":"claude-x", "messages":[{"role":"user","content":"long capture ".repeat(20000)}]})).unwrap();
         let captures = (0..8).map(|_| async {
             let id = crate::request_metrics::tests::started(
@@ -602,8 +601,9 @@ mod tests {
         )
         .await
         .unwrap();
-        reader_one.rollback().await.unwrap();
-        reader_two.rollback().await.unwrap();
+        for reader in readers {
+            reader.rollback().await.unwrap();
+        }
         reporting.close().await.unwrap();
         fixture.database.close_by_ref().await.unwrap();
     }
