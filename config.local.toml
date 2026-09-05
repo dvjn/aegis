@@ -1,0 +1,10 @@
+http_addr = "127.0.0.1:8765"
+database_url = "sqlite://data/dev.db?mode=rwc"
+
+[[providers]]
+id = "claude"
+type = "claude_subscription"
+
+[[providers]]
+id = "codex"
+type = "codex_subscription"
