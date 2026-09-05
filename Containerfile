@@ -17,7 +17,6 @@ VOLUME ["/data"]
 EXPOSE 8765
 
 ENV HTTP_ADDR=0.0.0.0:8765 \
-    DATABASE_URL="sqlite:///data/aegis.db?mode=rwc" \
-    RUST_LOG=aegis=info,tower_http=info
+    DATABASE_URL="sqlite:///data/aegis.db?mode=rwc"
 
 ENTRYPOINT ["/usr/local/bin/aegis"]
