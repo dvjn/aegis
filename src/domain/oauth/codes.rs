@@ -117,7 +117,7 @@ impl OAuthService {
             consumed_at: Set(None),
             issued_access_token_id: Set(None),
         }
-        .insert(&self.db)
+        .insert(&crate::db::writer(&self.db).await?)
         .await?;
         Ok(IssuedAuthorizationCode { value })
     }

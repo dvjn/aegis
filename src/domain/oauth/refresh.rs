@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set,
-    TransactionTrait,
     sea_query::{Expr, Func, SimpleExpr},
 };
 use subtle::ConstantTimeEq;
@@ -149,7 +148,7 @@ impl OAuthService {
         }
         let now = self.clock.now();
         if token.rotated_at.is_some() {
-            let tx = self.db.begin().await?;
+            let tx = crate::db::begin_immediate(&self.db).await?;
             Self::revoke_refresh_family(&tx, family_id, now).await?;
             tx.commit().await?;
             return Err(DomainError::InvalidCredentials);
@@ -165,7 +164,7 @@ impl OAuthService {
             return Err(DomainError::InvalidCredentials);
         }
 
-        let tx = self.db.begin().await?;
+        let tx = crate::db::begin_immediate(&self.db).await?;
         let rotated = oauth_refresh_tokens::Entity::update_many()
             .col_expr(
                 oauth_refresh_tokens::Column::RotatedAt,

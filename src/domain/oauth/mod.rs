@@ -24,8 +24,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DatabaseTransaction, SqliteTransactionMode,
-    TransactionOptions, TransactionTrait,
+    ColumnTrait, DatabaseConnection,
     sea_query::{Expr, Func, SimpleExpr},
 };
 use sha2::{Digest, Sha256};
@@ -140,17 +139,11 @@ impl OAuthService {
         })
     }
 
-    pub(super) async fn begin_immediate(&self) -> Result<DatabaseTransaction, DomainError> {
-        self.db
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| {
-                tracing::debug!(%error, "could not start immediate transaction");
-                DomainError::TemporarilyUnavailable
-            })
+    pub(super) async fn begin_immediate(&self) -> Result<crate::db::WriteTransaction, DomainError> {
+        crate::db::begin_immediate(&self.db).await.map_err(|error| {
+            tracing::debug!(%error, "could not start immediate transaction");
+            DomainError::TemporarilyUnavailable
+        })
     }
 }
 

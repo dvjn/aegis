@@ -90,7 +90,7 @@ impl KeyStore {
         validate(name, providers)?;
         let key_id = Uuid::now_v7().simple().to_string();
         let allowed = normalized_providers(providers)?;
-        self.database.execute_raw(Statement::from_sql_and_values(
+        crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO gateway_keys (id, user_id, name, allowed_providers, created_at) VALUES (?, ?, ?, ?, ?)",
             [key_id.clone().into(), user_id.to_string().into(), name.trim().to_owned().into(), allowed.into(), timestamp().into()],
@@ -100,7 +100,7 @@ impl KeyStore {
     }
 
     pub async fn rotate(&self, user_id: Uuid, key_id: &str) -> Result<String> {
-        let row = self.database.execute_raw(Statement::from_sql_and_values(
+        let row = crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE gateway_keys SET name = name WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
             [key_id.to_owned().into(), user_id.to_string().into()],
@@ -110,7 +110,7 @@ impl KeyStore {
         }
         let plaintext = self.create_version(key_id).await?;
         let version_id = parse_version_id(&plaintext).expect("generated key has a version id");
-        self.database.execute_raw(Statement::from_sql_and_values(
+        crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE gateway_key_versions SET revoked_at = ? WHERE key_id = ? AND id != ? AND revoked_at IS NULL",
             [timestamp().into(), key_id.to_owned().into(), version_id.into()],
@@ -132,7 +132,7 @@ impl KeyStore {
             .map_err(|e| anyhow::anyhow!("failed to hash API key: {e}"))?
             .to_string();
         let prefix = plaintext.chars().take(24).collect::<String>();
-        self.database.execute_raw(Statement::from_sql_and_values(
+        crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO gateway_key_versions (id, key_id, key_hash, prefix, created_at) VALUES (?, ?, ?, ?, ?)",
             [version_id.into(), key_id.to_owned().into(), key_hash.into(), prefix.into(), timestamp().into()],
@@ -188,14 +188,20 @@ impl KeyStore {
                 .map_err(|_| AuthenticationError::Invalid)?,
         };
         self.insert_cache(cache_key, key.clone()).await;
-        let _ = self
-            .database
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE gateway_key_versions SET last_used_at = ? WHERE id = ?",
-                [timestamp().into(), key.version_id.clone().into()],
-            ))
-            .await;
+        let last_used = async {
+            crate::db::writer(&self.database)
+                .await?
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE gateway_key_versions SET last_used_at = ? WHERE id = ?",
+                    [timestamp().into(), key.version_id.clone().into()],
+                ))
+                .await
+        }
+        .await;
+        if let Err(error) = last_used {
+            tracing::warn!(%error, "failed to update API key last use");
+        }
         authorize_provider(key, provider_id)
     }
 
@@ -211,14 +217,14 @@ impl KeyStore {
 
     pub async fn revoke(&self, user_id: Uuid, id: &str) -> Result<bool, sea_orm::DbErr> {
         let now = timestamp();
-        let result = self.database.execute_raw(Statement::from_sql_and_values(
+        let result = crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE gateway_keys SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
             [now.clone().into(), id.to_owned().into(), user_id.to_string().into()],
         )).await?;
         let revoked = result.rows_affected() > 0;
         if revoked {
-            self.database.execute_raw(Statement::from_sql_and_values(
+            crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE gateway_key_versions SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL",
                 [now.into(), id.to_owned().into()],

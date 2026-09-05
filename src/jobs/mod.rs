@@ -94,7 +94,8 @@ async fn completed(database: &DatabaseConnection, name: &str) -> Result<bool, Db
 }
 
 async fn record(database: &DatabaseConnection, name: &str) -> Result<(), DbErr> {
-    database
+    crate::db::writer(database)
+        .await?
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO background_jobs (name, completed_at) VALUES (?, ?)",

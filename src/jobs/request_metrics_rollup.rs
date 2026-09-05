@@ -3,7 +3,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "request_metrics_rollup";
 
-const SCAN_BATCH: i64 = 256;
+const SCAN_BATCH: i64 = 32;
 
 pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
     let mut after = String::new();
@@ -21,6 +21,8 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
             }
         }
         transaction.commit().await?;
+        tracing::debug!(job = NAME, after = %after, "background job batch committed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
