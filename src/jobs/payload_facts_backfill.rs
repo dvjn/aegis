@@ -1,8 +1,9 @@
 use crate::{
     compression::decode_body,
+    db::begin_immediate,
     payload_facts::{extract, store, tool_definition},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "payload_facts_backfill";
 
@@ -23,20 +24,24 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
             return Ok(extracted);
         };
         after = last.id.clone();
-        let transaction = database.begin().await?;
-        for blob in batch {
-            let Ok(value) = serde_json::from_slice(&blob.body) else {
-                continue;
-            };
-            let facts = if blob.is_tool {
-                tool_definition(&value)
-            } else {
-                extract(&value)
-            };
-            if facts.is_empty() {
-                continue;
-            }
-            store(&transaction, &blob.id, &facts).await?;
+        let extracted_facts: Vec<_> = batch
+            .into_iter()
+            .filter_map(|blob| {
+                let value = serde_json::from_slice(&blob.body).ok()?;
+                let facts = if blob.is_tool {
+                    tool_definition(&value)
+                } else {
+                    extract(&value)
+                };
+                (!facts.is_empty()).then_some((blob.id, facts))
+            })
+            .collect();
+        if extracted_facts.is_empty() {
+            continue;
+        }
+        let transaction = begin_immediate(database).await?;
+        for (blob_id, facts) in extracted_facts {
+            store(&transaction, &blob_id, &facts).await?;
             extracted += 1;
         }
         transaction.commit().await?;

@@ -1,5 +1,5 @@
-use crate::request_metrics::rollup;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+use crate::{db::begin_immediate, request_metrics::rollup};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 pub const NAME: &str = "request_metrics_rollup";
 
@@ -14,7 +14,7 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
             return Ok(rolled_up);
         };
         after = last.clone();
-        let transaction = database.begin().await?;
+        let transaction = begin_immediate(database).await?;
         for request_id in batch {
             if rollup(&transaction, &request_id).await? {
                 rolled_up += 1;
