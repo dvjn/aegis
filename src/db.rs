@@ -42,7 +42,10 @@ pub async fn reporting_connection(
         return Ok(primary.clone());
     }
     let mut options = ConnectOptions::new(database_url);
-    options.max_connections(2);
+    // The dashboard starts ten independent reports concurrently. Give each
+    // report a connection so a pair of expensive queries cannot make the
+    // remaining reports wait behind them until the HTTP deadline expires.
+    options.max_connections(10);
     options.map_sqlx_sqlite_opts(|options| {
         options
             .read_only(true)
@@ -261,16 +264,15 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
-        let reader_one = reporting.begin().await.unwrap();
-        let reader_two = reporting.begin().await.unwrap();
-        reader_one
-            .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
-            .await
-            .unwrap();
-        reader_two
-            .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
-            .await
-            .unwrap();
+        let mut readers = Vec::new();
+        for _ in 0..10 {
+            let reader = reporting.begin().await.unwrap();
+            reader
+                .execute_unprepared("SELECT COUNT(*) FROM gateway_requests")
+                .await
+                .unwrap();
+            readers.push(reader);
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
             let tx = begin_immediate(&fixture.database).await.unwrap();
             tx.execute_unprepared(
@@ -282,8 +284,9 @@ pub(crate) mod tests {
         })
         .await
         .expect("reporting readers must not block WAL writes or consume the primary pool");
-        reader_one.rollback().await.unwrap();
-        reader_two.rollback().await.unwrap();
+        for reader in readers {
+            reader.rollback().await.unwrap();
+        }
         reporting.close().await.unwrap();
         fixture.database.close_by_ref().await.unwrap();
     }
