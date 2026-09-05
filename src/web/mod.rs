@@ -338,6 +338,7 @@ mod tests {
         gateway::Gateway,
         migration::Migrator,
         origin::OriginPolicy,
+        policies::Pipeline,
         telemetry::SqliteSink,
     };
     use axum::{
@@ -387,7 +388,14 @@ mod tests {
         );
         let keys = KeyStore::new(db.clone());
         let usage = crate::usage::UsageStore::new(db.clone());
-        let gateway = Gateway::new(SqliteSink::new(db), keys.clone(), vec![], 1024).unwrap();
+        let gateway = Gateway::new(
+            SqliteSink::new(db),
+            keys.clone(),
+            Pipeline::default(),
+            vec![],
+            1024,
+        )
+        .unwrap();
         let router = router(AppState::new(
             SessionState::new(domain, OriginPolicy::new(None)),
             gateway,
@@ -845,7 +853,14 @@ mod tests {
         .unwrap();
         let keys = KeyStore::new(db.clone());
         let usage = crate::usage::UsageStore::new(db.clone());
-        let gateway = Gateway::new(SqliteSink::new(db), keys.clone(), vec![], 1024).unwrap();
+        let gateway = Gateway::new(
+            SqliteSink::new(db),
+            keys.clone(),
+            Pipeline::default(),
+            vec![],
+            1024,
+        )
+        .unwrap();
         let router = router(AppState::new(
             SessionState::new(domain.clone(), origin),
             gateway,

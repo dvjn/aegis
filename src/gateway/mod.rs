@@ -3,6 +3,9 @@ use anyhow::Context;
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
+    policies::{
+        Decision, Pipeline, PolicyError, PolicyFailure, RequestContext, restore::StreamRestorer,
+    },
     pricing::cost,
     providers::{Provider, extract_usage, requested_model},
     request_id::RequestId,
@@ -14,7 +17,7 @@ mod http;
 use axum::{
     body::{Body, Bytes, to_bytes},
     extract::Request,
-    http::{HeaderMap, HeaderName, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -25,6 +28,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const BLOCKING_POLICY_BYTES: usize = 256 * 1024;
+const POLICY_HEADER: HeaderName = HeaderName::from_static("x-aegis-policy");
+const APPLIED_POLICIES_HEADER: HeaderName = HeaderName::from_static("x-aegis-applied-policies");
 
 pub(crate) fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
@@ -47,6 +53,7 @@ pub struct Gateway {
     client: reqwest::Client,
     sink: SqliteSink,
     keys: KeyStore,
+    policies: Pipeline,
     providers: Arc<HashMap<String, ProviderTarget>>,
     max_capture_bytes: usize,
 }
@@ -79,6 +86,7 @@ impl Gateway {
     pub fn new(
         sink: SqliteSink,
         keys: KeyStore,
+        policies: Pipeline,
         providers: Vec<ProviderConfig>,
         max_capture_bytes: usize,
     ) -> anyhow::Result<Self> {
@@ -111,6 +119,7 @@ impl Gateway {
             client,
             sink,
             keys,
+            policies,
             providers: Arc::new(providers),
             max_capture_bytes,
         })
@@ -170,6 +179,32 @@ impl Gateway {
             Err(error) => return Ok(authentication_error(error)),
         };
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
+        let model = requested_model(&body);
+        let context = RequestContext {
+            body: body.clone(),
+            content_encoding: parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        };
+        let decision = match self.evaluate_policies(context).await? {
+            Ok(decision) => decision,
+            Err(failure) => return Ok(policy_failure(failure)),
+        };
+        let transformed = decision.body.as_ptr() != body.as_ptr();
+        let applied_policies = decision.applied_policies();
+        let Decision {
+            body,
+            evaluations,
+            restore,
+        } = decision;
+        let mut restorer =
+            (!restore.replacements.is_empty()).then(|| StreamRestorer::new(restore.replacements));
+        if transformed {
+            parts.headers.remove(header::CONTENT_ENCODING);
+            parts.headers.remove(header::CONTENT_LENGTH);
+        }
         let endpoint = parts
             .uri
             .path_and_query()
@@ -178,7 +213,6 @@ impl Gateway {
         let route_prefix = format!("/providers/{provider_id}");
         let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
         let upstream_url = target.upstream_url(upstream_path);
-        let model = requested_model(&body);
         let span = tracing::Span::current();
         span.record("user_id", tracing::field::display(&authenticated.user_id));
         span.record("key_id", tracing::field::display(&authenticated.id));
@@ -199,6 +233,9 @@ impl Gateway {
                 requested_model: model.as_deref(),
                 request_body: &body,
             })
+            .await?;
+        self.sink
+            .record_evaluations(capture_id, &evaluations)
             .await?;
 
         let mut outbound = self
@@ -240,6 +277,10 @@ impl Gateway {
                         if first_byte_at.is_none() {
                             first_byte_at = Some(timestamp());
                         }
+                        let chunk = match &mut restorer {
+                            Some(restorer) => Bytes::from(restorer.rewrite_chunk(&chunk)),
+                            None => chunk,
+                        };
                         response_bytes = response_bytes.saturating_add(chunk.len());
                         let remaining = max_capture_bytes.saturating_sub(capture.len());
                         if remaining > 0 {
@@ -256,6 +297,18 @@ impl Gateway {
                         stream_error = Some(message.clone());
                         let _ = sender.send(Err(io::Error::other(message))).await;
                         break;
+                    }
+                }
+            }
+
+            if let Some(restorer) = &mut restorer {
+                let tail = restorer.finish();
+                if !tail.is_empty() && !disconnected && stream_error.is_none() {
+                    response_bytes = response_bytes.saturating_add(tail.len());
+                    let remaining = max_capture_bytes.saturating_sub(capture.len());
+                    capture.extend_from_slice(&tail[..tail.len().min(remaining)]);
+                    if sender.send(Ok(Bytes::from(tail))).await.is_err() {
+                        disconnected = true;
                     }
                 }
             }
@@ -303,10 +356,30 @@ impl Gateway {
         let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
+        if !applied_policies.is_empty()
+            && let Ok(value) = applied_policies.parse()
+        {
+            response
+                .headers_mut()
+                .insert(APPLIED_POLICIES_HEADER, value);
+        }
         response
             .extensions_mut()
             .insert(crate::access_log::DeferredCompletion);
         Ok(response)
+    }
+}
+
+impl Gateway {
+    async fn evaluate_policies(
+        &self,
+        context: RequestContext,
+    ) -> anyhow::Result<Result<Decision, PolicyFailure>> {
+        if context.body.len() <= BLOCKING_POLICY_BYTES {
+            return Ok(self.policies.evaluate(context));
+        }
+        let policies = self.policies.clone();
+        Ok(tokio::task::spawn_blocking(move || policies.evaluate(context)).await?)
     }
 }
 
@@ -327,6 +400,36 @@ fn authentication_error(error: AuthenticationError) -> Response {
         })),
     )
         .into_response()
+}
+
+fn policy_failure(failure: PolicyFailure) -> Response {
+    let (status, code, message) = match &failure.error {
+        PolicyError::InvalidRequest(message) => {
+            tracing::warn!(error = %failure, "request policy rejected the request body");
+            (StatusCode::BAD_REQUEST, "invalid_request", message.clone())
+        }
+        PolicyError::Internal(_) => {
+            tracing::error!(error = %failure, "request policy failed; refusing to forward");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "policy_failure",
+                "a request policy failed, so the request was not forwarded".to_owned(),
+            )
+        }
+    };
+    let mut response = (
+        status,
+        axum::Json(json!({
+            "error": code,
+            "policy": failure.policy,
+            "message": message
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(POLICY_HEADER, HeaderValue::from_static("failed"));
+    response
 }
 
 fn filtered_headers(headers: &HeaderMap) -> HeaderMap {

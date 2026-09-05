@@ -23,6 +23,36 @@ pub struct Config {
     pub auth: AuthConfig,
     pub oauth: OAuthConfig,
     pub pricing: PricingConfig,
+    pub guardrails: GuardrailsConfig,
+    pub secret_placeholder_key: [u8; 32],
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GuardrailsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: GuardrailsMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailsMode {
+    #[default]
+    Observe,
+    Mask,
+}
+
+impl std::str::FromStr for GuardrailsMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "observe" => Ok(Self::Observe),
+            "mask" => Ok(Self::Mask),
+            other => bail!("guardrails mode {other:?} must be observe or mask"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -105,6 +135,8 @@ struct FileConfig {
     registration_enabled: bool,
     #[serde(default)]
     pricing: PricingConfig,
+    #[serde(default)]
+    guardrails: GuardrailsConfig,
 }
 
 impl Default for FileConfig {
@@ -117,6 +149,7 @@ impl Default for FileConfig {
             public_url: None,
             registration_enabled: false,
             pricing: PricingConfig::default(),
+            guardrails: GuardrailsConfig::default(),
         }
     }
 }
@@ -170,6 +203,16 @@ impl Config {
         }
         validate_pricing(&pricing)?;
 
+        let mut guardrails = file.guardrails;
+        if let Some(enabled) = optional_var("GUARDRAILS_ENABLED")? {
+            guardrails.enabled = enabled
+                .parse()
+                .context("GUARDRAILS_ENABLED must be true or false")?;
+        }
+        if let Some(mode) = optional_var("GUARDRAILS_MODE")? {
+            guardrails.mode = mode.parse()?;
+        }
+
         let smtp = smtp_config()?;
         let root_key = root_key()?;
         Ok(Self {
@@ -194,6 +237,8 @@ impl Config {
                 key_id: "v1".into(),
             },
             pricing,
+            guardrails,
+            secret_placeholder_key: derive_key(&root_key, b"aegis/v1/secret-placeholder"),
         })
     }
 }
@@ -486,6 +531,26 @@ mod tests {
             ..PricingConfig::default()
         };
         assert!(validate_pricing(&never_refreshed).is_err());
+    }
+
+    #[test]
+    fn guardrails_default_to_disabled_observation_and_parse_mask_mode() {
+        let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
+        assert!(!config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, GuardrailsMode::Observe);
+
+        let config: FileConfig = toml::from_str(
+            r#"
+            [guardrails]
+            enabled = true
+            mode = "mask"
+            "#,
+        )
+        .expect("configuration should parse");
+        assert!(config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, GuardrailsMode::Mask);
+        assert!(toml::from_str::<FileConfig>("[guardrails]\nmode = \"block\"").is_err());
+        assert!("block".parse::<GuardrailsMode>().is_err());
     }
 
     #[test]

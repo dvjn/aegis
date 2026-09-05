@@ -7,7 +7,8 @@ use super::charts::{
 use super::format::{count_text, money_text, percent_text, token_text};
 use super::{layout_with_nav, signed_in_nav, tools};
 use crate::usage::{
-    ContextTotals, LabeledSeries, Range, ToolUsage, TotalsSeries, UsageGroup, UsageTotals,
+    ContextTotals, GuardrailsSummary, LabeledSeries, Range, ToolUsage, TotalsSeries, UsageGroup,
+    UsageTotals,
 };
 
 /// Everything the overview needs, gathered by the handler in one place.
@@ -23,6 +24,7 @@ pub struct Overview<'a> {
     pub model_series: &'a [LabeledSeries],
     pub provider_series: &'a [LabeledSeries],
     pub key_series: &'a [LabeledSeries],
+    pub guardrails: &'a GuardrailsSummary,
 }
 
 const TILE_SPARKLINE: (u32, u32) = (96, 28);
@@ -83,6 +85,7 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                     (tools::mcp_card(overview.tools))
                     (tools::calls_card(overview.tools))
                     (tools::skills_card(overview.tools))
+                    (guardrails_card(overview.guardrails))
                 }
             }
         },
@@ -355,9 +358,55 @@ fn breakdown_card(
     }
 }
 
+fn guardrails_card(summary: &GuardrailsSummary) -> Markup {
+    html! {
+        article class="auth-card account-card" {
+            h2 { "Guardrails" }
+            p { "Requests the secrets policy scanned, and the secrets it masked before they left." }
+            div class="table-wrap" {
+                table class="data-table" {
+                    thead {
+                        tr {
+                            th scope="col" { "Measure" }
+                            th scope="col" class="col-numeric" { "Count" }
+                        }
+                    }
+                    tbody {
+                        @if summary.is_empty() {
+                            tr { td colspan="2" class="table-empty" { "No guardrail activity in this range." } }
+                        } @else {
+                            tr {
+                                th scope="row" class="cell-title" { "Requests scanned" }
+                                td class="col-numeric" { (count_text(summary.requests_scanned)) }
+                            }
+                            tr {
+                                th scope="row" class="cell-title" { "Requests masked" }
+                                td class="col-numeric" { (count_text(summary.requests_masked)) }
+                            }
+                            tr {
+                                th scope="row" class="cell-title" { "Placeholders substituted" }
+                                td class="col-numeric" { (count_text(summary.placeholders_substituted)) }
+                            }
+                            @for detector in &summary.detectors {
+                                tr {
+                                    th scope="row" class="cell-title" title=(detector.detector) {
+                                        span class="cell-absent" { "detector" } " " (detector.detector)
+                                    }
+                                    td class="col-numeric" { (count_text(detector.matches)) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::DetectorCount;
 
     #[test]
     fn the_overview_renders_with_and_without_traffic() {
@@ -399,6 +448,7 @@ mod tests {
             model_series: &model_series,
             provider_series: &[],
             key_series: &[],
+            guardrails: &GuardrailsSummary::default(),
         })
         .into_string();
         assert!(
@@ -483,6 +533,7 @@ mod tests {
             model_series: &[],
             provider_series: &[],
             key_series: &key_series,
+            guardrails: &GuardrailsSummary::default(),
         })
         .into_string();
         assert!(page.contains(r#"<h2>Keys</h2>"#), "{page}");
@@ -697,6 +748,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_guardrails_card_lists_the_counts_and_the_detectors() {
+        let guardrails = GuardrailsSummary {
+            requests_scanned: 12,
+            requests_masked: 4,
+            placeholders_substituted: 7,
+            detectors: vec![
+                DetectorCount {
+                    detector: "github_token".to_owned(),
+                    matches: 5,
+                },
+                DetectorCount {
+                    detector: "aws_access_key_id".to_owned(),
+                    matches: 2,
+                },
+            ],
+        };
+        let page = page(&Overview {
+            range: Range::Week,
+            totals: &UsageTotals::default(),
+            context: &ContextTotals::default(),
+            tools: &ToolUsage::default(),
+            series: &TotalsSeries {
+                requests: vec![0; 8],
+                tokens: vec![0; 8],
+                cost_nanodollars: vec![0; 8],
+            },
+            models: &[],
+            providers: &[],
+            keys: &[],
+            model_series: &[],
+            provider_series: &[],
+            key_series: &[],
+            guardrails: &guardrails,
+        })
+        .into_string();
+        assert!(page.contains("<h2>Guardrails</h2>"), "{page}");
+        assert!(page.contains(
+            r#"<th scope="row" class="cell-title">Requests scanned</th><td class="col-numeric">12</td>"#
+        ));
+        assert!(page.contains(
+            r#"<th scope="row" class="cell-title">Requests masked</th><td class="col-numeric">4</td>"#
+        ));
+        assert!(page.contains(
+            r#"<th scope="row" class="cell-title">Placeholders substituted</th><td class="col-numeric">7</td>"#
+        ));
+        assert!(page.contains(
+            r#"<th scope="row" class="cell-title" title="github_token"><span class="cell-absent">detector</span> github_token</th><td class="col-numeric">5</td>"#
+        ), "{page}");
+        assert!(page.contains("aws_access_key_id"));
+        assert!(!page.contains("No guardrail activity in this range."));
+        let keys_card = page.find("<h2>Keys</h2>").unwrap();
+        let guardrails_card = page.find("<h2>Guardrails</h2>").unwrap();
+        assert!(keys_card < guardrails_card, "Guardrails comes after Keys");
+    }
+
+    #[test]
+    fn the_guardrails_card_says_when_nothing_was_scanned() {
+        let page = page_without_traffic().into_string();
+        assert!(page.contains("<h2>Guardrails</h2>"));
+        assert!(
+            page.contains(
+                r#"<td colspan="2" class="table-empty">No guardrail activity in this range.</td>"#
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("Requests scanned"));
+    }
+
     fn page_without_traffic() -> Markup {
         page(&Overview {
             range: Range::Week,
@@ -714,6 +834,7 @@ mod tests {
             model_series: &[],
             provider_series: &[],
             key_series: &[],
+            guardrails: &GuardrailsSummary::default(),
         })
     }
 }

@@ -13,6 +13,7 @@ mod migration;
 mod oauth;
 mod origin;
 mod payload_facts;
+mod policies;
 mod pricing;
 mod providers;
 mod request_id;
@@ -131,6 +132,7 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
     let gateway = gateway::Gateway::new(
         sink,
         keys.clone(),
+        policies::pipeline(&config),
         config.providers,
         config.max_capture_bytes,
     )

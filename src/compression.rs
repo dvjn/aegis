@@ -26,6 +26,18 @@ pub(crate) fn decode_brotli_unsniffable(body: &[u8]) -> Option<Vec<u8>> {
     read_bounded(brotli::Decompressor::new(body, 4096))
 }
 
+pub(crate) fn decode_declared(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "" | "identity" => Some(body.to_vec()),
+        "gzip" | "x-gzip" => read_bounded(GzDecoder::new(body)),
+        "zstd" => zstd::stream::read::Decoder::new(body)
+            .ok()
+            .and_then(read_bounded),
+        "br" => decode_brotli_unsniffable(body),
+        _ => None,
+    }
+}
+
 fn read_bounded(reader: impl Read) -> Option<Vec<u8>> {
     let mut decoded = Vec::new();
     let one_past_the_cap = MAX_DECOMPRESSED_BYTES + 1;

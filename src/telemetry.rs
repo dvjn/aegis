@@ -1,6 +1,7 @@
 use crate::{
     compression::{decode_body, decode_brotli_unsniffable},
     payload_facts::{self, BlobFact},
+    policies::Evaluation,
     pricing::Cost,
     providers::{Provider, Usage},
     request_metrics,
@@ -340,6 +341,34 @@ impl SqliteSink {
             ))
             .await?;
         Ok(id)
+    }
+
+    pub async fn record_evaluations(
+        &self,
+        request_id: Uuid,
+        evaluations: &[Evaluation],
+    ) -> Result<(), sea_orm::DbErr> {
+        for evaluation in evaluations {
+            self.database
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO policy_evaluations (id, request_id, policy, policy_version, stage, outcome, severity, match_count, duration_micros, metadata, created_at) VALUES (?, ?, ?, ?, 'request', ?, ?, ?, ?, ?, ?)",
+                    [
+                        Uuid::now_v7().to_string().into(),
+                        request_id.to_string().into(),
+                        evaluation.policy.into(),
+                        i64::from(evaluation.policy_version).into(),
+                        evaluation.outcome.into(),
+                        evaluation.severity.into(),
+                        evaluation.match_count.into(),
+                        evaluation.duration_micros.into(),
+                        evaluation.metadata.to_string().into(),
+                        timestamp().into(),
+                    ],
+                ))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn complete(&self, record: CompletionRecord<'_>) -> Result<(), sea_orm::DbErr> {
@@ -785,5 +814,53 @@ mod tests {
         let finished = read("finished").await;
         assert_eq!(finished.1, None, "a completed request is left alone");
         assert_eq!(finished.2, Some(200));
+    }
+
+    #[tokio::test]
+    async fn evaluations_are_stored_against_the_capture_row_with_their_metadata() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let capture_id = Uuid::now_v7();
+        record(&db, &capture_id.to_string(), &timestamp(), None).await;
+
+        let sink = SqliteSink::new(db.clone());
+        sink.record_evaluations(
+            capture_id,
+            &[Evaluation {
+                policy: "secrets",
+                policy_version: 1,
+                outcome: "transform",
+                severity: Some("high"),
+                match_count: 2,
+                duration_micros: 40,
+                metadata: serde_json::json!({"detectors": ["github_token"]}),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT policy, policy_version, stage, outcome, severity, match_count, duration_micros, metadata FROM policy_evaluations WHERE request_id = ?",
+                [capture_id.to_string().into()],
+            ))
+            .await
+            .unwrap()
+            .expect("one evaluation row");
+        assert_eq!(row.try_get::<String>("", "policy").unwrap(), "secrets");
+        assert_eq!(row.try_get::<i64>("", "policy_version").unwrap(), 1);
+        assert_eq!(row.try_get::<String>("", "stage").unwrap(), "request");
+        assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "transform");
+        assert_eq!(
+            row.try_get::<Option<String>>("", "severity").unwrap(),
+            Some("high".to_owned())
+        );
+        assert_eq!(row.try_get::<i64>("", "match_count").unwrap(), 2);
+        assert_eq!(row.try_get::<i64>("", "duration_micros").unwrap(), 40);
+        assert_eq!(
+            row.try_get::<String>("", "metadata").unwrap(),
+            r#"{"detectors":["github_token"]}"#
+        );
     }
 }
