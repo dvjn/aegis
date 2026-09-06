@@ -84,6 +84,7 @@ pub async fn aggregate(
 
 /// Recounts every bucket from the request rows. Use after anything that
 /// changes a finished request's tokens or cost after the fact.
+#[cfg(test)]
 pub async fn rebuild(database: &impl ConnectionTrait) -> Result<u64, DbErr> {
     database
         .execute_unprepared("DELETE FROM gateway_usage_hourly")
