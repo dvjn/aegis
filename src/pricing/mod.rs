@@ -171,11 +171,14 @@ pub async fn backfill_costs(
 ) -> anyhow::Result<()> {
     let stats = store::backfill_unknown_costs(database, map).await?;
     if stats.updated > 0 {
+        let transaction = crate::db::begin_immediate(database).await?;
+        crate::usage_hourly::rebuild(&transaction).await?;
+        transaction.commit().await?;
         tracing::info!(
             scanned = stats.scanned,
             updated = stats.updated,
             still_unpriced = stats.scanned - stats.updated,
-            "backfilled historical request costs"
+            "backfilled historical request costs and rebuilt hourly usage"
         );
     } else {
         tracing::debug!(

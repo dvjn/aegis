@@ -4,7 +4,7 @@ use crate::{
     payload_facts::{self, BlobFact},
     pricing::Cost,
     providers::{Provider, Usage},
-    request_metrics,
+    request_metrics, usage_hourly,
 };
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -398,6 +398,7 @@ impl SqliteSink {
                 .await?;
         }
         request_metrics::rollup(&transaction, &record.id.to_string()).await?;
+        usage_hourly::aggregate(&transaction, Some(&record.id.to_string())).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -461,8 +462,8 @@ impl SqliteSink {
 
     pub async fn reconcile_interrupted(&self) -> Result<u64, sea_orm::DbErr> {
         let cutoff = (Utc::now() - INTERRUPTED_AFTER).to_rfc3339_opts(SecondsFormat::Millis, true);
-        let result = crate::db::writer(&self.database)
-            .await?
+        let transaction = begin_immediate(&self.database).await?;
+        let result = transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE gateway_requests SET completed_at = ?, error_message = ? \
@@ -475,24 +476,29 @@ impl SqliteSink {
                 ],
             ))
             .await?;
+        usage_hourly::aggregate(&transaction, None).await?;
+        transaction.commit().await?;
         Ok(result.rows_affected())
     }
 
     pub async fn fail(&self, id: Uuid, message: &str) {
-        let result =
-            async {
-                crate::db::writer(&self.database).await?.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE gateway_requests SET completed_at = ?, error_message = ? WHERE id = ?",
-                [
-                    timestamp().into(),
-                    message.to_owned().into(),
-                    id.to_string().into(),
-                ],
-            ))
-            .await
-            }
-            .await;
+        let result = async {
+            let transaction = begin_immediate(&self.database).await?;
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE gateway_requests SET completed_at = ?, error_message = ? WHERE id = ?",
+                    [
+                        timestamp().into(),
+                        message.to_owned().into(),
+                        id.to_string().into(),
+                    ],
+                ))
+                .await?;
+            usage_hourly::aggregate(&transaction, Some(&id.to_string())).await?;
+            transaction.commit().await
+        }
+        .await;
         if let Err(error) = result {
             tracing::error!(%error, %id, "failed to persist gateway failure");
         }
