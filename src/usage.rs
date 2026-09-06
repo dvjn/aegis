@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, NaiveTime, SecondsFormat, TimeDelta, Timelike, Utc};
 use sea_orm::{DatabaseConnection, DbBackend, FromQueryResult, Statement};
 use serde::Serialize;
 use uuid::Uuid;
+
+use crate::usage_hourly;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Range {
@@ -82,21 +84,23 @@ pub enum Bucket {
 }
 
 impl Bucket {
-    /// The SQLite expression that maps `r.started_at` to a bucket key. It must
-    /// produce exactly what `key` produces for the same moment.
+    /// The SQLite expression that maps `r.moment` to a bucket key. It must
+    /// produce exactly what `key` produces for the same moment. Every bucket
+    /// is a whole number of hours, so an hourly row maps to the same key as
+    /// the requests it sums.
     fn sql(self) -> &'static str {
         match self {
             Self::ThreeHours => {
-                "strftime('%Y-%m-%dT', r.started_at) \
-                 || printf('%02d', (CAST(strftime('%H', r.started_at) AS INTEGER) / 3) * 3) \
+                "strftime('%Y-%m-%dT', r.moment) \
+                 || printf('%02d', (CAST(strftime('%H', r.moment) AS INTEGER) / 3) * 3) \
                  || ':00:00Z'"
             }
-            Self::Day => "strftime('%Y-%m-%d', r.started_at)",
+            Self::Day => "strftime('%Y-%m-%d', r.moment)",
             // Days since the epoch, modulo three, is how far the day sits past
             // its bucket start.
             Self::ThreeDays => concat!(
-                "date(r.started_at, '-' || ",
-                "((CAST(julianday(date(r.started_at)) - 2440587.5 AS INTEGER)) % 3)",
+                "date(r.moment, '-' || ",
+                "((CAST(julianday(date(r.moment)) - 2440587.5 AS INTEGER)) % 3)",
                 " || ' days')"
             ),
         }
@@ -156,6 +160,31 @@ impl Window {
         [
             self.start.to_rfc3339_opts(SecondsFormat::Millis, true),
             self.end.to_rfc3339_opts(SecondsFormat::Millis, true),
+        ]
+    }
+
+    /// The hours the window covers completely, as a half-open range of hour
+    /// starts. The requests before it and from its end onwards are the two
+    /// partial edge hours, read row by row. When the window holds no whole
+    /// hour the range is empty and sits at the end, so the edges meet without
+    /// overlapping.
+    fn whole_hours(&self) -> [String; 2] {
+        let floor = |moment: DateTime<Utc>| {
+            moment.date_naive().and_time(NaiveTime::MIN).and_utc()
+                + TimeDelta::hours(i64::from(moment.hour()))
+        };
+        let last_hour_end = floor(self.end);
+        let first_hour_start = if floor(self.start) == self.start {
+            self.start
+        } else {
+            floor(self.start) + TimeDelta::hours(1)
+        }
+        .min(last_hour_end);
+        [
+            first_hour_start
+                .format(usage_hourly::HOUR_FORMAT)
+                .to_string(),
+            last_hour_end.format(usage_hourly::HOUR_FORMAT).to_string(),
         ]
     }
 }
@@ -358,26 +387,48 @@ pub struct UsageStore {
     database: DatabaseConnection,
 }
 
-const FROM_WINDOW_SQL: &str = "FROM gateway_requests r \
-     JOIN gateway_keys k ON k.id = r.key_id \
-     LEFT JOIN gateway_usage u ON u.request_id = r.id \
-     WHERE k.user_id = ? AND r.started_at >= ? AND r.started_at <= ?";
+/// The window's usage as uniform rows: hourly buckets for the whole hours
+/// inside it, and one row per request for the partial hours at either edge.
+/// Parameters, in order: user, window start, first whole hour, last whole
+/// hour end, window end, user, first whole hour, last whole hour end.
+const WINDOW_ROWS_SQL: &str = "WITH r AS ( \
+     SELECT q.started_at moment, q.provider, q.requested_model, k.name key_name, \
+     1 requests, \
+     CASE WHEN q.http_status < 400 AND q.error_message IS NULL THEN 1 ELSE 0 END succeeded, \
+     CASE WHEN q.http_status >= 400 OR q.error_message IS NOT NULL THEN 1 ELSE 0 END failed, \
+     COALESCE(u.input_tokens, 0) input_tokens, \
+     COALESCE(u.cache_read_tokens, 0) cache_read_tokens, \
+     COALESCE(u.cache_write_tokens, 0) cache_write_tokens, \
+     COALESCE(u.output_tokens, 0) output_tokens, \
+     COALESCE(u.cost_nanodollars, 0) cost_nanodollars, \
+     CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END unpriced \
+     FROM gateway_requests q \
+     JOIN gateway_keys k ON k.id = q.key_id \
+     LEFT JOIN gateway_usage u ON u.request_id = q.id \
+     WHERE k.user_id = ? \
+     AND ((q.started_at >= ? AND q.started_at < ?) OR (q.started_at >= ? AND q.started_at <= ?)) \
+     UNION ALL \
+     SELECT h.hour, h.provider, NULLIF(h.requested_model, ''), k.name, \
+     h.requests, h.succeeded, h.failed, \
+     h.input_tokens, h.cache_read_tokens, h.cache_write_tokens, h.output_tokens, \
+     h.cost_nanodollars, h.unpriced \
+     FROM gateway_usage_hourly h \
+     JOIN gateway_keys k ON k.id = h.key_id \
+     WHERE h.user_id = ? AND h.hour >= ? AND h.hour < ?)";
 
-const TOKENS_SQL: &str = "COALESCE(SUM(u.input_tokens), 0) + \
-     COALESCE(SUM(u.cache_read_tokens), 0) + \
-     COALESCE(SUM(u.cache_write_tokens), 0) + \
-     COALESCE(SUM(u.output_tokens), 0)";
+const TOKENS_SQL: &str = "COALESCE(SUM(r.input_tokens + r.cache_read_tokens + \
+     r.cache_write_tokens + r.output_tokens), 0)";
 
-const TOTALS_SQL: &str = "SELECT COUNT(*) requests, \
-     COALESCE(SUM(CASE WHEN r.http_status < 400 AND r.error_message IS NULL THEN 1 ELSE 0 END), 0) succeeded, \
-     COALESCE(SUM(CASE WHEN r.http_status >= 400 OR r.error_message IS NOT NULL THEN 1 ELSE 0 END), 0) failed, \
-     COALESCE(SUM(u.input_tokens), 0) input_tokens, \
-     COALESCE(SUM(u.cache_read_tokens), 0) cache_read_tokens, \
-     COALESCE(SUM(u.cache_write_tokens), 0) cache_write_tokens, \
-     COALESCE(SUM(u.output_tokens), 0) output_tokens, \
-     COALESCE(SUM(u.cost_nanodollars), 0) cost_nanodollars, \
-     COALESCE(SUM(CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END), 0) unpriced \
-     {from}";
+const TOTALS_SQL: &str = "{rows} SELECT COALESCE(SUM(r.requests), 0) requests, \
+     COALESCE(SUM(r.succeeded), 0) succeeded, \
+     COALESCE(SUM(r.failed), 0) failed, \
+     COALESCE(SUM(r.input_tokens), 0) input_tokens, \
+     COALESCE(SUM(r.cache_read_tokens), 0) cache_read_tokens, \
+     COALESCE(SUM(r.cache_write_tokens), 0) cache_write_tokens, \
+     COALESCE(SUM(r.output_tokens), 0) output_tokens, \
+     COALESCE(SUM(r.cost_nanodollars), 0) cost_nanodollars, \
+     COALESCE(SUM(r.unpriced), 0) unpriced \
+     FROM r";
 
 const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
      COALESCE(SUM(m.tool_definition_bytes), 0) tool_definition_bytes, \
@@ -478,26 +529,26 @@ const TOOL_PARTS_SQL: &str = "WITH refs AS MATERIALIZED ( \
      FROM parts WHERE block_type <> 'tool_definition' GROUP BY block_type, call_id) \
      GROUP BY block_type, label, skill";
 
-const BREAKDOWN_SQL: &str = "SELECT {column} label, COUNT(*) requests, \
+const BREAKDOWN_SQL: &str = "{rows} SELECT {column} label, SUM(r.requests) requests, \
      {tokens} tokens, \
-     COALESCE(SUM(u.cost_nanodollars), 0) cost_nanodollars \
-     {from} \
+     SUM(r.cost_nanodollars) cost_nanodollars \
+     FROM r \
      GROUP BY {column} ORDER BY tokens DESC, requests DESC, label";
 
-const TOTALS_SERIES_SQL: &str = "SELECT {bucket} bucket, COUNT(*) requests, \
+const TOTALS_SERIES_SQL: &str = "{rows} SELECT {bucket} bucket, SUM(r.requests) requests, \
      {tokens} tokens, \
-     COALESCE(SUM(u.cost_nanodollars), 0) cost_nanodollars \
-     {from} \
+     SUM(r.cost_nanodollars) cost_nanodollars \
+     FROM r \
      GROUP BY bucket";
 
-const LABELED_SERIES_SQL: &str = "SELECT {column} label, {bucket} bucket, \
+const LABELED_SERIES_SQL: &str = "{rows} SELECT {column} label, {bucket} bucket, \
      {tokens} tokens \
-     {from} \
+     FROM r \
      GROUP BY {column}, bucket";
 
 fn render_sql(template: &str, column: &str, bucket: Bucket) -> String {
     template
-        .replace("{from}", FROM_WINDOW_SQL)
+        .replace("{rows}", WINDOW_ROWS_SQL)
         .replace("{tokens}", TOKENS_SQL)
         .replace("{column}", column)
         .replace("{bucket}", bucket.sql())
@@ -515,7 +566,7 @@ impl UsageStore {
     ) -> Result<UsageTotals, sea_orm::DbErr> {
         let sql = render_sql(TOTALS_SQL, "", window.bucket);
         Ok(
-            UsageTotals::find_by_statement(self.statement(&sql, user_id, window))
+            UsageTotals::find_by_statement(self.window_statement(&sql, user_id, window))
                 .one(&self.database)
                 .await?
                 .unwrap_or_default(),
@@ -605,7 +656,7 @@ impl UsageStore {
         user_id: Uuid,
         window: Window,
     ) -> Result<Vec<UsageGroup>, sea_orm::DbErr> {
-        self.breakdown("k.name", user_id, window).await
+        self.breakdown("r.key_name", user_id, window).await
     }
 
     pub async fn totals_series(
@@ -614,7 +665,7 @@ impl UsageStore {
         window: Window,
     ) -> Result<TotalsSeries, sea_orm::DbErr> {
         let sql = render_sql(TOTALS_SERIES_SQL, "", window.bucket);
-        let points = TotalsPoint::find_by_statement(self.statement(&sql, user_id, window))
+        let points = TotalsPoint::find_by_statement(self.window_statement(&sql, user_id, window))
             .all(&self.database)
             .await?;
         let by_bucket: BTreeMap<&str, &TotalsPoint> = points
@@ -656,7 +707,7 @@ impl UsageStore {
         user_id: Uuid,
         window: Window,
     ) -> Result<Vec<LabeledSeries>, sea_orm::DbErr> {
-        self.labeled_series("k.name", user_id, window).await
+        self.labeled_series("r.key_name", user_id, window).await
     }
 
     async fn breakdown(
@@ -666,7 +717,7 @@ impl UsageStore {
         window: Window,
     ) -> Result<Vec<UsageGroup>, sea_orm::DbErr> {
         let sql = render_sql(BREAKDOWN_SQL, column, window.bucket);
-        UsageGroup::find_by_statement(self.statement(&sql, user_id, window))
+        UsageGroup::find_by_statement(self.window_statement(&sql, user_id, window))
             .all(&self.database)
             .await
     }
@@ -678,7 +729,7 @@ impl UsageStore {
         window: Window,
     ) -> Result<Vec<LabeledSeries>, sea_orm::DbErr> {
         let sql = render_sql(LABELED_SERIES_SQL, column, window.bucket);
-        let points = LabeledPoint::find_by_statement(self.statement(&sql, user_id, window))
+        let points = LabeledPoint::find_by_statement(self.window_statement(&sql, user_id, window))
             .all(&self.database)
             .await?;
         let keys = window.bucket_keys();
@@ -716,6 +767,26 @@ impl UsageStore {
             DbBackend::Sqlite,
             sql,
             [user_id.to_string().into(), start.into(), end.into()],
+        )
+    }
+
+    fn window_statement(&self, sql: &str, user_id: Uuid, window: Window) -> Statement {
+        let user = user_id.to_string();
+        let [start, end] = window.bounds();
+        let [hours_start, hours_end] = window.whole_hours();
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [
+                user.clone().into(),
+                start.into(),
+                hours_start.clone().into(),
+                hours_end.clone().into(),
+                end.into(),
+                user.into(),
+                hours_start.into(),
+                hours_end.into(),
+            ],
         )
     }
 }
@@ -782,10 +853,11 @@ mod tests {
 
     async fn complete(db: &DatabaseConnection, id: &str, status: i32) {
         db.execute_unprepared(&format!(
-            "UPDATE gateway_requests SET http_status = {status} WHERE id = '{id}'"
+            "UPDATE gateway_requests SET http_status = {status}, completed_at = started_at WHERE id = '{id}'"
         ))
         .await
         .unwrap();
+        usage_hourly::aggregate(db, Some(id)).await.unwrap();
     }
 
     async fn empty_store(email: &str) -> (DatabaseConnection, Uuid) {
@@ -906,7 +978,16 @@ mod tests {
             0,
         )
         .await;
+        for id in ["d-1", "d-2", "d-3", "d-4", "d-before", "d-after"] {
+            complete(&db, id, 200).await;
+        }
         (UsageStore::new(db), user)
+    }
+
+    /// Rows edited behind the store's back only reach the reports once the
+    /// buckets are recounted, as a repricing job would do in production.
+    async fn recount(store: &UsageStore) {
+        usage_hourly::rebuild(&store.database).await.unwrap();
     }
 
     #[test]
@@ -994,7 +1075,7 @@ mod tests {
             for moment in moments {
                 let sql = format!(
                     "SELECT {}",
-                    bucket.sql().replace("r.started_at", &format!("'{moment}'"))
+                    bucket.sql().replace("r.moment", &format!("'{moment}'"))
                 );
                 let row = db
                     .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql))
@@ -1108,6 +1189,7 @@ mod tests {
         )
         .await
         .unwrap();
+        recount(&store).await;
 
         let keys = store.by_key(user, last(Range::Month)).await.unwrap();
         assert_eq!(
@@ -1143,6 +1225,7 @@ mod tests {
             )
             .await
             .unwrap();
+        recount(&store).await;
         let models = store
             .by_model(user, daily("2026-03-01", "2026-03-04"))
             .await
@@ -1249,6 +1332,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn whole_hours_exclude_both_partial_edges_and_never_overlap_them() {
+        let hours = |from: &str, to: &str| window(from, to, Bucket::ThreeHours).whole_hours();
+        assert_eq!(
+            hours("2026-03-01T10:15:00Z", "2026-03-01T13:40:00Z"),
+            ["2026-03-01T11:00:00.000Z", "2026-03-01T13:00:00.000Z"]
+        );
+        assert_eq!(
+            hours("2026-03-01T10:00:00Z", "2026-03-01T13:00:00Z"),
+            ["2026-03-01T10:00:00.000Z", "2026-03-01T13:00:00.000Z"],
+            "a start on the hour is whole; an end on the hour stays a request read"
+        );
+        assert_eq!(
+            hours("2026-03-01T10:15:00Z", "2026-03-01T10:40:00Z"),
+            ["2026-03-01T10:00:00.000Z", "2026-03-01T10:00:00.000Z"],
+            "a window inside one hour has no whole hours"
+        );
+        assert_eq!(
+            hours("2026-03-01T10:15:00Z", "2026-03-01T11:40:00Z"),
+            ["2026-03-01T11:00:00.000Z", "2026-03-01T11:00:00.000Z"],
+            "a window across one boundary has no whole hours"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_hours_come_from_buckets_and_edge_hours_from_requests() {
+        let (db, user) = empty_store("seam@example.com").await;
+        record(
+            &db,
+            "edge",
+            "claude",
+            Some("opus"),
+            "2026-03-01T10:30:00.000Z",
+            1,
+            0,
+        )
+        .await;
+        record(
+            &db,
+            "whole",
+            "claude",
+            Some("opus"),
+            "2026-03-01T11:30:00.000Z",
+            2,
+            0,
+        )
+        .await;
+        record(
+            &db,
+            "open",
+            "claude",
+            Some("opus"),
+            "2026-03-01T11:45:00.000Z",
+            4,
+            0,
+        )
+        .await;
+        record(
+            &db,
+            "tail",
+            "claude",
+            Some("opus"),
+            "2026-03-01T12:30:00.000Z",
+            8,
+            0,
+        )
+        .await;
+        complete(&db, "edge", 200).await;
+        complete(&db, "whole", 200).await;
+        complete(&db, "tail", 200).await;
+        db.execute_unprepared("DELETE FROM gateway_requests WHERE id = 'whole'")
+            .await
+            .unwrap();
+        let store = UsageStore::new(db);
+
+        let totals = store
+            .totals(
+                user,
+                window(
+                    "2026-03-01T10:15:00Z",
+                    "2026-03-01T12:45:00Z",
+                    Bucket::ThreeHours,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            totals.tokens(),
+            11,
+            "the deleted request survives in its bucket; the open one is not there yet"
+        );
+        assert_eq!(totals.requests, 3);
+        assert_eq!(totals.unfinished(), 0);
+    }
+
     #[tokio::test]
     async fn a_request_without_an_outcome_counts_as_unfinished() {
         let (db, user) = empty_store("open@example.com").await;
@@ -1313,6 +1491,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        recount(&store).await;
 
         let totals = store.totals(user, last(Range::Week)).await.unwrap();
         assert_eq!(totals.cost_nanodollars, 4_000_000);
@@ -1366,6 +1545,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        recount(&store).await;
 
         let totals = store.totals(user, last(Range::Day)).await.unwrap();
         assert_eq!(totals.cost_nanodollars, nanodollars);

@@ -19,6 +19,7 @@ mod request_id;
 mod request_metrics;
 mod telemetry;
 mod usage;
+mod usage_hourly;
 mod web;
 
 use anyhow::{Context, Result, bail};
