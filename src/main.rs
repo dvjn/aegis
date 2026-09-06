@@ -18,6 +18,7 @@ mod providers;
 mod request_id;
 mod request_metrics;
 mod telemetry;
+mod tool_usage_hourly;
 mod usage;
 mod usage_hourly;
 mod web;

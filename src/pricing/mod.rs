@@ -173,6 +173,7 @@ pub async fn backfill_costs(
     if stats.updated > 0 {
         let transaction = crate::db::begin_immediate(database).await?;
         crate::usage_hourly::rebuild(&transaction).await?;
+        crate::tool_usage_hourly::rebuild(&transaction).await?;
         transaction.commit().await?;
         tracing::info!(
             scanned = stats.scanned,
