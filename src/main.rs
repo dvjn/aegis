@@ -271,6 +271,7 @@ async fn start_analytics(
                 published_at = ?current.published.as_ref().map(|b| b.observed_at.as_str()),
                 published_revision = ?current.published.as_ref().map(|b| b.revision),
                 pending_count = ?current.pending_count,
+                quarantined_count = current.quarantined.len(),
                 oldest_pending_at = ?current.oldest_pending_at,
                 oldest_pending_reason = current.oldest_pending_at_unavailable_reason,
                 processing_ms = current.processing_duration.as_millis() as u64,

@@ -1,5 +1,5 @@
 use super::{
-    Boundary, ProjectionStore,
+    Boundary, ProjectionStore, Quarantine,
     source::{Limits, Source},
     sqlite::SqliteStore,
 };
@@ -23,6 +23,8 @@ pub struct Status {
     pub availability: Availability,
     pub published: Option<Boundary>,
     pub pending_count: Option<i64>,
+    /// Requests refused this attempt. They remain pending and unprojected.
+    pub quarantined: Vec<Quarantine>,
     /// Always unavailable in this schema, not an assertion that the queue is empty.
     pub oldest_pending_at: Option<String>,
     pub oldest_pending_at_unavailable_reason: &'static str,
@@ -35,6 +37,7 @@ impl Default for Status {
             availability: Availability::Incomplete,
             published: None,
             pending_count: None,
+            quarantined: Vec::new(),
             oldest_pending_at: None,
             oldest_pending_at_unavailable_reason: "durable first-pending timestamps are not installed",
             processing_duration: Duration::ZERO,
@@ -125,6 +128,10 @@ impl Worker {
         self.project_from_boundary(boundary, cancel, status).await
     }
     #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> &SqliteStore {
+        &self.store
+    }
+    #[cfg(test)]
     pub(crate) async fn project_from_boundary_for_test(
         &self,
         boundary: Boundary,
@@ -140,13 +147,31 @@ impl Worker {
         status: &mut Status,
     ) -> Result<()> {
         let mut drained = false;
+        status.quarantined.clear();
         for _ in 0..self.max_batches {
             if cancel.is_cancelled() {
                 break;
             }
             let started = Instant::now();
             let batch = self.source.batch(&boundary, &self.limits).await?;
-            if batch.requests.is_empty() {
+            for quarantined in &batch.quarantined {
+                if !status
+                    .quarantined
+                    .iter()
+                    .any(|seen: &Quarantine| seen.request_id == quarantined.request_id)
+                {
+                    tracing::warn!(
+                        request = quarantined.request_id,
+                        revision = quarantined.revision,
+                        reason = quarantined.reason,
+                        "analytics request quarantined; leaving it pending"
+                    );
+                    status.quarantined.push(quarantined.clone());
+                }
+            }
+            // Quarantined requests are never drained, so a batch carrying only
+            // those has no work left that this attempt can apply.
+            if batch.requests.is_empty() && batch.key_revisions.is_empty() {
                 drained = true;
                 break;
             }

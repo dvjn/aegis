@@ -29,6 +29,18 @@ pub struct SourceBatch {
     pub identities: Vec<IdentityKey>,
     pub variants: Vec<Variant>,
     pub keys: Vec<Key>,
+    /// Drained from the key dimension queue, so only these may be acknowledged.
+    pub key_revisions: Vec<(String, i64)>,
+    pub quarantined: Vec<Quarantine>,
+}
+/// A request whose stored identities no longer belong to its owner/provider
+/// scope. Projecting it would export another owner's attribution, so it is
+/// withheld from the batch and left pending until the source is corrected.
+#[derive(Clone, Debug)]
+pub struct Quarantine {
+    pub request_id: String,
+    pub revision: i64,
+    pub reason: String,
 }
 #[derive(Clone, Debug)]
 pub struct Replacement {
@@ -134,6 +146,9 @@ pub struct Key {
     pub id: String,
     pub name: String,
     pub owner_id: Option<String>,
+    /// The revision at which this key last changed, not the snapshot's. Zero
+    /// for a key observed through a request that has never been revised.
+    pub source_revision: i64,
 }
 /// Constructed only by a store after its transaction commits.
 #[derive(Debug)]
@@ -142,6 +157,7 @@ pub struct CommittedReceipt {
     pub(crate) source_id: String,
     pub(crate) epoch: i64,
     pub(crate) revisions: Vec<(String, i64)>,
+    pub(crate) key_revisions: Vec<(String, i64)>,
 }
 impl CommittedReceipt {
     pub fn generation(&self) -> &str {
@@ -155,6 +171,9 @@ impl CommittedReceipt {
     }
     pub fn revisions(&self) -> &[(String, i64)] {
         &self.revisions
+    }
+    pub fn key_revisions(&self) -> &[(String, i64)] {
+        &self.key_revisions
     }
 }
 #[async_trait::async_trait]
@@ -222,6 +241,8 @@ mod tests {
             identities: vec![],
             variants: vec![],
             keys: vec![],
+            key_revisions: vec![],
+            quarantined: vec![],
         }
     }
     #[tokio::test]
@@ -643,14 +664,13 @@ mod tests {
             .await
             .unwrap();
         let boundary = source.observe().await.unwrap();
-        assert!(
-            source
-                .batch(&boundary, &source::Limits::default())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("namespace")
-        );
+        let rescoped = source
+            .batch(&boundary, &source::Limits::default())
+            .await
+            .unwrap();
+        assert!(rescoped.requests.is_empty());
+        assert_eq!(rescoped.quarantined.len(), 1);
+        assert!(rescoped.quarantined[0].reason.contains("namespace"));
     }
     #[tokio::test]
     async fn source_deletion_exports_a_tombstone() {
@@ -703,19 +723,26 @@ mod tests {
                 id: "key".into(),
                 name: "new name".into(),
                 owner_id: Some("new owner".into()),
+                source_revision: 5,
             }],
+            key_revisions: vec![("key".into(), 5)],
+            quarantined: vec![],
         };
         store.apply_batch(&fresh).await.unwrap();
+        // A later snapshot carrying an older observation of this key. Deciding
+        // on the snapshot revision instead of the key's own would roll the name
+        // back here, which is the arbitrary-winner failure this pins.
         let stale = SourceBatch {
             boundary: Boundary {
-                revision: 4,
+                revision: 9,
                 observed_at: "stale".into(),
             },
-            snapshot_revision: 4,
+            snapshot_revision: 9,
             keys: vec![Key {
                 id: "key".into(),
                 name: "old name".into(),
                 owner_id: Some("old owner".into()),
+                source_revision: 4,
             }],
             ..fresh
         };
@@ -738,6 +765,148 @@ mod tests {
         );
         assert_eq!(row.try_get::<i64>("", "source_revision").unwrap(), 5);
     }
+    async fn owned_request(db: &DatabaseConnection, owner: Uuid, request: &str) {
+        db.execute_unprepared(&format!("INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('{owner}','{owner}@example.com','{owner}@example.com','user','active',0,'2026-01-01','2026-01-01'); INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at) VALUES('key','{owner}','old label','[]','2026-01-01');")).await.ok();
+        db.execute_unprepared(&format!("INSERT INTO gateway_requests(id,request_id,key_id,provider,protocol,method,endpoint,started_at,request_bytes,http_status) VALUES('{request}','external-{request}','key','p','anthropic_messages','POST','/messages','2026-01-01T10:30:00.000Z',12,200); INSERT INTO gateway_analytics_requests(request_id) VALUES('{request}');")).await.unwrap();
+    }
+
+    async fn drain(source: &source::Source, store: &SqliteStore) -> Vec<Quarantine> {
+        let boundary = source.observe().await.unwrap();
+        let batch = source
+            .batch(&boundary, &source::Limits::default())
+            .await
+            .unwrap();
+        let receipt = store.apply_batch(&batch).await.unwrap();
+        source.acknowledge(&receipt).await.unwrap();
+        batch.quarantined
+    }
+
+    #[tokio::test]
+    async fn renaming_a_key_reaches_the_analytics_dimension_and_relabels_reports() {
+        let (fixture, source, store) = fixture().await;
+        let owner = Uuid::now_v7();
+        owned_request(&fixture.database, owner, "labelled").await;
+        drain(&source, &store).await;
+        let reader = store.reader().await.unwrap();
+        let window = report_window("2026-01-01T10:30:00Z", "2026-01-01T12:00:00Z");
+        let snapshot = reports::Snapshot::begin(&reader, true).await.unwrap();
+        assert_eq!(
+            snapshot.by_key(owner, window).await.unwrap()[0]
+                .label
+                .as_deref(),
+            Some("old label")
+        );
+        snapshot.commit().await.unwrap();
+
+        fixture
+            .database
+            .execute_unprepared("UPDATE gateway_keys SET name='new label' WHERE id='key'")
+            .await
+            .unwrap();
+        assert_eq!(source.pending().await.unwrap(), 1);
+        drain(&source, &store).await;
+        assert_eq!(source.pending().await.unwrap(), 0);
+        let snapshot = reports::Snapshot::begin(&reader, true).await.unwrap();
+        assert_eq!(
+            snapshot.by_key(owner, window).await.unwrap()[0]
+                .label
+                .as_deref(),
+            Some("new label"),
+            "a renamed key must not keep displaying its old label"
+        );
+        snapshot.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_corrections_arriving_out_of_order_keep_the_newest_name() {
+        let (fixture, source, store) = fixture().await;
+        let owner = Uuid::now_v7();
+        owned_request(&fixture.database, owner, "ordered").await;
+        drain(&source, &store).await;
+        fixture
+            .database
+            .execute_unprepared("UPDATE gateway_keys SET name='second' WHERE id='key'")
+            .await
+            .unwrap();
+        let newer = source
+            .batch(&source.observe().await.unwrap(), &source::Limits::default())
+            .await
+            .unwrap();
+        // The queue coalesces, so an older observation can only be replayed by
+        // a batch that was read before the newer one and applied after it.
+        let mut older = newer.clone();
+        older.keys[0].name = "first".into();
+        older.keys[0].source_revision -= 1;
+        store.apply_batch(&newer).await.unwrap();
+        store.apply_batch(&older).await.unwrap();
+        let name: String = store
+            .database
+            .query_one_raw(sql("SELECT name FROM keys WHERE id='key'", vec![]))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "name")
+            .unwrap();
+        assert_eq!(name, "second");
+    }
+
+    #[tokio::test]
+    async fn a_rescoped_request_is_quarantined_while_its_batch_still_projects() {
+        let (fixture, source, store) = fixture().await;
+        let owner = Uuid::now_v7();
+        owned_request(&fixture.database, owner, "rescoped").await;
+        owned_request(&fixture.database, owner, "healthy").await;
+        fixture.database.execute_unprepared(r#"
+            INSERT INTO gateway_analytics_tools VALUES(10,'["read",null]','read',NULL);
+            INSERT INTO gateway_analytics_tool_identities VALUES(10,'["owner","someone-else"]','p','call_id','call',0,'resolved',10);
+            INSERT INTO gateway_analytics_tool_variants VALUES(10,10,'tool_use',7,10);
+            INSERT INTO gateway_analytics_tool_appearances SELECT id,10,1 FROM gateway_analytics_requests WHERE request_id='rescoped';
+        "#).await.unwrap();
+        store
+            .database
+            .execute_unprepared("UPDATE generation SET baseline_complete=1")
+            .await
+            .unwrap();
+        let boundary = source.observe().await.unwrap();
+        let worker = worker::Worker::new(
+            source,
+            store,
+            source::Limits::default(),
+            Duration::from_secs(1),
+            3,
+        )
+        .await
+        .unwrap();
+        let mut status = worker::Status::default();
+        worker
+            .project_from_boundary_for_test(
+                boundary,
+                &tokio_util::sync::CancellationToken::new(),
+                &mut status,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.quarantined.len(), 1);
+        assert_eq!(status.quarantined[0].request_id, "rescoped");
+        assert_eq!(status.availability, worker::Availability::Backlog);
+        assert_eq!(
+            status.pending_count,
+            Some(1),
+            "the quarantined request must stay pending for a later source correction"
+        );
+        assert!(status.published.is_none());
+        let projected = worker
+            .store_for_test()
+            .database
+            .query_all_raw(sql("SELECT source_request_id FROM requests", vec![]))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "source_request_id").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(projected, vec!["healthy".to_owned()]);
+    }
+
     #[tokio::test]
     async fn filename_options_handle_sqlite_url_characters() {
         let (fixture, source, store) = fixture().await;
@@ -1091,7 +1260,10 @@ mod tests {
                     id: "key".into(),
                     name: "same label".into(),
                     owner_id: Some(owner.to_string()),
+                    source_revision: 0,
                 }],
+                key_revisions: vec![],
+                quarantined: vec![],
             })
             .await
             .unwrap();
@@ -1157,6 +1329,8 @@ mod tests {
                 identities: vec![],
                 variants: vec![],
                 keys: vec![],
+                key_revisions: vec![],
+                quarantined: vec![],
             })
             .await
             .unwrap();
@@ -1197,7 +1371,10 @@ mod tests {
                     id: "key".into(),
                     name: "key".into(),
                     owner_id: Some(owner.to_string()),
+                    source_revision: 0,
                 }],
+                key_revisions: vec![],
+                quarantined: vec![],
             })
             .await
             .unwrap();
@@ -1224,6 +1401,8 @@ mod tests {
                 identities: vec![],
                 variants: vec![],
                 keys: vec![],
+                key_revisions: vec![],
+                quarantined: vec![],
             })
             .await
             .unwrap();
@@ -1272,6 +1451,8 @@ mod tests {
                 identities: vec![],
                 variants: vec![],
                 keys: vec![],
+                key_revisions: vec![],
+                quarantined: vec![],
             })
             .await
             .unwrap();
@@ -1379,7 +1560,10 @@ mod tests {
                 id: "key".into(),
                 name: "key".into(),
                 owner_id: Some(owner.to_string()),
+                source_revision: 0,
             }],
+            key_revisions: vec![],
+            quarantined: vec![],
         }
     }
 

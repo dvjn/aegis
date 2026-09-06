@@ -154,11 +154,20 @@ impl Source {
                 .await?
                 .rows_affected();
         }
+        for (key, revision) in receipt.key_revisions() {
+            n += tx
+                .execute_raw(sql(
+                    "UPDATE gateway_analytics_key_revisions SET first_pending_revision=NULL WHERE key_id=? AND revision=?",
+                    vec![key.clone().into(), (*revision).into()],
+                ))
+                .await?
+                .rows_affected();
+        }
         tx.commit().await?;
         Ok(n)
     }
     pub async fn pending(&self) -> Result<i64> {
-        Ok(self.database.query_one_raw(sql("SELECT COUNT(*) n FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL",vec![])).await?.context("missing count")?.try_get("","n")?)
+        Ok(self.database.query_one_raw(sql("SELECT (SELECT COUNT(*) FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL)+(SELECT COUNT(*) FROM gateway_analytics_key_revisions WHERE first_pending_revision IS NOT NULL) n",vec![])).await?.context("missing count")?.try_get("","n")?)
     }
     /// Activation ownership excludes generation switching. Once no work through
     /// B remains, ordinary source mutations receive revisions above B, so the
@@ -183,7 +192,7 @@ impl Source {
             boundary.revision <= row.try_get::<i64>("", "revision")?,
             "future publication boundary"
         );
-        let pending=tx.query_one_raw(sql("SELECT 1 n FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL AND first_pending_revision<=? LIMIT 1",vec![boundary.revision.into()])).await?.is_some();
+        let pending=tx.query_one_raw(sql("SELECT 1 n FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL AND first_pending_revision<=? UNION ALL SELECT 1 FROM gateway_analytics_key_revisions WHERE first_pending_revision IS NOT NULL AND first_pending_revision<=? LIMIT 1",vec![boundary.revision.into(),boundary.revision.into()])).await?.is_some();
         tx.commit().await?;
         let complete = !pending && store.baseline_complete().await?;
         if complete {
@@ -231,7 +240,24 @@ impl Source {
             identities: vec![],
             variants: vec![],
             keys: vec![],
+            key_revisions: vec![],
+            quarantined: vec![],
         };
+        // A key deleted while its correction was pending has nothing left to
+        // relabel, so the queue entry is drained without touching the dimension.
+        for row in tx.query_all_raw(sql("SELECT r.key_id,r.revision,k.name,k.user_id FROM gateway_analytics_key_revisions r LEFT JOIN gateway_keys k ON k.id=r.key_id WHERE r.first_pending_revision IS NOT NULL AND r.first_pending_revision<=? ORDER BY r.first_pending_revision,r.key_id LIMIT ?",vec![boundary.revision.into(),(limits.request_count as i64).into()])).await? {
+            let id: String = row.try_get("", "key_id")?;
+            let revision: i64 = row.try_get("", "revision")?;
+            if let Some(name) = row.try_get::<Option<String>>("", "name")? {
+                batch.keys.push(Key {
+                    id: id.clone(),
+                    name,
+                    owner_id: row.try_get("", "user_id")?,
+                    source_revision: revision,
+                });
+            }
+            batch.key_revisions.push((id, revision));
+        }
         let mut used_rows = 0usize;
         let mut used_bytes = 0usize;
         for row in rows {
@@ -263,7 +289,29 @@ impl Source {
             let mutation = if deleted {
                 Mutation::Delete
             } else {
-                Mutation::Upsert(Box::new(read_request(&tx, &request, &mut batch).await?))
+                let dictionaries = (
+                    batch.tools.len(),
+                    batch.identities.len(),
+                    batch.variants.len(),
+                    batch.keys.len(),
+                );
+                match read_request(&tx, &request, &mut batch).await? {
+                    RequestRead::Facts(facts) => Mutation::Upsert(facts),
+                    RequestRead::Rescoped(reason) => {
+                        // Nothing this request alone introduced may reach the
+                        // destination, including its dictionary rows.
+                        batch.tools.truncate(dictionaries.0);
+                        batch.identities.truncate(dictionaries.1);
+                        batch.variants.truncate(dictionaries.2);
+                        batch.keys.truncate(dictionaries.3);
+                        batch.quarantined.push(Quarantine {
+                            request_id: request,
+                            revision,
+                            reason,
+                        });
+                        continue;
+                    }
+                }
             };
             batch.requests.push(Replacement {
                 request_id: request,
@@ -283,7 +331,12 @@ impl Source {
         batch.identities.dedup_by_key(|v| v.id);
         batch.variants.sort_by_key(|v| v.id);
         batch.variants.dedup_by_key(|v| v.id);
-        batch.keys.sort_by(|a, b| a.id.cmp(&b.id));
+        // Highest revision first, so deduplication keeps the newest observation
+        // when a queued correction and a request read see the same key.
+        batch.keys.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then(b.source_revision.cmp(&a.source_revision))
+        });
         batch.keys.dedup_by(|a, b| a.id == b.id);
         tx.commit().await?;
         Ok(batch)
@@ -343,12 +396,16 @@ async fn tool(tx: &DatabaseTransaction, id: i64, batch: &mut SourceBatch) -> Res
     });
     Ok(())
 }
+enum RequestRead {
+    Facts(Box<RequestFacts>),
+    Rescoped(String),
+}
 async fn read_request(
     tx: &DatabaseTransaction,
     request: &str,
     batch: &mut SourceBatch,
-) -> Result<RequestFacts> {
-    let r=one(tx,"SELECT r.key_id,r.key_version_id,k.user_id owner_id,k.name key_name,r.provider,r.requested_model,r.started_at,r.first_byte_at,r.completed_at,r.http_status,r.error_message IS NOT NULL has_error,r.request_bytes,r.response_bytes,r.client_disconnected FROM gateway_requests r LEFT JOIN gateway_keys k ON k.id=r.key_id WHERE r.id=?",vec![request.into()]).await?;
+) -> Result<RequestRead> {
+    let r=one(tx,"SELECT r.key_id,r.key_version_id,k.user_id owner_id,k.name key_name,COALESCE(kr.revision,0) key_revision,r.provider,r.requested_model,r.started_at,r.first_byte_at,r.completed_at,r.http_status,r.error_message IS NOT NULL has_error,r.request_bytes,r.response_bytes,r.client_disconnected FROM gateway_requests r LEFT JOIN gateway_keys k ON k.id=r.key_id LEFT JOIN gateway_analytics_key_revisions kr ON kr.key_id=r.key_id WHERE r.id=?",vec![request.into()]).await?;
     let mut f = RequestFacts {
         key_id: r.try_get("", "key_id")?,
         key_version_id: r.try_get("", "key_version_id")?,
@@ -370,6 +427,7 @@ async fn read_request(
             id: id.clone(),
             name,
             owner_id: f.owner_id.clone(),
+            source_revision: r.try_get("", "key_revision")?,
         });
     }
     if let Some(u)=tx.query_one_raw(sql("SELECT input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,cost_nanodollars,cost_source FROM gateway_usage WHERE request_id=?",vec![request.into()])).await? {f.usage=Some(Usage {input_tokens:u.try_get("","input_tokens")?,cache_read_tokens:u.try_get("","cache_read_tokens")?,cache_write_tokens:u.try_get("","cache_write_tokens")?,output_tokens:u.try_get("","output_tokens")?,reasoning_tokens:u.try_get("","reasoning_tokens")?,cost_nanos:u.try_get("","cost_nanodollars")?,cost_source:u.try_get("","cost_source")?});}
@@ -410,7 +468,13 @@ async fn read_request(
     }
     for a in tx.query_all_raw(sql("SELECT a.variant_id,a.multiplicity,v.identity_id,v.kind,v.bytes,v.observed_tool_id,i.scope_key,i.provider,i.identity_kind,i.identity_key,i.conversation_available,i.state,i.tool_id FROM gateway_analytics_tool_appearances a JOIN gateway_analytics_tool_variants v ON v.id=a.variant_id JOIN gateway_analytics_tool_identities i ON i.id=v.identity_id WHERE a.request_id=?",vec![id.into()])).await? {
         let expected_scope=serde_json::to_string(&match &f.owner_id {Some(owner)=>("owner",owner.as_str()),None=>("request",request)})?;
-        ensure!(a.try_get::<String>("","scope_key")?==expected_scope && a.try_get::<String>("","provider")?==f.provider,"analytics identity namespace differs from request {request}; source correction required");
+        if a.try_get::<String>("", "scope_key")? != expected_scope
+            || a.try_get::<String>("", "provider")? != f.provider
+        {
+            return Ok(RequestRead::Rescoped(format!(
+                "analytics identity namespace differs from request {request}; source correction required"
+            )));
+        }
         let variant_id=a.try_get("","variant_id")?;let identity_id=a.try_get("","identity_id")?;let observed_tool_id=a.try_get("","observed_tool_id")?;let tool_id:Option<i64>=a.try_get("","tool_id")?;
         tool(tx,observed_tool_id,batch).await?;if let Some(t)=tool_id {tool(tx,t,batch).await?;}
         batch.identities.push(IdentityKey {id:identity_id,scope_key:a.try_get("","scope_key")?,provider:a.try_get("","provider")?,identity_kind:a.try_get("","identity_kind")?,identity_key:a.try_get("","identity_key")?,conversation_available:a.try_get("","conversation_available")?});
@@ -420,5 +484,5 @@ async fn read_request(
     }
     f.attribution.sort_by_key(|a| a.identity_id);
     f.attribution.dedup_by_key(|a| a.identity_id);
-    Ok(f)
+    Ok(RequestRead::Facts(Box::new(f)))
 }

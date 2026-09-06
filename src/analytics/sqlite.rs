@@ -402,7 +402,11 @@ impl ProjectionStore for SqliteStore {
             .await?;
         }
         for k in &batch.keys {
-            tx.execute_raw(sql("INSERT INTO keys VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,owner_id=excluded.owner_id,source_revision=excluded.source_revision WHERE excluded.source_revision >= keys.source_revision",vec![k.id.clone().into(),k.name.clone().into(),k.owner_id.clone().into(),batch.snapshot_revision.into()])).await?;
+            ensure!(
+                k.source_revision >= 0 && k.source_revision <= batch.snapshot_revision,
+                "invalid key revision"
+            );
+            tx.execute_raw(sql("INSERT INTO keys VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,owner_id=excluded.owner_id,source_revision=excluded.source_revision WHERE excluded.source_revision >= keys.source_revision",vec![k.id.clone().into(),k.name.clone().into(),k.owner_id.clone().into(),k.source_revision.into()])).await?;
         }
         let mut revisions = Vec::new();
         for r in &batch.requests {
@@ -530,6 +534,7 @@ impl ProjectionStore for SqliteStore {
             source_id: self.source_id.clone(),
             epoch: batch.epoch,
             revisions,
+            key_revisions: batch.key_revisions.clone(),
         })
     }
 }
