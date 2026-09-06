@@ -294,14 +294,20 @@ ON CONFLICT(key_id) DO UPDATE SET
 mod tests {
     use crate::migration::Migrator;
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
-    use sea_orm_migration::MigratorTrait;
+    use sea_orm_migration::{MigrationName, MigratorTrait};
 
-    /// Everything except this migration, so the queues meet a source that has
-    /// already been capturing under the previous schema.
+    /// Everything before this migration, so the queues meet a source that has
+    /// already been capturing under the previous schema. Counting the
+    /// predecessors keeps the fixture accurate as later migrations are added.
     async fn previous_schema() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        let before = u32::try_from(Migrator::migrations().len() - 1).unwrap();
-        Migrator::up(&db, Some(before)).await.unwrap();
+        let before = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == super::Migration.name())
+            .expect("this migration must be registered");
+        Migrator::up(&db, Some(u32::try_from(before).unwrap()))
+            .await
+            .unwrap();
         db.execute_unprepared(
             "UPDATE gateway_analytics_clock SET active_generation = 'live' WHERE id = 1;
              INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at)
@@ -402,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn reverting_restores_the_coalescing_columns_and_keeps_capture_working() {
         let db = previous_schema().await;
-        Migrator::up(&db, None).await.unwrap();
+        Migrator::up(&db, Some(1)).await.unwrap();
         Migrator::down(&db, Some(1)).await.unwrap();
         assert_eq!(
             rows(

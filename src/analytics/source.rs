@@ -122,6 +122,25 @@ impl Source {
         tx.commit().await?;
         Ok(())
     }
+    /// The generation currently owning this source, for an operator command
+    /// that must enumerate for it without claiming an ownership era of its own.
+    pub async fn active_generation(&self) -> Result<Option<String>> {
+        Ok(self
+            .database
+            .query_one_raw(sql(
+                "SELECT active_generation FROM gateway_analytics_clock WHERE id=1",
+                vec![],
+            ))
+            .await?
+            .context("missing analytics clock")?
+            .try_get("", "active_generation")?)
+    }
+    /// Whether backfill has enumerated this generation's whole baseline frame.
+    /// The capture-side checkpoint is authoritative; the destination flag is
+    /// adopted from it by whoever owns the destination.
+    pub async fn baseline_covered(&self) -> Result<bool> {
+        backfill::baseline_covered(&self.database, self.generation()?).await
+    }
     pub async fn observe(&self) -> Result<Boundary> {
         let tx = self.database.begin().await?;
         let row=tx.query_one_raw(sql("SELECT revision,strftime('%Y-%m-%dT%H:%M:%fZ','now') observed_at FROM gateway_analytics_clock WHERE id=1",vec![])).await?.context("missing clock")?;

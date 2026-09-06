@@ -1,5 +1,5 @@
 mod payload_facts_backfill;
-mod payload_resplit;
+pub(crate) mod payload_resplit;
 mod request_metrics_rollup;
 mod requested_model_backfill;
 

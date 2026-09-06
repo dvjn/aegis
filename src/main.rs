@@ -54,6 +54,33 @@ enum Command {
         #[arg(long)]
         password_file: Option<PathBuf>,
     },
+    Analytics {
+        #[command(subcommand)]
+        command: AnalyticsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnalyticsCommand {
+    /// Install source facts for requests captured before analytics tracking
+    /// existed. Safe to interrupt: the next run resumes from its checkpoint.
+    Backfill {
+        /// Requests per capture transaction, which decides how long each page
+        /// holds the writer against live traffic.
+        #[arg(long, default_value_t = 8)]
+        page: usize,
+        /// Stop after this many requests instead of covering all of history.
+        #[arg(long)]
+        max_requests: Option<usize>,
+        #[arg(long, default_value_t = 10)]
+        throttle_ms: u64,
+        /// Treat requests whose payloads are gone as accounted for, so the
+        /// baseline can complete without them.
+        #[arg(long)]
+        accept_missing_payloads: bool,
+    },
+    /// Report backfill progress and the requests it could not derive facts for.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -94,6 +121,7 @@ async fn main() -> Result<()> {
             email,
             password_file,
         } => bootstrap_user(&config, &database, &email, password_file).await,
+        Command::Analytics { command } => manage_analytics(command, &database).await,
     };
 
     if let Err(error) = database.close().await {
@@ -283,6 +311,72 @@ async fn start_analytics(
         status,
         reader,
     }))
+}
+
+/// Enumeration writes only to the capture database, so these commands never
+/// take the analytics destination's ownership lock and can run while the
+/// gateway serves.
+async fn manage_analytics(command: AnalyticsCommand, database: &DatabaseConnection) -> Result<()> {
+    let source_path = database
+        .get_sqlite_connection_pool()
+        .connect_options()
+        .get_filename()
+        .to_path_buf();
+    let source = analytics::source::Source::open(database.clone(), &source_path).await?;
+    let generation = source
+        .active_generation()
+        .await?
+        .context("no analytics generation owns this database yet; run the server once")?;
+    let progress = match command {
+        AnalyticsCommand::Backfill {
+            page,
+            max_requests,
+            throttle_ms,
+            accept_missing_payloads,
+        } => Some(
+            analytics::backfill::run(
+                database,
+                &generation,
+                &analytics::backfill::Budget {
+                    page,
+                    max_requests,
+                    throttle: std::time::Duration::from_millis(throttle_ms),
+                },
+                accept_missing_payloads,
+            )
+            .await?,
+        ),
+        AnalyticsCommand::Status => analytics::backfill::progress(database, &generation).await?,
+    };
+    let Some(progress) = progress else {
+        println!("generation: {generation}");
+        println!("backfill: not started");
+        return Ok(());
+    };
+    println!("generation: {generation}");
+    println!(
+        "visited: {} installed: {} already tracked: {} unavailable: {}",
+        progress.visited, progress.installed, progress.live, progress.unavailable
+    );
+    println!("remaining in frame: {}", progress.remaining);
+    println!(
+        "enumeration: {}",
+        match &progress.completed_at {
+            Some(at) => format!("complete at {at}"),
+            None => format!("at {} of {}", progress.cursor, progress.ceiling),
+        }
+    );
+    println!("baseline covered: {}", progress.covered());
+    if progress.unavailable > 0 {
+        println!(
+            "{} requests have no derivable facts; rerun with --accept-missing-payloads to complete the baseline without them:",
+            progress.unavailable
+        );
+        for gap in analytics::backfill::gaps(database, &generation).await? {
+            println!("  {} {} ({})", gap.request_id, gap.reason, gap.detected_at);
+        }
+    }
+    Ok(())
 }
 
 async fn bootstrap_user(

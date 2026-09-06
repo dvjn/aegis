@@ -1,6 +1,7 @@
 //! Facts-only projection. New generations remain incomplete until a separate backfill validates them.
 pub mod aggregates;
 pub mod arithmetic;
+pub mod backfill;
 pub mod reports;
 pub mod source;
 pub mod sqlite;
@@ -1016,6 +1017,75 @@ mod tests {
         held_writer.commit().await.unwrap();
         apply.await.unwrap();
     }
+    #[tokio::test]
+    async fn a_covered_backfill_turns_an_incomplete_generation_into_a_published_one() {
+        let (fixture, source, store) = fixture().await;
+        let db = &fixture.database;
+        // A request as captured before tracking existed: no source fact, no
+        // revision, so nothing ever offers it to the projector.
+        db.execute_unprepared(
+            "INSERT INTO gateway_requests(id,request_id,provider,protocol,method,endpoint,started_at,request_bytes) VALUES('historical','external','p','anthropic_messages','POST','/messages','2026-01-01T00:00:00.000Z',0);
+             DELETE FROM gateway_analytics_pending_requests WHERE request_id='historical';
+             DELETE FROM gateway_analytics_revisions WHERE request_id='historical'",
+        )
+        .await
+        .unwrap();
+        let generation = store.generation().to_owned();
+        let worker = worker::Worker::new(
+            source,
+            store,
+            source::Limits::default(),
+            Duration::from_secs(300),
+            4,
+        )
+        .await
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut status = worker::Status::default();
+        worker
+            .project_from_boundary_for_test(
+                Boundary {
+                    revision: 0,
+                    observed_at: "observed".into(),
+                },
+                &cancel,
+                &mut status,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.availability, worker::Availability::Incomplete);
+
+        let progress = backfill::run(db, &generation, &backfill::Budget::default(), false)
+            .await
+            .unwrap();
+        assert!(progress.covered());
+
+        let boundary = db
+            .query_one_raw(sql(
+                "SELECT revision FROM gateway_analytics_clock WHERE id=1",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "revision")
+            .unwrap();
+        worker
+            .project_from_boundary_for_test(
+                Boundary {
+                    revision: boundary,
+                    observed_at: "observed".into(),
+                },
+                &cancel,
+                &mut status,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.availability, worker::Availability::Published);
+        assert!(worker.store_for_test().baseline_complete().await.unwrap());
+        assert_eq!(count(db, "gateway_analytics_pending_requests").await, 0);
+    }
+
     #[tokio::test]
     async fn scheduler_sleeps_after_attempt_and_cancels_without_waiting_interval() {
         let (fixture, source, store) = fixture().await;

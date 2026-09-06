@@ -177,6 +177,23 @@ async fn replace_if_unchanged(
     Ok(true)
 }
 
+/// The request body as captured, rebuilt from its stored envelope and parts.
+/// `None` once those payloads are gone, which no caller may read as an empty body.
+pub(crate) async fn original_request_body(
+    database: &impl ConnectionTrait,
+    request_id: &str,
+    protocol: &str,
+) -> Result<Option<Vec<u8>>, DbErr> {
+    original_body(
+        database,
+        &Request {
+            id: request_id.to_owned(),
+            protocol: protocol.to_owned(),
+        },
+    )
+    .await
+}
+
 async fn original_body(
     database: &impl ConnectionTrait,
     request: &Request,

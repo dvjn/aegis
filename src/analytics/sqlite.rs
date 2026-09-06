@@ -287,6 +287,14 @@ impl SqliteStore {
             .context("missing generation")?
             .try_get("", "baseline_complete")?)
     }
+    /// Adopts a completed source enumeration. The flag is derived, so setting it
+    /// twice is a no-op and clearing it is not this method's business.
+    pub async fn mark_baseline_complete(&self) -> Result<()> {
+        self.database
+            .execute_unprepared("UPDATE generation SET baseline_complete=1 WHERE singleton=1")
+            .await?;
+        Ok(())
+    }
     pub async fn published(&self) -> Result<Option<Boundary>> {
         self.database
             .query_one_raw(sql(

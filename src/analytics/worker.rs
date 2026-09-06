@@ -147,6 +147,13 @@ impl Worker {
     ) -> Result<()> {
         let mut drained = false;
         status.quarantined.clear();
+        // Backfill records completion in the capture database, which it can
+        // reach while this process serves. Adopting it here, before the batches
+        // that may drain the last of the queue, lets one attempt both finish the
+        // backlog and publish it.
+        if !self.store.baseline_complete().await? && self.source.baseline_covered().await? {
+            self.store.mark_baseline_complete().await?;
+        }
         for _ in 0..self.max_batches {
             if cancel.is_cancelled() {
                 break;
