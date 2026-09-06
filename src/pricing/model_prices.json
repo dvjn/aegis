@@ -73,6 +73,12 @@
     "input": 0.00001,
     "output": 0.00005
   },
+  "claude-mythos-5-1": {
+    "cache_read": 2.5E-7,
+    "cache_write": 0.0000125,
+    "input": 0.00001,
+    "output": 0.00005
+  },
   "claude-mythos-preview": {
     "cache_read": 0.000001,
     "cache_write": 0.0000125,
@@ -702,6 +708,18 @@
     "input": 6E-7,
     "output": 0.0000024
   },
+  "gpt-daybreak-blue-latest": {
+    "cache_read": 4E-7,
+    "cache_write": 0.000005,
+    "input": 0.000004,
+    "output": 0.00002
+  },
+  "gpt-daybreak-red-latest": {
+    "cache_read": 0.00000125,
+    "cache_write": 0.000015625,
+    "input": 0.0000125,
+    "output": 0.000075
+  },
   "gpt-image-1": {
     "cache_read": 0.00000125,
     "input": 0.000005,
@@ -725,12 +743,12 @@
   "gpt-image-2": {
     "cache_read": 0.00000125,
     "input": 0.000005,
-    "output": 0.00001
+    "output": 0
   },
   "gpt-image-2-2026-04-21": {
     "cache_read": 0.00000125,
     "input": 0.000005,
-    "output": 0.00001
+    "output": 0
   },
   "gpt-realtime": {
     "cache_read": 4E-7,
