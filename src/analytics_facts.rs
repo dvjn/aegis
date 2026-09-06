@@ -3,8 +3,10 @@
 //! multiply by authoritative request nanodollars / request total bytes.
 //!
 //! Deletion with occupied appearances is deliberately blocked by migration 19.
-//! A later withdrawal API must remove observations and invalidate dependents
-//! atomically. Definition-only deletion can retain facts behind a tombstone.
+//! [`PreparedTools::withdraw`] is the way through it: it removes observations
+//! and invalidates dependents in the caller's transaction, so the trigger stays
+//! as a backstop against raw SQL deletion rather than an unimplemented feature.
+//! Definition-only deletion can retain facts behind a tombstone.
 use crate::telemetry::SemanticPayload;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, Statement, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -114,6 +116,29 @@ impl PreparedTools {
             }
         }
         Ok(prepared)
+    }
+
+    /// Withdraws every tool fact a request carries, so it can then be deleted.
+    ///
+    /// Storing an empty set is withdrawal: it removes the request's appearances
+    /// and contributions, re-resolves every identity they touched, and revises
+    /// the dependents that shared them. Identities are scoped per owner and
+    /// shared across a conversation, so removing one request's calls can change
+    /// what another request's attribution proves; without this, deletion would
+    /// leave those dependents asserting a caller nothing supports any more.
+    ///
+    /// The caller owns the capture transaction and writer gate, and must issue
+    /// the `DELETE` in that same transaction: the request row must still exist
+    /// here, and until the delete lands the request is live with no tool facts.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no retention or pruning path calls this yet; deletion is operator SQL"
+        )
+    )]
+    pub(crate) async fn withdraw(db: &DatabaseTransaction, request: &str) -> Result<(), DbErr> {
+        Self::default().store(db, request).await
     }
 
     /// Caller owns the capture transaction and writer gate. Replacements remove
@@ -1058,6 +1083,58 @@ mod tests {
             .await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_unresolves_a_shared_identity_and_lets_the_request_delete() {
+        use sea_orm::TransactionTrait as _;
+        let db = crate::request_metrics::tests::database().await;
+        let request = capture(&db, "missing", "p", body(vec![call("Read")])).await;
+        assert_eq!(
+            number(
+                &db,
+                "SELECT COUNT(*) n FROM gateway_analytics_tool_identities WHERE state = 'resolved'"
+            )
+            .await,
+            1
+        );
+        let before = number(&db, "SELECT revision n FROM gateway_analytics_clock").await;
+        let tx = db.begin().await.unwrap();
+        PreparedTools::withdraw(&tx, &request).await.unwrap();
+        tx.execute_raw(sql(
+            "DELETE FROM gateway_requests WHERE id = ?",
+            vec![request.clone().into()],
+        ))
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            number(
+                &db,
+                "SELECT COUNT(*) n FROM gateway_analytics_tool_appearances"
+            )
+            .await,
+            0
+        );
+        // The call that proved the identity is gone, so nothing may still claim
+        // it resolves to a tool.
+        assert_eq!(
+            number(
+                &db,
+                "SELECT COUNT(*) n FROM gateway_analytics_tool_identities WHERE state = 'resolved'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            number(
+                &db,
+                "SELECT COUNT(*) n FROM gateway_analytics_revisions WHERE deleted = 1"
+            )
+            .await,
+            1
+        );
+        assert!(number(&db, "SELECT revision n FROM gateway_analytics_clock").await > before);
     }
 
     #[tokio::test]
