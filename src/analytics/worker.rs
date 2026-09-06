@@ -25,9 +25,9 @@ pub struct Status {
     pub pending_count: Option<i64>,
     /// Requests refused this attempt. They remain pending and unprojected.
     pub quarantined: Vec<Quarantine>,
-    /// Always unavailable in this schema, not an assertion that the queue is empty.
+    /// When the oldest work this generation still owes first became pending;
+    /// None only when both queues are empty.
     pub oldest_pending_at: Option<String>,
-    pub oldest_pending_at_unavailable_reason: &'static str,
     pub processing_duration: Duration,
     pub last_batch_duration: Duration,
 }
@@ -39,7 +39,6 @@ impl Default for Status {
             pending_count: None,
             quarantined: Vec::new(),
             oldest_pending_at: None,
-            oldest_pending_at_unavailable_reason: "durable first-pending timestamps are not installed",
             processing_duration: Duration::ZERO,
             last_batch_duration: Duration::ZERO,
         }
@@ -194,10 +193,11 @@ impl Worker {
         };
         status.published = self.store.published().await?;
         let pending = self.source.pending().await?;
-        status.pending_count = Some(pending);
+        status.pending_count = Some(pending.count);
+        status.oldest_pending_at = pending.oldest_at;
         status.availability = if !self.store.baseline_complete().await? {
             Availability::Incomplete
-        } else if published && pending == 0 {
+        } else if published && pending.count == 0 {
             Availability::Published
         } else {
             Availability::Backlog

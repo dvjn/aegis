@@ -262,7 +262,7 @@ mod tests {
         assert!(batch.requests[0].revision > boundary.revision);
         assert_eq!(batch.requests[0].request_id, "internal");
         let receipt = store.apply_batch(&batch).await.unwrap();
-        assert_eq!(source.pending().await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 1);
         // Simulate process loss after the destination commit, before acknowledgement.
         let path = fixture
             .database
@@ -289,15 +289,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.acknowledge(&receipt).await.unwrap(), 0);
-        assert_eq!(source.pending().await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 1);
         let fresh = source
             .batch(&boundary, &source::Limits::default())
             .await
             .unwrap();
         let receipt = store.apply_batch(&fresh).await.unwrap();
         assert_eq!(source.acknowledge(&receipt).await.unwrap(), 1);
-        assert_eq!(source.pending().await.unwrap(), 0);
+        assert_eq!(source.pending().await.unwrap().count, 0);
     }
+    #[tokio::test]
+    async fn the_reported_oldest_pending_time_spans_the_request_and_key_queues() {
+        let (fixture, source, _store) = fixture().await;
+        let db = &fixture.database;
+        request(db).await;
+        let after_request = source.pending().await.unwrap();
+        assert_eq!(after_request.count, 1);
+        let queued_request = after_request.oldest_at.unwrap();
+        db.execute_unprepared("INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('u','u@example.com','u@example.com','user','active',0,'2026-01-01','2026-01-01'); INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at) VALUES('k','u','agent','[]','2026-01-01T00:00:00.000Z');").await.unwrap();
+        let both = source.pending().await.unwrap();
+        assert_eq!(both.count, 2);
+        assert_eq!(
+            both.oldest_at.as_ref(),
+            Some(&queued_request),
+            "the request queued first must still set the reported backlog age"
+        );
+        db.execute_unprepared("DELETE FROM gateway_analytics_pending_requests")
+            .await
+            .unwrap();
+        let key_only = source.pending().await.unwrap();
+        assert_eq!(key_only.count, 1);
+        assert!(
+            key_only.oldest_at.is_some_and(|at| at >= queued_request),
+            "the key queue alone must still report an age"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebuilding_generation_keeps_its_queue_when_the_active_one_acknowledges() {
+        let (fixture, source, store) = fixture().await;
+        source.register_generation("rebuild").await.unwrap();
+        request(&fixture.database).await;
+        let boundary = source.observe().await.unwrap();
+        let batch = source
+            .batch(&boundary, &source::Limits::default())
+            .await
+            .unwrap();
+        let receipt = store.apply_batch(&batch).await.unwrap();
+        assert_eq!(source.acknowledge(&receipt).await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 0);
+        assert_eq!(
+            count(&fixture.database, "gateway_analytics_pending_requests").await,
+            1,
+            "the rebuilding generation still owes the request it never projected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_registered_after_capture_starts_owing_the_recorded_facts() {
+        let (fixture, source, _store) = fixture().await;
+        request(&fixture.database).await;
+        source.register_generation("rebuild").await.unwrap();
+        assert_eq!(
+            count(&fixture.database, "gateway_analytics_pending_requests").await,
+            2
+        );
+        source.register_generation("rebuild").await.unwrap();
+        assert_eq!(
+            count(&fixture.database, "gateway_analytics_pending_requests").await,
+            2,
+            "re-registering must not resurrect acknowledged work"
+        );
+    }
+
     #[tokio::test]
     async fn failed_destination_never_produces_receipt_or_ack() {
         let (fixture, source, store) = fixture().await;
@@ -314,7 +378,7 @@ mod tests {
             });
         }
         assert!(store.apply_batch(&batch).await.is_err());
-        assert_eq!(source.pending().await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 1);
         assert_eq!(count(&store.database, "requests").await, 0);
         assert_eq!(count(&store.database, "applied_requests").await, 0);
     }
@@ -394,7 +458,7 @@ mod tests {
                 .to_string()
                 .contains("ownership era changed")
         );
-        assert_eq!(source.pending().await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 1);
         let current = source
             .batch(&boundary, &source::Limits::default())
             .await
@@ -402,7 +466,7 @@ mod tests {
         let receipt = store.apply_batch(&current).await.unwrap();
         assert_eq!(receipt.epoch(), previous + 1);
         assert_eq!(source.acknowledge(&receipt).await.unwrap(), 1);
-        assert_eq!(source.pending().await.unwrap(), 0);
+        assert_eq!(source.pending().await.unwrap().count, 0);
     }
     #[tokio::test]
     async fn publication_refuses_a_superseded_ownership_era() {
@@ -592,7 +656,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(source.pending().await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 1);
         assert!(!source.publish(&store, &boundary).await.unwrap());
     }
     #[tokio::test]
@@ -701,7 +765,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count(&store.database, "requests").await, 0);
-        assert_eq!(source.pending().await.unwrap(), 0);
+        assert_eq!(source.pending().await.unwrap().count, 0);
     }
     #[tokio::test]
     async fn stale_key_replay_cannot_roll_back_newer_metadata() {
@@ -803,9 +867,9 @@ mod tests {
             .execute_unprepared("UPDATE gateway_keys SET name='new label' WHERE id='key'")
             .await
             .unwrap();
-        assert_eq!(source.pending().await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap().count, 1);
         drain(&source, &store).await;
-        assert_eq!(source.pending().await.unwrap(), 0);
+        assert_eq!(source.pending().await.unwrap().count, 0);
         let snapshot = reports::Snapshot::begin(&reader, true).await.unwrap();
         assert_eq!(
             snapshot.by_key(owner, window).await.unwrap()[0]
@@ -979,12 +1043,6 @@ mod tests {
         assert_eq!(status.borrow().pending_count, Some(0));
         assert!(status.borrow().oldest_pending_at.is_none());
         assert!(
-            !status
-                .borrow()
-                .oldest_pending_at_unavailable_reason
-                .is_empty()
-        );
-        assert!(
             tokio::time::timeout(Duration::from_millis(30), status.changed())
                 .await
                 .is_err()
@@ -1043,7 +1101,7 @@ mod tests {
             .acknowledge(&store.apply_batch(&initial).await.unwrap())
             .await
             .unwrap();
-        fixture.database.execute_unprepared(&format!("INSERT INTO gateway_analytics_tools VALUES(10,'[\"old\",null]','old',NULL),(20,'[\"new\",null]','new',NULL); INSERT INTO gateway_analytics_tool_identities VALUES(10,'[\"request\",\"internal\"]','p','call_id','shared',0,'resolved',20); INSERT INTO gateway_analytics_tool_variants VALUES(10,10,'tool_use',7,20); INSERT INTO gateway_analytics_tool_appearances SELECT id,10,1 FROM gateway_analytics_requests WHERE request_id='internal'; UPDATE gateway_analytics_clock SET revision=10; UPDATE gateway_analytics_revisions SET revision=10,first_pending_revision={} WHERE request_id='internal'; UPDATE gateway_analytics_revisions SET revision=10,first_pending_revision=10 WHERE request_id='dependent';", boundary.revision)).await.unwrap();
+        fixture.database.execute_unprepared(&format!("INSERT INTO gateway_analytics_tools VALUES(10,'[\"old\",null]','old',NULL),(20,'[\"new\",null]','new',NULL); INSERT INTO gateway_analytics_tool_identities VALUES(10,'[\"request\",\"internal\"]','p','call_id','shared',0,'resolved',20); INSERT INTO gateway_analytics_tool_variants VALUES(10,10,'tool_use',7,20); INSERT INTO gateway_analytics_tool_appearances SELECT id,10,1 FROM gateway_analytics_requests WHERE request_id='internal'; UPDATE gateway_analytics_clock SET revision=10; UPDATE gateway_analytics_revisions SET revision=10 WHERE request_id IN('internal','dependent'); INSERT INTO gateway_analytics_pending_requests VALUES('{gen}','internal',{},'2026-01-01T00:00:00.000Z'),('{gen}','dependent',10,'2026-01-01T00:00:00.000Z') ON CONFLICT(generation,request_id) DO UPDATE SET first_pending_revision=excluded.first_pending_revision;", boundary.revision, gen = store.generation())).await.unwrap();
         store
             .database
             .execute_unprepared("UPDATE generation SET baseline_complete=1")

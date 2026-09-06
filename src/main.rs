@@ -273,7 +273,6 @@ async fn start_analytics(
                 pending_count = ?current.pending_count,
                 quarantined_count = current.quarantined.len(),
                 oldest_pending_at = ?current.oldest_pending_at,
-                oldest_pending_reason = current.oldest_pending_at_unavailable_reason,
                 processing_ms = current.processing_duration.as_millis() as u64,
                 batch_ms = current.last_batch_duration.as_millis() as u64,
                 "analytics projection status");

@@ -97,6 +97,11 @@ mod tests {
     async fn database() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO gateway_analytics_generations VALUES ('g', 0, '2026-01-01T00:00:00.000Z')",
+        )
+        .await
+        .unwrap();
         db
     }
 
@@ -111,13 +116,40 @@ mod tests {
     async fn revision(db: &DatabaseConnection) -> (i64, Option<i64>, bool) {
         let row = db.query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT revision, first_pending_revision, deleted FROM gateway_analytics_revisions WHERE request_id = 'r'",
+            "SELECT r.revision, p.first_pending_revision, r.deleted FROM gateway_analytics_revisions r
+             LEFT JOIN gateway_analytics_pending_requests p
+                 ON p.request_id = r.request_id AND p.generation = 'g'
+             WHERE r.request_id = 'r'",
         )).await.unwrap().unwrap();
         (
             row.try_get("", "revision").unwrap(),
             row.try_get("", "first_pending_revision").unwrap(),
             row.try_get("", "deleted").unwrap(),
         )
+    }
+
+    async fn first_pending_at(db: &DatabaseConnection) -> Option<String> {
+        db.query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT first_pending_at FROM gateway_analytics_pending_requests
+             WHERE generation = 'g' AND request_id = 'r'",
+        ))
+        .await
+        .unwrap()
+        .map(|row| row.try_get("", "first_pending_at").unwrap())
+    }
+
+    async fn acknowledge(db: &DatabaseConnection, revision: i64) -> u64 {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM gateway_analytics_pending_requests WHERE generation = 'g' AND request_id = 'r'
+             AND EXISTS (SELECT 1 FROM gateway_analytics_revisions r
+                         WHERE r.request_id = 'r' AND r.revision = ?)",
+            [revision.into()],
+        ))
+        .await
+        .unwrap()
+        .rows_affected()
     }
 
     #[tokio::test]
@@ -133,24 +165,97 @@ mod tests {
         let (second, pending, _) = revision(&db).await;
         assert!(second > first);
         assert_eq!(pending, Some(first));
-        let result = db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE gateway_analytics_revisions SET first_pending_revision = NULL WHERE request_id = 'r' AND revision = ?",
-            [first.into()],
-        )).await.unwrap();
-        assert_eq!(result.rows_affected(), 0);
+        assert_eq!(acknowledge(&db, first).await, 0);
         assert_eq!(revision(&db).await.1, Some(first));
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE gateway_analytics_revisions SET first_pending_revision = NULL WHERE request_id = 'r' AND revision = ?",
-            [second.into()],
-        )).await.unwrap();
+        assert_eq!(acknowledge(&db, second).await, 1);
         db.execute_unprepared("UPDATE gateway_requests SET http_status = 201 WHERE id = 'r'")
             .await
             .unwrap();
         let (third, pending, _) = revision(&db).await;
         assert!(third > second);
         assert_eq!(pending, Some(third));
+    }
+
+    #[tokio::test]
+    async fn a_coalesced_re_dirty_never_advances_the_first_pending_time() {
+        let db = database().await;
+        request(&db).await;
+        let entered = first_pending_at(&db).await.unwrap();
+        let first = revision(&db).await.0;
+        for status in [200, 201, 202] {
+            db.execute_unprepared(&format!(
+                "UPDATE gateway_requests SET http_status = {status} WHERE id = 'r'"
+            ))
+            .await
+            .unwrap();
+        }
+        let (latest, pending, _) = revision(&db).await;
+        assert!(latest > first);
+        assert_eq!(pending, Some(first));
+        assert_eq!(
+            first_pending_at(&db).await,
+            Some(entered),
+            "backlog age must count from the instant the work was queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_clears_the_first_pending_time_with_the_pending_revision() {
+        let db = database().await;
+        request(&db).await;
+        assert!(first_pending_at(&db).await.is_some());
+        assert_eq!(acknowledge(&db, revision(&db).await.0).await, 1);
+        assert_eq!(revision(&db).await.1, None);
+        assert_eq!(first_pending_at(&db).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_generation_accumulates_no_pending_work() {
+        let db = database().await;
+        request(&db).await;
+        db.execute_unprepared("UPDATE gateway_requests SET http_status = 200 WHERE id = 'r'")
+            .await
+            .unwrap();
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) n FROM gateway_analytics_pending_requests
+                 WHERE generation = 'never-registered'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        assert!(revision(&db).await.1.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_second_generation_keeps_its_backlog_when_the_first_acknowledges() {
+        let db = database().await;
+        db.execute_unprepared(
+            "INSERT INTO gateway_analytics_generations
+             VALUES ('rebuild', 0, '2026-01-01T00:00:00.000Z')",
+        )
+        .await
+        .unwrap();
+        request(&db).await;
+        let current = revision(&db).await.0;
+        assert_eq!(acknowledge(&db, current).await, 1);
+        assert_eq!(revision(&db).await.1, None);
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT first_pending_revision FROM gateway_analytics_pending_requests
+                 WHERE generation = 'rebuild' AND request_id = 'r'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "first_pending_revision").unwrap(),
+            current,
+            "the active generation's acknowledgement must not drain a rebuild"
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ mod m20260906_000019_analytics_tool_facts;
 mod m20260906_000020_analytics_source_identity;
 mod m20260906_000021_analytics_ownership_epoch;
 mod m20260906_000022_analytics_key_revisions;
+mod m20260906_000023_analytics_generation_queues;
 
 pub struct Migrator;
 
@@ -49,6 +50,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260906_000020_analytics_source_identity::Migration),
             Box::new(m20260906_000021_analytics_ownership_epoch::Migration),
             Box::new(m20260906_000022_analytics_key_revisions::Migration),
+            Box::new(m20260906_000023_analytics_generation_queues::Migration),
         ]
     }
 }

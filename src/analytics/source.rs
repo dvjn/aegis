@@ -7,7 +7,10 @@ use sea_orm::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicI64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -42,11 +45,22 @@ impl Limits {
     }
 }
 
+/// One consistent read of a generation's queues. A count without its oldest
+/// entry, or the reverse, could disagree across two reads of a live queue.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub count: i64,
+    pub oldest_at: Option<String>,
+}
+
 pub struct Source {
     database: DatabaseConnection,
     activation_path: PathBuf,
     /// Zero until this process activates; no clock epoch is ever zero once owned.
     epoch: AtomicI64,
+    /// Activation binds this handle to one generation for its lifetime, so queue
+    /// reads scope themselves without carrying the name through every call.
+    generation: OnceLock<String>,
     pub source_id: String,
 }
 impl Source {
@@ -77,11 +91,36 @@ impl Source {
             database,
             activation_path: lock_path(&source_path, ".analytics-activation.lock"),
             epoch: AtomicI64::new(0),
+            generation: OnceLock::new(),
             source_id,
         })
     }
     pub fn epoch(&self) -> i64 {
         self.epoch.load(Ordering::SeqCst)
+    }
+    fn generation(&self) -> Result<&str> {
+        Ok(self
+            .generation
+            .get()
+            .context("analytics generation is not activated")?)
+    }
+    /// Registration is what makes a generation accumulate work: a source
+    /// revision fans out only to registered generations, and an unregistered one
+    /// stays empty however long it waits. A newly registered generation owes
+    /// every recorded fact; re-registering an existing one changes nothing, so
+    /// reclaiming ownership cannot resurrect acknowledged work.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "activation registers its own generation; a second one is registered by the rebuild path, which does not exist yet"
+        )
+    )]
+    pub async fn register_generation(&self, generation: &str) -> Result<()> {
+        let tx = crate::db::begin_immediate(&self.database).await?;
+        register(&tx, generation).await?;
+        tx.commit().await?;
+        Ok(())
     }
     pub async fn observe(&self) -> Result<Boundary> {
         let tx = self.database.begin().await?;
@@ -115,8 +154,10 @@ impl Source {
             "another analytics generation is active"
         );
         let epoch = row.try_get::<i64>("", "epoch")?;
+        register(&tx, generation).await?;
         tx.commit().await?;
         self.epoch.store(epoch, Ordering::SeqCst);
+        let _ = self.generation.set(generation.to_owned());
         Ok(epoch)
     }
     pub async fn acknowledge(&self, receipt: &CommittedReceipt) -> Result<u64> {
@@ -144,12 +185,16 @@ impl Source {
             clock.try_get::<i64>("", "epoch")? == receipt.epoch(),
             "analytics ownership era changed; stopping projection attempt"
         );
+        // Draining only this generation's entries leaves a rebuilding generation
+        // owing the same work. The revision still has to match the current fact,
+        // so a mutation racing the batch is not acknowledged away.
+        let generation = receipt.generation();
         let mut n = 0;
         for (request, revision) in receipt.revisions() {
             n += tx
                 .execute_raw(sql(
-                    "UPDATE gateway_analytics_revisions SET first_pending_revision=NULL WHERE request_id=? AND revision=?",
-                    vec![request.clone().into(), (*revision).into()],
+                    "DELETE FROM gateway_analytics_pending_requests WHERE generation=? AND request_id=? AND EXISTS(SELECT 1 FROM gateway_analytics_revisions r WHERE r.request_id=gateway_analytics_pending_requests.request_id AND r.revision=?)",
+                    vec![generation.into(), request.clone().into(), (*revision).into()],
                 ))
                 .await?
                 .rows_affected();
@@ -157,8 +202,8 @@ impl Source {
         for (key, revision) in receipt.key_revisions() {
             n += tx
                 .execute_raw(sql(
-                    "UPDATE gateway_analytics_key_revisions SET first_pending_revision=NULL WHERE key_id=? AND revision=?",
-                    vec![key.clone().into(), (*revision).into()],
+                    "DELETE FROM gateway_analytics_pending_keys WHERE generation=? AND key_id=? AND EXISTS(SELECT 1 FROM gateway_analytics_key_revisions r WHERE r.key_id=gateway_analytics_pending_keys.key_id AND r.revision=?)",
+                    vec![generation.into(), key.clone().into(), (*revision).into()],
                 ))
                 .await?
                 .rows_affected();
@@ -166,8 +211,13 @@ impl Source {
         tx.commit().await?;
         Ok(n)
     }
-    pub async fn pending(&self) -> Result<i64> {
-        Ok(self.database.query_one_raw(sql("SELECT (SELECT COUNT(*) FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL)+(SELECT COUNT(*) FROM gateway_analytics_key_revisions WHERE first_pending_revision IS NOT NULL) n",vec![])).await?.context("missing count")?.try_get("","n")?)
+    pub async fn pending(&self) -> Result<Pending> {
+        let generation = self.generation()?;
+        let row=self.database.query_one_raw(sql("SELECT COUNT(*) n,MIN(first_pending_at) oldest FROM (SELECT first_pending_at FROM gateway_analytics_pending_requests WHERE generation=? UNION ALL SELECT first_pending_at FROM gateway_analytics_pending_keys WHERE generation=?)",vec![generation.into(),generation.into()])).await?.context("missing count")?;
+        Ok(Pending {
+            count: row.try_get("", "n")?,
+            oldest_at: row.try_get("", "oldest")?,
+        })
     }
     /// Activation ownership excludes generation switching. Once no work through
     /// B remains, ordinary source mutations receive revisions above B, so the
@@ -192,7 +242,8 @@ impl Source {
             boundary.revision <= row.try_get::<i64>("", "revision")?,
             "future publication boundary"
         );
-        let pending=tx.query_one_raw(sql("SELECT 1 n FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL AND first_pending_revision<=? UNION ALL SELECT 1 FROM gateway_analytics_key_revisions WHERE first_pending_revision IS NOT NULL AND first_pending_revision<=? LIMIT 1",vec![boundary.revision.into(),boundary.revision.into()])).await?.is_some();
+        let generation = store.generation();
+        let pending=tx.query_one_raw(sql("SELECT 1 n FROM gateway_analytics_pending_requests WHERE generation=? AND first_pending_revision<=? UNION ALL SELECT 1 FROM gateway_analytics_pending_keys WHERE generation=? AND first_pending_revision<=? LIMIT 1",vec![generation.into(),boundary.revision.into(),generation.into(),boundary.revision.into()])).await?.is_some();
         tx.commit().await?;
         let complete = !pending && store.baseline_complete().await?;
         if complete {
@@ -227,8 +278,9 @@ impl Source {
             boundary.revision <= snapshot_revision,
             "boundary exceeds source snapshot"
         );
+        let generation = self.generation()?;
         // Deliberately no current-revision <= boundary predicate.
-        let rows=tx.query_all_raw(sql("SELECT request_id,revision,changed_at,deleted FROM gateway_analytics_revisions WHERE first_pending_revision IS NOT NULL AND first_pending_revision<=? ORDER BY first_pending_revision,request_id LIMIT ?",vec![boundary.revision.into(),(limits.request_count as i64).into()])).await?;
+        let rows=tx.query_all_raw(sql("SELECT r.request_id,r.revision,r.changed_at,r.deleted FROM gateway_analytics_pending_requests p JOIN gateway_analytics_revisions r ON r.request_id=p.request_id WHERE p.generation=? AND p.first_pending_revision<=? ORDER BY p.first_pending_revision,p.request_id LIMIT ?",vec![generation.into(),boundary.revision.into(),(limits.request_count as i64).into()])).await?;
         let mut batch = SourceBatch {
             source_id: self.source_id.clone(),
             source_fact_version: SOURCE_VERSION,
@@ -245,7 +297,7 @@ impl Source {
         };
         // A key deleted while its correction was pending has nothing left to
         // relabel, so the queue entry is drained without touching the dimension.
-        for row in tx.query_all_raw(sql("SELECT r.key_id,r.revision,k.name,k.user_id FROM gateway_analytics_key_revisions r LEFT JOIN gateway_keys k ON k.id=r.key_id WHERE r.first_pending_revision IS NOT NULL AND r.first_pending_revision<=? ORDER BY r.first_pending_revision,r.key_id LIMIT ?",vec![boundary.revision.into(),(limits.request_count as i64).into()])).await? {
+        for row in tx.query_all_raw(sql("SELECT r.key_id,r.revision,k.name,k.user_id FROM gateway_analytics_pending_keys p JOIN gateway_analytics_key_revisions r ON r.key_id=p.key_id LEFT JOIN gateway_keys k ON k.id=p.key_id WHERE p.generation=? AND p.first_pending_revision<=? ORDER BY p.first_pending_revision,p.key_id LIMIT ?",vec![generation.into(),boundary.revision.into(),(limits.request_count as i64).into()])).await? {
             let id: String = row.try_get("", "key_id")?;
             let revision: i64 = row.try_get("", "revision")?;
             if let Some(name) = row.try_get::<Option<String>>("", "name")? {
@@ -341,6 +393,19 @@ impl Source {
         tx.commit().await?;
         Ok(batch)
     }
+}
+
+/// Seeding runs only for a generation registered for the first time, so it never
+/// competes with the fan-out that keeps an established queue current.
+async fn register(tx: &DatabaseTransaction, generation: &str) -> Result<()> {
+    ensure!(!generation.is_empty(), "empty analytics generation");
+    let registered=tx.execute_raw(sql("INSERT INTO gateway_analytics_generations(generation,registered_revision,registered_at) SELECT ?,revision,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM gateway_analytics_clock WHERE id=1 ON CONFLICT(generation) DO NOTHING",vec![generation.into()])).await?.rows_affected();
+    if registered == 0 {
+        return Ok(());
+    }
+    tx.execute_raw(sql("INSERT INTO gateway_analytics_pending_requests(generation,request_id,first_pending_revision,first_pending_at) SELECT ?,request_id,revision,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM gateway_analytics_revisions",vec![generation.into()])).await?;
+    tx.execute_raw(sql("INSERT INTO gateway_analytics_pending_keys(generation,key_id,first_pending_revision,first_pending_at) SELECT ?,key_id,revision,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM gateway_analytics_key_revisions",vec![generation.into()])).await?;
+    Ok(())
 }
 
 // SQL counts and UTF-8 byte lengths precede materializing any request-owned

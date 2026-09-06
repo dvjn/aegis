@@ -88,7 +88,8 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         db.execute_unprepared(
-            "INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at)
+            "INSERT INTO gateway_analytics_generations VALUES('g',0,'2026-01-01T00:00:00.000Z');
+             INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at)
              VALUES('u','u@example.com','u@example.com','user','active',0,'2026-01-01','2026-01-01');
              INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at)
              VALUES('k','u','old name','[]','2026-01-01T00:00:00.000Z');",
@@ -99,10 +100,17 @@ mod tests {
     }
 
     async fn key_revision(db: &DatabaseConnection) -> (i64, Option<i64>) {
-        let row = db.query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT revision, first_pending_revision FROM gateway_analytics_key_revisions WHERE key_id = 'k'",
-        )).await.unwrap().unwrap();
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT r.revision, p.first_pending_revision FROM gateway_analytics_key_revisions r
+             LEFT JOIN gateway_analytics_pending_keys p
+                 ON p.key_id = r.key_id AND p.generation = 'g'
+             WHERE r.key_id = 'k'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         (
             row.try_get("", "revision").unwrap(),
             row.try_get("", "first_pending_revision").unwrap(),
@@ -114,11 +122,9 @@ mod tests {
         let db = database().await;
         let (created, pending) = key_revision(&db).await;
         assert_eq!(pending, Some(created));
-        db.execute_unprepared(
-            "UPDATE gateway_analytics_key_revisions SET first_pending_revision = NULL",
-        )
-        .await
-        .unwrap();
+        db.execute_unprepared("DELETE FROM gateway_analytics_pending_keys")
+            .await
+            .unwrap();
         db.execute_unprepared("UPDATE gateway_keys SET name = 'new name' WHERE id = 'k'")
             .await
             .unwrap();
@@ -150,11 +156,9 @@ mod tests {
     async fn unrelated_key_columns_do_not_revise_the_key_dimension() {
         let db = database().await;
         let (created, _) = key_revision(&db).await;
-        db.execute_unprepared(
-            "UPDATE gateway_analytics_key_revisions SET first_pending_revision = NULL",
-        )
-        .await
-        .unwrap();
+        db.execute_unprepared("DELETE FROM gateway_analytics_pending_keys")
+            .await
+            .unwrap();
         db.execute_unprepared(
             "UPDATE gateway_keys SET revoked_at = '2026-01-02T00:00:00.000Z' WHERE id = 'k'",
         )

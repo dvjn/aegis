@@ -402,10 +402,14 @@ async fn invalidate(
         values.clone(),
     ))
     .await?;
-    db.execute_raw(sql(&format!("INSERT INTO gateway_analytics_revisions(request_id, revision, first_pending_revision, changed_at, deleted)
-SELECT r.request_id, c.revision, c.revision, strftime('%Y-%m-%dT%H:%M:%fZ','now'), NOT EXISTS(SELECT 1 FROM gateway_requests g WHERE g.id = r.request_id)
+    db.execute_raw(sql(&format!("INSERT INTO gateway_analytics_revisions(request_id, revision, changed_at, deleted)
+SELECT r.request_id, c.revision, strftime('%Y-%m-%dT%H:%M:%fZ','now'), NOT EXISTS(SELECT 1 FROM gateway_requests g WHERE g.id = r.request_id)
 FROM gateway_analytics_requests r CROSS JOIN gateway_analytics_clock c WHERE r.id IN ({affected}) AND c.id = 1
-ON CONFLICT(request_id) DO UPDATE SET revision = excluded.revision, first_pending_revision = COALESCE(gateway_analytics_revisions.first_pending_revision, excluded.revision), changed_at = excluded.changed_at, deleted = excluded.deleted"), values)).await?;
+ON CONFLICT(request_id) DO UPDATE SET revision = excluded.revision, changed_at = excluded.changed_at, deleted = excluded.deleted"), values.clone())).await?;
+    db.execute_raw(sql(&format!("INSERT INTO gateway_analytics_pending_requests(generation, request_id, first_pending_revision, first_pending_at)
+SELECT g.generation, r.request_id, c.revision, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+FROM gateway_analytics_requests r CROSS JOIN gateway_analytics_clock c CROSS JOIN gateway_analytics_generations g WHERE r.id IN ({affected}) AND c.id = 1
+ON CONFLICT(generation, request_id) DO NOTHING"), values)).await?;
     Ok(())
 }
 
@@ -421,6 +425,13 @@ mod tests {
     use serde_json::{Value as Json, json};
 
     async fn owners(db: &DatabaseConnection) {
+        // Revisions fan out to registered generations only, so a capture world
+        // that asserts queue state has to register one.
+        db.execute_unprepared(
+            "INSERT INTO gateway_analytics_generations VALUES('g',0,'2026-01-01T00:00:00.000Z')",
+        )
+        .await
+        .unwrap();
         for owner in ["a", "b"] {
             db.execute_unprepared(&format!("INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('{owner}','{owner}@example.com','{owner}@example.com','user','active',0,'2026-01-01','2026-01-01'); INSERT INTO gateway_keys(id,user_id,name,allowed_providers,created_at) VALUES('{owner}','{owner}','agent','[]','2026-01-01')")).await.unwrap();
         }
@@ -460,7 +471,7 @@ mod tests {
             .unwrap()
     }
     async fn revision(db: &impl ConnectionTrait, request: &str) -> (i64, Option<i64>) {
-        let row = db.query_one_raw(sql("SELECT revision, first_pending_revision FROM gateway_analytics_revisions WHERE request_id = ?", vec![request.into()])).await.unwrap().unwrap();
+        let row = db.query_one_raw(sql("SELECT r.revision, p.first_pending_revision FROM gateway_analytics_revisions r LEFT JOIN gateway_analytics_pending_requests p ON p.request_id = r.request_id AND p.generation = 'g' WHERE r.request_id = ?", vec![request.into()])).await.unwrap().unwrap();
         (
             row.try_get("", "revision").unwrap(),
             row.try_get("", "first_pending_revision").unwrap(),
@@ -693,7 +704,12 @@ mod tests {
             .await,
             2
         );
-        db.execute_raw(sql("UPDATE gateway_analytics_revisions SET first_pending_revision = NULL WHERE request_id = ?", vec![r.clone().into()])).await.unwrap();
+        db.execute_raw(sql(
+            "DELETE FROM gateway_analytics_pending_requests WHERE request_id = ?",
+            vec![r.clone().into()],
+        ))
+        .await
+        .unwrap();
         let before = revision(&db, &r).await;
         replace(&db, &conflicting, json!({})).await;
         let after = revision(&db, &r).await;
