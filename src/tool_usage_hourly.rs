@@ -24,7 +24,7 @@ use crate::usage_hourly::HOUR_FORMAT;
 /// their context: the request's cost spread over its measured bytes, or
 /// nothing when either is missing.
 const REQUESTS_SQL: &str = "request AS ( \
-     SELECT r.id, k.user_id, strftime('{hour}', r.started_at) hour, r.started_at, \
+     SELECT r.id, r.seq, k.user_id, strftime('{hour}', r.started_at) hour, r.started_at, \
      COALESCE(u.cost_nanodollars * 1.0 / m.total_bytes, 0) cost_per_byte \
      FROM gateway_requests r \
      JOIN gateway_keys k ON k.id = r.key_id \
@@ -45,9 +45,9 @@ const DEFINITIONS_SQL: &str = "INSERT INTO gateway_tool_usage_hourly \
      SELECT q.user_id, q.hour, q.cost_per_byte, f.block_type, f.tool_name, b.original_bytes bytes, \
      (SELECT COUNT(*) FROM gateway_payload_blob_facts x WHERE x.blob_id = f.blob_id) facts \
      FROM request q \
-     JOIN gateway_payload_part_refs p ON p.request_id = q.id AND p.direction = 'request' \
-     JOIN gateway_payload_blob_facts f ON f.blob_id = p.part_id AND f.block_type = 'tool_definition' \
-     JOIN gateway_payload_blobs b ON b.id = p.part_id) \
+     JOIN gateway_payload_parts p ON p.request_seq = q.seq \
+     JOIN gateway_payload_blobs b ON b.seq = p.blob_seq \
+     JOIN gateway_payload_blob_facts f ON f.blob_id = b.id AND f.block_type = 'tool_definition') \
      SELECT user_id, hour, block_type, COALESCE(tool_name, ''), '', \
      COUNT(*), \
      SUM(bytes * 1.0 / facts), \
@@ -69,9 +69,9 @@ const CALLS_SQL: &str = "{requests}, \
      COALESCE(f.tool_use_id, f.blob_id) call_id, \
      b.original_bytes bytes \
      FROM request q \
-     JOIN gateway_payload_part_refs p ON p.request_id = q.id AND p.direction = 'request' \
-     JOIN gateway_payload_blob_facts f ON f.blob_id = p.part_id AND f.block_type IN ('tool_use', 'tool_result') \
-     JOIN gateway_payload_blobs b ON b.id = p.part_id), \
+     JOIN gateway_payload_parts p ON p.request_seq = q.seq \
+     JOIN gateway_payload_blobs b ON b.seq = p.blob_seq \
+     JOIN gateway_payload_blob_facts f ON f.blob_id = b.id AND f.block_type IN ('tool_use', 'tool_result')), \
      call AS ( \
      SELECT user_id, hour, block_type, call_id, MIN(label) label, MIN(skill) skill, \
      MAX(bytes) bytes, SUM(bytes * cost_per_byte) cost, \
@@ -347,10 +347,13 @@ mod tests {
     ) {
         db.execute_unprepared(&format!(
             "INSERT OR IGNORE INTO gateway_payload_blobs(id,body,encoding,original_bytes,created_at) \
-             VALUES('{blob_id}',x'00','identity',{bytes},'2026-03-01T00:00:00Z'); \
-             INSERT INTO gateway_payload_part_refs(request_id,direction,path,position,kind,part_id) \
-             VALUES('{request_id}','request','tools',{position},'tools','{blob_id}')"
+             VALUES('{blob_id}',x'00','identity',{bytes},'2026-03-01T00:00:00Z')"
         ))
+        .await
+        .unwrap();
+        crate::payload_parts::insert_by_id(
+            db, request_id, "tools", None, "tools", position, blob_id,
+        )
         .await
         .unwrap();
         let quoted =
@@ -367,6 +370,26 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    /// Apply the bucket migrations to a database that already holds requests.
+    /// Both are idempotent, so re-applying them to a migrated database shows
+    /// what they would do to traffic that was captured before they landed.
+    async fn apply_bucket_migrations(db: &DatabaseConnection) {
+        use crate::migration::{
+            m20260906_000018_gateway_usage_hourly, m20260906_000021_tool_usage_hourly,
+        };
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let manager = SchemaManager::new(db);
+        m20260906_000018_gateway_usage_hourly::Migration
+            .up(&manager)
+            .await
+            .unwrap();
+        m20260906_000021_tool_usage_hourly::Migration
+            .up(&manager)
+            .await
+            .unwrap();
     }
 
     async fn rows(db: &DatabaseConnection) -> Vec<Row> {
@@ -476,7 +499,6 @@ mod tests {
     #[tokio::test]
     async fn bucket_migrations_do_not_scan_or_stamp_existing_requests() {
         let db = database().await;
-        Migrator::down(&db, Some(2)).await.unwrap();
         request(&db, "a", "10:15", 100).await;
         part(
             &db,
@@ -487,7 +509,7 @@ mod tests {
             &[("tool_definition", Some("Bash"), None, None)],
         )
         .await;
-        Migrator::up(&db, None).await.unwrap();
+        apply_bucket_migrations(&db).await;
         assert!(rows(&db).await.is_empty());
         let row = db
             .query_one_raw(Statement::from_string(

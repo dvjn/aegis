@@ -3,6 +3,7 @@ mod payload_facts_backfill;
 mod payload_resplit;
 mod request_metrics_rollup;
 mod requested_model_backfill;
+mod vacuum;
 
 use crate::telemetry::timestamp;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
@@ -54,6 +55,9 @@ async fn prepare(database: &DatabaseConnection) -> bool {
     )
     .await
     {
+        return false;
+    }
+    if !run(database, vacuum::NAME, vacuum::run).await {
         return false;
     }
     true

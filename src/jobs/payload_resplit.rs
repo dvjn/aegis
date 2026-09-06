@@ -1,6 +1,7 @@
 use crate::{
     compression::decode_body,
     db::begin_immediate,
+    payload_parts,
     telemetry::{SemanticPayload, StoredPart, reassemble_request, split_request, store_blob},
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
@@ -43,16 +44,17 @@ async fn unsplit_requests(
             "SELECT g.id, g.protocol
              FROM gateway_requests g
              WHERE g.id > ?
-               AND (EXISTS (SELECT 1 FROM gateway_payload_part_refs c
-                            WHERE c.request_id = g.id AND c.direction = 'request'
-                              AND c.path = '$bytes')
+               AND (EXISTS (SELECT 1 FROM gateway_payload_parts c
+                            JOIN gateway_payload_part_kinds ck ON ck.seq = c.kind_seq
+                            WHERE c.request_seq = g.seq AND ck.path = '$bytes')
                     OR (g.protocol = 'anthropic_messages'
-                        AND EXISTS (SELECT 1 FROM gateway_payload_part_refs m
-                                    WHERE m.request_id = g.id AND m.direction = 'request'
-                                      AND m.path = 'messages')
-                        AND NOT EXISTS (SELECT 1 FROM gateway_payload_part_refs b
-                                        WHERE b.request_id = g.id AND b.direction = 'request'
-                                          AND b.path LIKE 'messages/%/content')))
+                        AND EXISTS (SELECT 1 FROM gateway_payload_parts m
+                                    JOIN gateway_payload_part_kinds mk ON mk.seq = m.kind_seq
+                                    WHERE m.request_seq = g.seq AND mk.path = 'messages')
+                        AND NOT EXISTS (SELECT 1 FROM gateway_payload_parts b
+                                        JOIN gateway_payload_part_kinds bk ON bk.seq = b.kind_seq
+                                        WHERE b.request_seq = g.seq
+                                          AND bk.path LIKE 'messages/%/content')))
              ORDER BY g.id
              LIMIT ?",
             [after.to_owned().into(), SCAN_BATCH.into()],
@@ -77,8 +79,11 @@ async fn source_state(
     let rows = database
         .query_all_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT path, position, part_id AS blob_id, role, kind FROM gateway_payload_part_refs
-         WHERE request_id = ? AND direction = 'request'
+            "SELECT k.path, p.position, b.id AS blob_id, NULLIF(k.role, '') role, k.kind
+         FROM gateway_payload_parts p
+         JOIN gateway_payload_part_kinds k ON k.seq = p.kind_seq
+         JOIN gateway_payload_blobs b ON b.seq = p.blob_seq
+         WHERE p.request_seq = (SELECT seq FROM gateway_requests WHERE id = ?)
          UNION ALL SELECT '$envelope', -1, body_id, NULL, '' FROM gateway_payload_envelopes
          WHERE request_id = ? AND direction = 'request'
          UNION ALL SELECT '$request', -1, protocol, NULL, '' FROM gateway_requests WHERE id = ?
@@ -153,14 +158,18 @@ async fn replace_if_unchanged(
         transaction.rollback().await?;
         return Ok(false);
     }
+    let Some(request_seq) = payload_parts::request_seq(&transaction, &request.id).await? else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
     transaction
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "DELETE FROM gateway_payload_part_refs WHERE request_id = ? AND direction = 'request'",
-            [request.id.clone().into()],
+            "DELETE FROM gateway_payload_parts WHERE request_seq = ?",
+            [request_seq.into()],
         ))
         .await?;
-    store_semantic(&transaction, &request.id, payload).await?;
+    store_semantic(&transaction, &request.id, request_seq, payload).await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -186,11 +195,12 @@ async fn stored_parts(
     let rows = database
         .query_all_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT r.path, r.position, b.body
-             FROM gateway_payload_part_refs r
-             JOIN gateway_payload_blobs b ON b.id = r.part_id
-             WHERE r.request_id = ? AND r.direction = 'request'
-             ORDER BY r.path, r.position",
+            "SELECT k.path, p.position, b.body
+             FROM gateway_payload_parts p
+             JOIN gateway_payload_part_kinds k ON k.seq = p.kind_seq
+             JOIN gateway_payload_blobs b ON b.seq = p.blob_seq
+             WHERE p.request_seq = (SELECT seq FROM gateway_requests WHERE id = ?)
+             ORDER BY k.path, p.position",
             [request_id.to_owned().into()],
         ))
         .await?;
@@ -235,6 +245,7 @@ fn concatenated(mut parts: Vec<StoredPart>) -> Vec<u8> {
 async fn store_semantic(
     database: &impl ConnectionTrait,
     request_id: &str,
+    request_seq: i64,
     payload: SemanticPayload,
 ) -> Result<(), DbErr> {
     store_blob(database, &payload.envelope).await?;
@@ -246,21 +257,10 @@ async fn store_semantic(
         ))
         .await?;
     for part in payload.parts {
-        store_blob(database, &part.payload).await?;
-        database
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, role, kind, part_id) VALUES (?, 'request', ?, ?, ?, ?, ?)",
-                [
-                    request_id.to_owned().into(),
-                    part.path.into(),
-                    part.position.into(),
-                    part.role.into(),
-                    part.kind.into(),
-                    part.payload.id.into(),
-                ],
-            ))
-            .await?;
+        let blob = store_blob(database, &part.payload).await?;
+        let kind =
+            payload_parts::kind_seq(database, &part.path, part.role.as_deref(), &part.kind).await?;
+        payload_parts::insert(database, request_seq, kind, part.position, blob).await?;
     }
     Ok(())
 }
@@ -270,7 +270,7 @@ mod tests {
     use super::*;
     use crate::{
         migration::Migrator,
-        telemetry::{StoredPayload, timestamp},
+        telemetry::{CHUNK_KIND, CHUNK_PATH, StoredPayload, timestamp},
     };
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
@@ -279,7 +279,7 @@ mod tests {
     const BODY: &[u8] = br#"{"model":"claude-x","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"tool_result","tool_use_id":"c1","content":"out"}]},{"role":"assistant","content":"ok"}]}"#;
     const REQUEST_ID: &str = "01930000-0000-7000-8000-000000000001";
 
-    async fn blob(database: &DatabaseConnection, body: &str) -> String {
+    async fn blob(database: &DatabaseConnection, body: &str) -> (String, i64) {
         let id: String = Sha256::digest(body.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -297,7 +297,25 @@ mod tests {
             ))
             .await
             .unwrap();
-        id
+        let seq: i64 = database
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT seq FROM gateway_payload_blobs WHERE id = ?",
+                [id.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "seq")
+            .unwrap();
+        (id, seq)
+    }
+
+    async fn request_seq(database: &DatabaseConnection) -> i64 {
+        payload_parts::request_seq(database, REQUEST_ID)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     async fn request_row(database: &DatabaseConnection, protocol: &str, endpoint: &str) {
@@ -317,7 +335,7 @@ mod tests {
             "/providers/claude/v1/messages",
         )
         .await;
-        let envelope = blob(database, r#"{"model":"claude-x","messages":[]}"#).await;
+        let (envelope, _) = blob(database, r#"{"model":"claude-x","messages":[]}"#).await;
         database
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
@@ -330,14 +348,13 @@ mod tests {
             r#"{"role":"user","content":[{"type":"text","text":"hi"},{"type":"tool_result","tool_use_id":"c1","content":"out"}]}"#,
             r#"{"role":"assistant","content":"ok"}"#,
         ];
+        let request = request_seq(database).await;
+        let kind = payload_parts::kind_seq(database, "messages", Some("user"), "messages")
+            .await
+            .unwrap();
         for (position, message) in messages.into_iter().enumerate() {
-            let part = blob(database, message).await;
-            database
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, role, kind, part_id) VALUES (?, 'request', 'messages', ?, 'user', 'messages', ?)",
-                    [REQUEST_ID.into(), (position as i64).into(), part.into()],
-                ))
+            let (_, part) = blob(database, message).await;
+            payload_parts::insert(database, request, kind, position as i64, part)
                 .await
                 .unwrap();
         }
@@ -347,10 +364,11 @@ mod tests {
         database
             .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT r.path, r.position, r.kind, CAST(b.body AS TEXT) body
-                 FROM gateway_payload_part_refs r
-                 JOIN gateway_payload_blobs b ON b.id = r.part_id
-                 ORDER BY r.path, r.position",
+                "SELECT k.path, p.position, k.kind, CAST(b.body AS TEXT) body
+                 FROM gateway_payload_parts p
+                 JOIN gateway_payload_part_kinds k ON k.seq = p.kind_seq
+                 JOIN gateway_payload_blobs b ON b.seq = p.blob_seq
+                 ORDER BY k.path, p.position",
             ))
             .await
             .unwrap()
@@ -440,9 +458,14 @@ mod tests {
         let state = source_state(db, &request).await.unwrap();
         let body = original_body(db, &request).await.unwrap().unwrap();
         let prepared = split_request(&body, &request.protocol).unwrap();
-        db.execute_unprepared(
-            "UPDATE gateway_payload_part_refs SET role = 'assistant' WHERE position = 0",
-        )
+        let relabeled = payload_parts::kind_seq(db, "messages", Some("assistant"), "messages")
+            .await
+            .unwrap();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE gateway_payload_parts SET kind_seq = ? WHERE position = 0",
+            [relabeled.into()],
+        ))
         .await
         .unwrap();
         let changed = source_state(db, &request).await.unwrap();
@@ -517,15 +540,14 @@ mod tests {
             0,
         )
         .unwrap();
+        let request = request_seq(&database).await;
+        let chunk_kind = payload_parts::kind_seq(&database, CHUNK_PATH, None, CHUNK_KIND)
+            .await
+            .unwrap();
         for (position, chunk) in compressed.chunks(8).enumerate() {
             let payload = StoredPayload::new(chunk).unwrap();
-            store_blob(&database, &payload).await.unwrap();
-            database
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, kind, part_id) VALUES (?, 'request', '$bytes', ?, 'chunk', ?)",
-                    [REQUEST_ID.into(), (position as i64).into(), payload.id.into()],
-                ))
+            let blob = store_blob(&database, &payload).await.unwrap();
+            payload_parts::insert(&database, request, chunk_kind, position as i64, blob)
                 .await
                 .unwrap();
         }

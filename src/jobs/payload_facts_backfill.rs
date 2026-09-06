@@ -58,13 +58,12 @@ async fn blobs_without_facts(
         .query_all_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT b.id, b.body,
-                    EXISTS (SELECT 1 FROM gateway_payload_part_refs t
-                            WHERE t.part_id = b.id AND t.direction = 'request'
-                              AND t.path = 'tools') is_tool
+                    b.seq IN (SELECT t.blob_seq FROM gateway_payload_parts t
+                              JOIN gateway_payload_part_kinds k ON k.seq = t.kind_seq
+                              WHERE k.path = 'tools') is_tool
              FROM gateway_payload_blobs b
              WHERE b.id > ?
-               AND EXISTS (SELECT 1 FROM gateway_payload_part_refs r
-                           WHERE r.part_id = b.id AND r.direction = 'request')
+               AND b.seq IN (SELECT p.blob_seq FROM gateway_payload_parts p)
                AND NOT EXISTS (SELECT 1 FROM gateway_payload_blob_facts f
                                WHERE f.blob_id = b.id)
              ORDER BY b.id
@@ -87,7 +86,7 @@ async fn blobs_without_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{migration::Migrator, telemetry::timestamp};
+    use crate::{migration::Migrator, payload_parts, telemetry::timestamp};
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
     use sha2::{Digest, Sha256};
@@ -116,12 +115,25 @@ mod tests {
             ))
             .await
             .unwrap();
-        database
-            .execute_raw(Statement::from_sql_and_values(
+        let request = payload_parts::request_seq(database, REQUEST_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let kind = payload_parts::kind_seq(database, path, None, "content")
+            .await
+            .unwrap();
+        let blob: i64 = database
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, kind, part_id) VALUES (?, 'request', ?, ?, 'content', ?)",
-                [REQUEST_ID.into(), path.to_owned().into(), position.into(), id.into()],
+                "SELECT seq FROM gateway_payload_blobs WHERE id = ?",
+                [id.into()],
             ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "seq")
+            .unwrap();
+        payload_parts::insert(database, request, kind, position, blob)
             .await
             .unwrap();
     }

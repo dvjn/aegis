@@ -1583,9 +1583,17 @@ mod tests {
         ))
         .await
         .unwrap();
+        db.execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_payload_part_kinds(path,role,kind) VALUES('tools','','tools')",
+        )
+        .await
+        .unwrap();
         db.execute_unprepared(&format!(
-            "INSERT INTO gateway_payload_part_refs(request_id,direction,path,position,kind,part_id) \
-             VALUES('{request_id}','request','tools',{position},'tools','{blob_id}')"
+            "INSERT INTO gateway_payload_parts(request_seq,kind_seq,position,blob_seq) \
+             SELECT r.seq, k.seq, {position}, b.seq \
+             FROM gateway_requests r, gateway_payload_part_kinds k, gateway_payload_blobs b \
+             WHERE r.id = '{request_id}' AND k.path = 'tools' AND k.role = '' AND k.kind = 'tools' \
+               AND b.id = '{blob_id}'"
         ))
         .await
         .unwrap();
