@@ -4,7 +4,7 @@ use crate::{
     payload_facts::{self, BlobFact},
     pricing::Cost,
     providers::{Provider, Usage},
-    request_metrics, usage_hourly,
+    request_metrics, tool_usage_hourly, usage_hourly,
 };
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -399,6 +399,7 @@ impl SqliteSink {
         }
         request_metrics::rollup(&transaction, &record.id.to_string()).await?;
         usage_hourly::aggregate(&transaction, Some(&record.id.to_string())).await?;
+        tool_usage_hourly::aggregate(&transaction, Some(&record.id.to_string())).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -477,6 +478,7 @@ impl SqliteSink {
             ))
             .await?;
         usage_hourly::aggregate(&transaction, None).await?;
+        tool_usage_hourly::aggregate(&transaction, None).await?;
         transaction.commit().await?;
         Ok(result.rows_affected())
     }
@@ -496,6 +498,7 @@ impl SqliteSink {
                 ))
                 .await?;
             usage_hourly::aggregate(&transaction, Some(&id.to_string())).await?;
+            tool_usage_hourly::aggregate(&transaction, Some(&id.to_string())).await?;
             transaction.commit().await
         }
         .await;

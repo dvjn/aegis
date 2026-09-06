@@ -327,7 +327,8 @@ impl ToolUsage {
 }
 
 /// One aggregated row of `TOOL_PARTS_SQL`: a block type of one tool, or of
-/// one skill when the part belongs to a Skill call.
+/// one skill when the part belongs to a Skill call. `parts` is the count of
+/// calls; for definitions it is how many requests carried them.
 #[derive(Debug, FromQueryResult)]
 struct ToolPart {
     block_type: String,
@@ -483,51 +484,16 @@ fn context_sql() -> String {
         })
 }
 
-/// Calls and results count once per call, however many later requests
-/// replay them; definitions count once per request that carried them, and
-/// every part costs its byte share of every request that carried it. The
-/// window's references are grouped by blob first, so each blob and its facts
-/// are read once. A result carries no tool name or skill, so it borrows them
-/// from the call it answers. A blob holding several definitions splits its
-/// bytes between them.
-const TOOL_PARTS_SQL: &str = "WITH refs AS MATERIALIZED ( \
-     SELECT p.part_id, COUNT(*) sent, \
-     SUM(COALESCE(u.cost_nanodollars * 1.0 / m.total_bytes, 0)) cost_per_byte \
-     FROM gateway_requests r \
-     JOIN gateway_keys k ON k.id = r.key_id \
-     JOIN gateway_payload_part_refs p ON p.request_id = r.id AND p.direction = 'request' \
-     LEFT JOIN gateway_request_metrics m ON m.request_id = r.id AND m.total_bytes > 0 \
-     LEFT JOIN gateway_usage u ON u.request_id = r.id \
-     WHERE k.user_id = ? AND r.started_at >= ? AND r.started_at <= ? \
-     GROUP BY p.part_id), \
-     parts AS MATERIALIZED ( \
-     SELECT f.block_type, \
-     CASE WHEN f.block_type = 'tool_result' THEN (SELECT MIN(x.tool_name) FROM gateway_payload_blob_facts x \
-     WHERE x.tool_use_id = f.tool_use_id AND x.block_type = 'tool_use') ELSE f.tool_name END label, \
-     CASE WHEN f.block_type = 'tool_result' THEN (SELECT MIN(x.skill_name) FROM gateway_payload_blob_facts x \
-     WHERE x.tool_use_id = f.tool_use_id AND x.block_type = 'tool_use') ELSE f.skill_name END skill, \
-     COALESCE(f.tool_use_id, f.blob_id) call_id, \
-     b.original_bytes bytes, \
-     refs.sent, \
-     refs.cost_per_byte, \
-     CASE WHEN f.block_type = 'tool_definition' THEN (SELECT COUNT(*) FROM gateway_payload_blob_facts x \
-     WHERE x.blob_id = f.blob_id) ELSE 1 END facts \
-     FROM refs \
-     JOIN gateway_payload_blob_facts f ON f.blob_id = refs.part_id \
-     JOIN gateway_payload_blobs b ON b.id = refs.part_id \
-     WHERE f.block_type IN ('tool_definition', 'tool_use', 'tool_result')) \
-     SELECT block_type, label, skill, SUM(sent) parts, \
-     CAST(SUM(bytes * sent * 1.0 / facts) AS INTEGER) bytes, \
-     CAST(SUM(bytes * cost_per_byte / facts) AS INTEGER) cost_nanodollars \
-     FROM parts WHERE block_type = 'tool_definition' GROUP BY label \
-     UNION ALL \
-     SELECT block_type, label, skill, COUNT(*) parts, \
-     COALESCE(SUM(bytes), 0) bytes, \
-     CAST(COALESCE(SUM(cost), 0) AS INTEGER) cost_nanodollars \
-     FROM (SELECT block_type, call_id, MIN(label) label, MIN(skill) skill, MAX(bytes) bytes, \
-     SUM(bytes * cost_per_byte) cost \
-     FROM parts WHERE block_type <> 'tool_definition' GROUP BY block_type, call_id) \
-     GROUP BY block_type, label, skill";
+/// The tool buckets of the hours the window touches, from the hour holding
+/// its start to the hour holding its end. Parameters: user, first hour,
+/// window end.
+const TOOL_PARTS_SQL: &str = "SELECT block_type, NULLIF(label, '') label, NULLIF(skill, '') skill, \
+     SUM(calls) parts, \
+     CAST(SUM(bytes) AS INTEGER) bytes, \
+     CAST(SUM(cost_nanodollars) AS INTEGER) cost_nanodollars \
+     FROM gateway_tool_usage_hourly \
+     WHERE user_id = ? AND hour >= ? AND hour <= ? \
+     GROUP BY 1, 2, 3";
 
 const BREAKDOWN_SQL: &str = "{rows} SELECT {column} label, SUM(r.requests) requests, \
      {tokens} tokens, \
@@ -591,9 +557,21 @@ impl UsageStore {
         user_id: Uuid,
         window: Window,
     ) -> Result<ToolUsage, sea_orm::DbErr> {
-        let parts = ToolPart::find_by_statement(self.statement(TOOL_PARTS_SQL, user_id, window))
-            .all(&self.database)
-            .await?;
+        let parts = ToolPart::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            TOOL_PARTS_SQL,
+            [
+                user_id.to_string().into(),
+                window
+                    .start
+                    .format(usage_hourly::HOUR_FORMAT)
+                    .to_string()
+                    .into(),
+                window.bounds()[1].clone().into(),
+            ],
+        ))
+        .all(&self.database)
+        .await?;
         let mut tools: BTreeMap<Option<String>, ToolCalls> = BTreeMap::new();
         let mut skills: BTreeMap<String, SkillCalls> = BTreeMap::new();
         for part in parts {
@@ -795,6 +773,7 @@ impl UsageStore {
 mod tests {
     use super::*;
     use crate::migration::Migrator;
+    use crate::tool_usage_hourly;
     use sea_orm::{ConnectionTrait, Database};
     use sea_orm_migration::MigratorTrait;
 
@@ -858,6 +837,7 @@ mod tests {
         .await
         .unwrap();
         usage_hourly::aggregate(db, Some(id)).await.unwrap();
+        tool_usage_hourly::aggregate(db, Some(id)).await.unwrap();
     }
 
     async fn empty_store(email: &str) -> (DatabaseConnection, Uuid) {
@@ -988,6 +968,7 @@ mod tests {
     /// buckets are recounted, as a repricing job would do in production.
     async fn recount(store: &UsageStore) {
         usage_hourly::rebuild(&store.database).await.unwrap();
+        tool_usage_hourly::rebuild(&store.database).await.unwrap();
     }
 
     #[test]
@@ -1776,6 +1757,9 @@ mod tests {
                 &[("tool_use", Some("Glob"), None, None, None)],
             )
             .await;
+        }
+        for id in ["t-1", "t-2", "t-out"] {
+            complete(&db, id, 200).await;
         }
         (UsageStore::new(db), user)
     }
