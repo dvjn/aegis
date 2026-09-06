@@ -1,5 +1,5 @@
-use flate2::read::GzDecoder;
-use std::io::Read;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use std::io::{Read, Write};
 
 const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -19,6 +19,23 @@ pub(crate) fn decode_body(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     };
     decoded.unwrap_or_else(|| body.to_vec())
+}
+
+pub(crate) fn decode_gzip(body: &[u8]) -> Option<Vec<u8>> {
+    read_bounded(GzDecoder::new(body))
+}
+
+pub(crate) fn gzip_if_smaller(body: &[u8]) -> (Vec<u8>, &'static str) {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let compressed = encoder
+        .write_all(body)
+        .and_then(|()| encoder.finish())
+        .unwrap_or_default();
+    if !compressed.is_empty() && compressed.len() < body.len() {
+        (compressed, "gzip")
+    } else {
+        (body.to_vec(), "identity")
+    }
 }
 
 // Brotli defines no magic number, so it cannot be sniffed: RFC 7932.
