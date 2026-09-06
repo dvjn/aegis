@@ -17,8 +17,8 @@ mod m20260905_000014_payload_blob_facts;
 mod m20260905_000015_request_metrics;
 mod m20260905_000017_part_refs_request_index;
 mod m20260906_000018_gateway_usage_hourly;
-mod m20260906_000019_compress_usage_json;
 mod m20260906_000021_tool_usage_hourly;
+mod m20260906_000022_compress_usage_json;
 
 pub struct Migrator;
 
@@ -43,8 +43,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000015_request_metrics::Migration),
             Box::new(m20260905_000017_part_refs_request_index::Migration),
             Box::new(m20260906_000018_gateway_usage_hourly::Migration),
-            Box::new(m20260906_000019_compress_usage_json::Migration),
             Box::new(m20260906_000021_tool_usage_hourly::Migration),
+            Box::new(m20260906_000022_compress_usage_json::Migration),
         ]
     }
 }
