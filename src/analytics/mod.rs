@@ -21,6 +21,7 @@ pub struct Boundary {
 pub struct SourceBatch {
     pub source_id: String,
     pub source_fact_version: i64,
+    pub epoch: i64,
     pub boundary: Boundary,
     pub snapshot_revision: i64,
     pub requests: Vec<Replacement>,
@@ -139,11 +140,15 @@ pub struct Key {
 pub struct CommittedReceipt {
     pub(crate) generation: String,
     pub(crate) source_id: String,
+    pub(crate) epoch: i64,
     pub(crate) revisions: Vec<(String, i64)>,
 }
 impl CommittedReceipt {
     pub fn generation(&self) -> &str {
         &self.generation
+    }
+    pub fn epoch(&self) -> i64 {
+        self.epoch
     }
     pub fn source_id(&self) -> &str {
         &self.source_id
@@ -197,10 +202,11 @@ mod tests {
             .try_get("", "n")
             .unwrap()
     }
-    fn batch(source: &str, revision: i64, mutation: Mutation) -> SourceBatch {
+    fn batch(source: &source::Source, revision: i64, mutation: Mutation) -> SourceBatch {
         SourceBatch {
-            source_id: source.to_owned(),
+            source_id: source.source_id.clone(),
             source_fact_version: SOURCE_VERSION,
+            epoch: source.epoch(),
             boundary: Boundary {
                 revision,
                 observed_at: "observed".into(),
@@ -341,10 +347,74 @@ mod tests {
         assert!(source.activate("other").await.is_err());
     }
     #[tokio::test]
+    async fn reactivating_one_generation_opens_an_era_that_strands_earlier_receipts() {
+        let (fixture, source, store) = fixture().await;
+        request(&fixture.database).await;
+        let boundary = source.observe().await.unwrap();
+        let batch = source
+            .batch(&boundary, &source::Limits::default())
+            .await
+            .unwrap();
+        let superseded = store.apply_batch(&batch).await.unwrap();
+        let previous = source.epoch();
+        // A lost lock lets the same generation id claim the source a second time.
+        assert_eq!(
+            source.activate(store.generation()).await.unwrap(),
+            previous + 1
+        );
+        assert_eq!(source.epoch(), previous + 1);
+        assert_eq!(superseded.generation(), store.generation());
+        assert_eq!(superseded.epoch(), previous);
+        assert!(
+            source
+                .acknowledge(&superseded)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ownership era changed")
+        );
+        assert_eq!(source.pending().await.unwrap(), 1);
+        let current = source
+            .batch(&boundary, &source::Limits::default())
+            .await
+            .unwrap();
+        let receipt = store.apply_batch(&current).await.unwrap();
+        assert_eq!(receipt.epoch(), previous + 1);
+        assert_eq!(source.acknowledge(&receipt).await.unwrap(), 1);
+        assert_eq!(source.pending().await.unwrap(), 0);
+    }
+    #[tokio::test]
+    async fn publication_refuses_a_superseded_ownership_era() {
+        let (fixture, source, store) = fixture().await;
+        let boundary = source.observe().await.unwrap();
+        store
+            .database
+            .execute_unprepared("UPDATE generation SET baseline_complete=1")
+            .await
+            .unwrap();
+        // A competing owner reclaims the same generation without this Source noticing.
+        fixture
+            .database
+            .execute_unprepared("UPDATE gateway_analytics_clock SET epoch=epoch+1 WHERE id=1")
+            .await
+            .unwrap();
+        assert!(
+            source
+                .publish(&store, &boundary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ownership era changed")
+        );
+        assert!(store.published().await.unwrap().is_none());
+        source.activate(store.generation()).await.unwrap();
+        assert!(source.publish(&store, &boundary).await.unwrap());
+    }
+    #[tokio::test]
     async fn tombstone_and_equal_or_older_replay_preserve_latest_state() {
         let (_fixture, source, store) = fixture().await;
         let first = batch(
-            &source.source_id,
+            &source,
             2,
             Mutation::Upsert(Box::new(RequestFacts {
                 provider: "p".into(),
@@ -384,16 +454,12 @@ mod tests {
             Some(0)
         );
         store
-            .apply_batch(&batch(&source.source_id, 3, Mutation::Delete))
+            .apply_batch(&batch(&source, 3, Mutation::Delete))
             .await
             .unwrap();
         store.apply_batch(&first).await.unwrap();
         store
-            .apply_batch(&batch(
-                &source.source_id,
-                3,
-                Mutation::Upsert(Box::default()),
-            ))
+            .apply_batch(&batch(&source, 3, Mutation::Upsert(Box::default())))
             .await
             .unwrap();
         assert_eq!(count(&store.database, "requests").await, 0);
@@ -623,6 +689,7 @@ mod tests {
         let fresh = SourceBatch {
             source_id: source.source_id.clone(),
             source_fact_version: SOURCE_VERSION,
+            epoch: source.epoch(),
             boundary: Boundary {
                 revision: 5,
                 observed_at: "fresh".into(),
@@ -972,6 +1039,7 @@ mod tests {
             .apply_batch(&SourceBatch {
                 source_id: source.source_id.clone(),
                 source_fact_version: SOURCE_VERSION,
+                epoch: source.epoch(),
                 boundary: Boundary {
                     revision: 3,
                     observed_at: "observed".into(),
@@ -1078,6 +1146,7 @@ mod tests {
             .apply_batch(&SourceBatch {
                 source_id: source.source_id.clone(),
                 source_fact_version: SOURCE_VERSION,
+                epoch: source.epoch(),
                 boundary: Boundary {
                     revision: 4,
                     observed_at: "later".into(),
@@ -1109,6 +1178,7 @@ mod tests {
             .apply_batch(&SourceBatch {
                 source_id: source.source_id.clone(),
                 source_fact_version: SOURCE_VERSION,
+                epoch: source.epoch(),
                 boundary: Boundary {
                     revision: 1,
                     observed_at: "one".into(),
@@ -1138,6 +1208,7 @@ mod tests {
             .apply_batch(&SourceBatch {
                 source_id: source.source_id.clone(),
                 source_fact_version: SOURCE_VERSION,
+                epoch: source.epoch(),
                 boundary: Boundary {
                     revision: 2,
                     observed_at: "two".into(),
@@ -1185,6 +1256,7 @@ mod tests {
             .apply_batch(&SourceBatch {
                 source_id: source.source_id.clone(),
                 source_fact_version: SOURCE_VERSION,
+                epoch: source.epoch(),
                 boundary: Boundary {
                     revision: 3,
                     observed_at: "three".into(),
@@ -1273,7 +1345,7 @@ mod tests {
     }
 
     fn seam_batch(
-        source_id: &str,
+        source: &source::Source,
         owner: Uuid,
         requests: Vec<(&str, RequestFacts)>,
         tools: Vec<Tool>,
@@ -1282,8 +1354,9 @@ mod tests {
     ) -> SourceBatch {
         let revision = requests.len() as i64;
         SourceBatch {
-            source_id: source_id.to_owned(),
+            source_id: source.source_id.clone(),
             source_fact_version: SOURCE_VERSION,
+            epoch: source.epoch(),
             boundary: Boundary {
                 revision,
                 observed_at: "observed".into(),
@@ -1330,7 +1403,7 @@ mod tests {
         full_priced.contributions = vec![contribution(1, 6, 4)];
         store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![
                     ("unpriced-boundary", boundary_unpriced),
@@ -1455,7 +1528,7 @@ mod tests {
         full.attribution = vec![resolved(21, 2), resolved(22, 1)];
         store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![("ambiguous-boundary", boundary), ("ambiguous-full", full)],
                 vec![
@@ -1537,7 +1610,7 @@ mod tests {
         };
         store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![
                     ("replay-boundary", replay("2026-01-01T10:30:00.000Z")),
@@ -1604,7 +1677,7 @@ mod tests {
         }];
         store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![("unnamed-boundary", boundary), ("uncaptured-full", full)],
                 vec![Tool {
@@ -1659,7 +1732,7 @@ mod tests {
         orphan.attribution.clear();
         store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![("orphan", orphan)],
                 vec![Tool {
@@ -1691,7 +1764,7 @@ mod tests {
         let owner = Uuid::now_v7();
         let refusal = store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![(
                     "unreadable",
@@ -1712,7 +1785,7 @@ mod tests {
 
         store
             .apply_batch(&seam_batch(
-                &source.source_id,
+                &source,
                 owner,
                 vec![(
                     "offset",
@@ -1932,7 +2005,7 @@ mod tests {
             .unwrap();
         store
             .apply_batch(&batch(
-                &source.source_id,
+                &source,
                 2,
                 Mutation::Upsert(Box::new(RequestFacts {
                     provider: "p".into(),

@@ -528,6 +528,7 @@ impl ProjectionStore for SqliteStore {
         Ok(CommittedReceipt {
             generation: self.generation.clone(),
             source_id: self.source_id.clone(),
+            epoch: batch.epoch,
             revisions,
         })
     }

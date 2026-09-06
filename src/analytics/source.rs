@@ -7,6 +7,7 @@ use sea_orm::{
 };
 use std::{
     path::{Path, PathBuf},
+    sync::atomic::{AtomicI64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -44,6 +45,8 @@ impl Limits {
 pub struct Source {
     database: DatabaseConnection,
     activation_path: PathBuf,
+    /// Zero until this process activates; no clock epoch is ever zero once owned.
+    epoch: AtomicI64,
     pub source_id: String,
 }
 impl Source {
@@ -73,8 +76,12 @@ impl Source {
         Ok(Self {
             database,
             activation_path: lock_path(&source_path, ".analytics-activation.lock"),
+            epoch: AtomicI64::new(0),
             source_id,
         })
+    }
+    pub fn epoch(&self) -> i64 {
+        self.epoch.load(Ordering::SeqCst)
     }
     pub async fn observe(&self) -> Result<Boundary> {
         let tx = self.database.begin().await?;
@@ -86,14 +93,16 @@ impl Source {
         tx.commit().await?;
         Ok(boundary)
     }
-    /// A generation may claim an unowned source, never steal an existing owner.
-    pub async fn activate(&self, generation: &str) -> Result<()> {
+    /// A generation may claim an unowned source, or reclaim one it already holds,
+    /// never steal an existing owner. Every claim opens a new ownership era, so a
+    /// reclaim after lost ownership strands the previous era's in-flight work.
+    pub async fn activate(&self, generation: &str) -> Result<i64> {
         let _lock = OwnershipLock::acquire(&self.activation_path)?;
         let tx = crate::db::begin_immediate(&self.database).await?;
-        tx.execute_raw(sql("UPDATE gateway_analytics_clock SET active_generation=? WHERE id=1 AND source_id=? AND active_generation IS NULL",vec![generation.into(),self.source_id.clone().into()])).await?;
+        tx.execute_raw(sql("UPDATE gateway_analytics_clock SET active_generation=?,epoch=epoch+1 WHERE id=1 AND source_id=? AND (active_generation IS NULL OR active_generation=?)",vec![generation.into(),self.source_id.clone().into(),generation.into()])).await?;
         let row = tx
             .query_one_raw(sql(
-                "SELECT active_generation,source_id FROM gateway_analytics_clock WHERE id=1",
+                "SELECT active_generation,source_id,epoch FROM gateway_analytics_clock WHERE id=1",
                 vec![],
             ))
             .await?
@@ -105,8 +114,10 @@ impl Source {
                 && row.try_get::<String>("", "source_id")? == self.source_id,
             "another analytics generation is active"
         );
+        let epoch = row.try_get::<i64>("", "epoch")?;
         tx.commit().await?;
-        Ok(())
+        self.epoch.store(epoch, Ordering::SeqCst);
+        Ok(epoch)
     }
     pub async fn acknowledge(&self, receipt: &CommittedReceipt) -> Result<u64> {
         ensure!(
@@ -116,7 +127,7 @@ impl Source {
         let tx = crate::db::begin_immediate(&self.database).await?;
         let clock = tx
             .query_one_raw(sql(
-                "SELECT source_id,active_generation FROM gateway_analytics_clock WHERE id=1",
+                "SELECT source_id,active_generation,epoch FROM gateway_analytics_clock WHERE id=1",
                 vec![],
             ))
             .await?
@@ -128,6 +139,10 @@ impl Source {
                     .as_deref()
                     == Some(receipt.generation()),
             "analytics generation is no longer active; stopping projection attempt"
+        );
+        ensure!(
+            clock.try_get::<i64>("", "epoch")? == receipt.epoch(),
+            "analytics ownership era changed; stopping projection attempt"
         );
         let mut n = 0;
         for (request, revision) in receipt.revisions() {
@@ -151,7 +166,7 @@ impl Source {
     pub async fn publish(&self, store: &sqlite::SqliteStore, boundary: &Boundary) -> Result<bool> {
         let _lock = OwnershipLock::acquire(&self.activation_path)?;
         let tx = self.database.begin().await?;
-        let row=tx.query_one_raw(sql("SELECT source_id,active_generation,revision FROM gateway_analytics_clock WHERE id=1",vec![])).await?.context("missing clock")?;
+        let row=tx.query_one_raw(sql("SELECT source_id,active_generation,revision,epoch FROM gateway_analytics_clock WHERE id=1",vec![])).await?.context("missing clock")?;
         ensure!(
             row.try_get::<String>("", "source_id")? == store.source_id
                 && row
@@ -159,6 +174,10 @@ impl Source {
                     .as_deref()
                     == Some(store.generation()),
             "inactive analytics generation"
+        );
+        ensure!(
+            row.try_get::<i64>("", "epoch")? == self.epoch(),
+            "analytics ownership era changed; refusing publication"
         );
         ensure!(
             boundary.revision <= row.try_get::<i64>("", "revision")?,
@@ -204,6 +223,7 @@ impl Source {
         let mut batch = SourceBatch {
             source_id: self.source_id.clone(),
             source_fact_version: SOURCE_VERSION,
+            epoch: self.epoch(),
             boundary: boundary.clone(),
             snapshot_revision,
             requests: vec![],
