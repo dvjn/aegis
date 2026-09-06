@@ -13,6 +13,17 @@ use std::{
 pub(crate) fn sql(text: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Sqlite, text, values)
 }
+
+/// Reports compare request starts as text against RFC 3339 bounds, so every
+/// stored start must share one form. A time that cannot be read is refused
+/// here rather than sorting outside every window and vanishing from the seam
+/// between hourly aggregates and boundary facts.
+pub(crate) fn canonical_start(value: &str) -> Result<String> {
+    Ok(chrono::DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("unreadable request start time {value}"))?
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
 pub(crate) async fn insert(
     db: &impl ConnectionTrait,
     table: &str,
@@ -160,12 +171,53 @@ impl SqliteStore {
                     row.try_get::<String>("", "source_id")? == source_id,
                     "analytics source binding mismatch"
                 );
+                let old_schema = row.try_get::<i64>("", "schema_version")?;
                 ensure!(
                     row.try_get::<i64>("", "source_version")? == SOURCE_VERSION
-                        && row.try_get::<i64>("", "schema_version")? == SCHEMA_VERSION
+                        && old_schema <= SCHEMA_VERSION
                         && row.try_get::<i64>("", "projection_version")? == PROJECTION_VERSION,
                     "unsupported analytics versions"
                 );
+                if old_schema < 4 {
+                    // Aggregate tables are rebuildable caches. Recreate them rather
+                    // than trying to preserve the nullable composite-key layout.
+                    tx.execute_unprepared(DROP_AGGREGATES).await?;
+                    tx.execute_unprepared(AGGREGATE_SCHEMA).await?;
+                    // Rows written before schema 4 kept whatever start text they
+                    // arrived with. `strftime` still buckets them, so they would
+                    // count in full hours and vanish from boundary hours, which
+                    // is the seam gap canonical starts exist to prevent.
+                    let stored = tx
+                        .query_all_raw(sql("SELECT id,started_at FROM requests", vec![]))
+                        .await?;
+                    for row in stored {
+                        let id: i64 = row.try_get("", "id")?;
+                        let started_at: String = row.try_get("", "started_at")?;
+                        let canonical = canonical_start(&started_at)
+                            .with_context(|| format!("analytics request {id}"))?;
+                        if canonical != started_at {
+                            tx.execute_raw(sql(
+                                "UPDATE requests SET started_at=? WHERE id=?",
+                                vec![canonical.into(), id.into()],
+                            ))
+                            .await?;
+                        }
+                    }
+                    let buckets = tx.query_all_raw(sql(
+                        "SELECT owner_id,strftime('%Y-%m-%dT%H:00:00Z',started_at) hour FROM requests GROUP BY owner_id,hour",
+                        vec![],
+                    )).await?;
+                    for bucket in buckets {
+                        let owner = bucket.try_get::<Option<String>>("", "owner_id")?;
+                        let hour = bucket.try_get::<String>("", "hour")?;
+                        super::aggregates::repair_owner_hour(&tx, owner.as_deref(), &hour).await?;
+                    }
+                }
+                tx.execute_raw(sql(
+                    "UPDATE generation SET schema_version=? WHERE singleton=1",
+                    vec![SCHEMA_VERSION.into()],
+                ))
+                .await?;
                 row.try_get("", "id")?
             } else {
                 let id = uuid::Uuid::new_v4().to_string();
@@ -372,13 +424,14 @@ impl ProjectionStore for SqliteStore {
                 revisions.push((r.request_id.clone(), r.revision));
                 continue;
             }
+            let old_bucket = tx.query_one_raw(sql("SELECT owner_id,strftime('%Y-%m-%dT%H:00:00Z',started_at) hour FROM requests WHERE source_request_id=?", vec![r.request_id.clone().into()])).await?;
             tx.execute_raw(sql(
                 "DELETE FROM requests WHERE source_request_id=?",
                 vec![r.request_id.clone().into()],
             ))
             .await?;
             if let Mutation::Upsert(f) = &r.mutation {
-                tx.execute_raw(sql("INSERT INTO requests(source_request_id,key_id,key_version_id,owner_id,provider,requested_model,started_at,first_byte_at,completed_at,status,has_error,request_bytes,response_bytes,client_disconnected,changed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",vec![r.request_id.clone().into(),f.key_id.clone().into(),f.key_version_id.clone().into(),f.owner_id.clone().into(),f.provider.clone().into(),f.requested_model.clone().into(),f.started_at.clone().into(),f.first_byte_at.clone().into(),f.completed_at.clone().into(),f.status.into(),f.has_error.into(),f.request_bytes.into(),f.response_bytes.into(),f.client_disconnected.into(),r.changed_at.clone().into()])).await?;
+                tx.execute_raw(sql("INSERT INTO requests(source_request_id,key_id,key_version_id,owner_id,provider,requested_model,started_at,first_byte_at,completed_at,status,has_error,request_bytes,response_bytes,client_disconnected,changed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",vec![r.request_id.clone().into(),f.key_id.clone().into(),f.key_version_id.clone().into(),f.owner_id.clone().into(),f.provider.clone().into(),f.requested_model.clone().into(),canonical_start(&f.started_at).with_context(|| format!("source request {}", r.request_id))?.into(),f.first_byte_at.clone().into(),f.completed_at.clone().into(),f.status.into(),f.has_error.into(),f.request_bytes.into(),f.response_bytes.into(),f.client_disconnected.into(),r.changed_at.clone().into()])).await?;
                 let id: i64 = tx
                     .query_one_raw(sql(
                         "SELECT id FROM requests WHERE source_request_id=?",
@@ -456,6 +509,18 @@ impl ProjectionStore for SqliteStore {
                 }
             }
             tx.execute_raw(sql("INSERT INTO applied_requests VALUES(?,?,?) ON CONFLICT(request_id) DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted",vec![r.request_id.clone().into(),r.revision.into(),matches!(r.mutation,Mutation::Delete).into()])).await?;
+            if let Some(old) = old_bucket {
+                let owner = old.try_get::<Option<String>>("", "owner_id")?;
+                if let Some(hour) = old.try_get::<Option<String>>("", "hour")? {
+                    super::aggregates::repair_owner_hour(&tx, owner.as_deref(), &hour).await?;
+                }
+            }
+            if let Some(new) = tx.query_one_raw(sql("SELECT owner_id,strftime('%Y-%m-%dT%H:00:00Z',started_at) hour FROM requests WHERE source_request_id=?", vec![r.request_id.clone().into()])).await? {
+                let owner = new.try_get::<Option<String>>("", "owner_id")?;
+                if let Some(hour) = new.try_get::<Option<String>>("", "hour")? {
+                    super::aggregates::repair_owner_hour(&tx, owner.as_deref(), &hour).await?;
+                }
+            }
             revisions.push((r.request_id.clone(), r.revision));
         }
         tx.execute_raw(sql("INSERT INTO worker_progress VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET snapshot_revision=MAX(snapshot_revision,excluded.snapshot_revision),batch_at=excluded.batch_at",vec![batch.snapshot_revision.into(),chrono::Utc::now().to_rfc3339().into()])).await?;
@@ -502,6 +567,26 @@ async fn immutable(
     }
     Ok(())
 }
+const DROP_AGGREGATES: &str = "
+DROP TABLE IF EXISTS hourly_owner_overview;
+DROP TABLE IF EXISTS hourly_owner_model;
+DROP TABLE IF EXISTS hourly_owner_provider;
+DROP TABLE IF EXISTS hourly_owner_key;
+DROP TABLE IF EXISTS hourly_context;
+DROP TABLE IF EXISTS hourly_context_cost;
+DROP TABLE IF EXISTS hourly_tool_contribution;
+DROP TABLE IF EXISTS hourly_identity_presence;
+";
+const AGGREGATE_SCHEMA: &str = "
+CREATE TABLE hourly_owner_overview(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour)) WITHOUT ROWID;
+CREATE TABLE hourly_owner_model(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,dimension_key TEXT NOT NULL,dimension TEXT,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,dimension_key)) WITHOUT ROWID;
+CREATE TABLE hourly_owner_provider(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,dimension_key TEXT NOT NULL,dimension TEXT,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,dimension_key)) WITHOUT ROWID;
+CREATE TABLE hourly_owner_key(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,dimension_key TEXT NOT NULL,dimension TEXT,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,dimension_key)) WITHOUT ROWID;
+CREATE TABLE hourly_context(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,requests INTEGER NOT NULL,tool_definition_bytes INTEGER NOT NULL,system_bytes INTEGER NOT NULL,user_text_bytes INTEGER NOT NULL,assistant_text_bytes INTEGER NOT NULL,thinking_bytes INTEGER NOT NULL,tool_use_bytes INTEGER NOT NULL,tool_result_bytes INTEGER NOT NULL,other_bytes INTEGER NOT NULL,total_bytes INTEGER NOT NULL,tools_offered INTEGER NOT NULL,tools_invoked INTEGER NOT NULL,tool_result_errors INTEGER NOT NULL,cache_breakpoints INTEGER NOT NULL,PRIMARY KEY(owner_key,hour)) WITHOUT ROWID;
+CREATE TABLE hourly_context_cost(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,component TEXT NOT NULL,lower_scaled TEXT NOT NULL,remainders TEXT NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,component)) WITHOUT ROWID;
+CREATE TABLE hourly_tool_contribution(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,tool_id INTEGER NOT NULL,definition_count INTEGER NOT NULL,definition_bytes_num TEXT NOT NULL,definition_bytes_den TEXT NOT NULL,definition_lower_scaled TEXT NOT NULL,definition_remainders TEXT NOT NULL,transmission_lower_scaled TEXT NOT NULL,transmission_remainders TEXT NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,tool_id)) WITHOUT ROWID;
+CREATE TABLE hourly_identity_presence(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,identity_id INTEGER NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(owner_key,hour,identity_id,kind)) WITHOUT ROWID;
+";
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS generation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_id TEXT NOT NULL,id TEXT NOT NULL,source_version INTEGER NOT NULL,schema_version INTEGER NOT NULL,projection_version INTEGER NOT NULL,baseline_complete INTEGER NOT NULL DEFAULT 0 CHECK(baseline_complete IN(0,1)));
 CREATE TABLE IF NOT EXISTS publication(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL,observed_at TEXT NOT NULL);
@@ -519,5 +604,15 @@ CREATE INDEX IF NOT EXISTS contribution_tool_request ON contributions(tool_id,re
 CREATE TABLE IF NOT EXISTS appearances(request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,variant_id INTEGER NOT NULL REFERENCES variants(id),multiplicity INTEGER NOT NULL CHECK(multiplicity>0),PRIMARY KEY(request_id,variant_id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS appearance_variant_request ON appearances(variant_id,request_id);
 CREATE TABLE IF NOT EXISTS request_identity_attribution(request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,identity_id INTEGER NOT NULL REFERENCES identity_keys(id),state TEXT NOT NULL CHECK(state IN('unresolved','resolved','ambiguous')),tool_id INTEGER REFERENCES tools(id),CHECK((state='resolved')=(tool_id IS NOT NULL)),PRIMARY KEY(request_id,identity_id)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS attribution_identity_request ON request_identity_attribution(identity_id,request_id);
 CREATE TABLE IF NOT EXISTS worker_progress(singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot_revision INTEGER NOT NULL,batch_at TEXT NOT NULL);
+-- Additive only: aggregates are acceleration caches rebuilt from the compact tables.
+CREATE TABLE IF NOT EXISTS hourly_owner_overview(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_owner_model(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,dimension_key TEXT NOT NULL,dimension TEXT,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,dimension_key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_owner_provider(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,dimension_key TEXT NOT NULL,dimension TEXT,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,dimension_key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_owner_key(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,dimension_key TEXT NOT NULL,dimension TEXT,requests INTEGER NOT NULL,succeeded INTEGER NOT NULL,failed INTEGER NOT NULL,input_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,cache_write_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cost_nanos INTEGER NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,dimension_key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_context(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,requests INTEGER NOT NULL,tool_definition_bytes INTEGER NOT NULL,system_bytes INTEGER NOT NULL,user_text_bytes INTEGER NOT NULL,assistant_text_bytes INTEGER NOT NULL,thinking_bytes INTEGER NOT NULL,tool_use_bytes INTEGER NOT NULL,tool_result_bytes INTEGER NOT NULL,other_bytes INTEGER NOT NULL,total_bytes INTEGER NOT NULL,tools_offered INTEGER NOT NULL,tools_invoked INTEGER NOT NULL,tool_result_errors INTEGER NOT NULL,cache_breakpoints INTEGER NOT NULL,PRIMARY KEY(owner_key,hour)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_context_cost(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,component TEXT NOT NULL,lower_scaled TEXT NOT NULL,remainders TEXT NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,component)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_tool_contribution(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,tool_id INTEGER NOT NULL,definition_count INTEGER NOT NULL,definition_bytes_num TEXT NOT NULL,definition_bytes_den TEXT NOT NULL,definition_lower_scaled TEXT NOT NULL,definition_remainders TEXT NOT NULL,transmission_lower_scaled TEXT NOT NULL,transmission_remainders TEXT NOT NULL,unpriced INTEGER NOT NULL,PRIMARY KEY(owner_key,hour,tool_id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_identity_presence(owner_key TEXT NOT NULL,owner_id TEXT,hour TEXT NOT NULL,identity_id INTEGER NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(owner_key,hour,identity_id,kind)) WITHOUT ROWID;
 ";

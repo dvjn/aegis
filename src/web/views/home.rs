@@ -612,6 +612,7 @@ mod tests {
     fn the_context_card_keeps_every_part_in_one_fixed_order() {
         let context = ContextTotals {
             requests: 4,
+            unpriced_requests: 0,
             tool_definition_bytes: 3_228_000,
             system_bytes: 1_000_000,
             user_text_bytes: 500_000,

@@ -84,7 +84,7 @@ pub enum Bucket {
 impl Bucket {
     /// The SQLite expression that maps `r.started_at` to a bucket key. It must
     /// produce exactly what `key` produces for the same moment.
-    fn sql(self) -> &'static str {
+    pub(crate) fn sql(self) -> &'static str {
         match self {
             Self::ThreeHours => {
                 "strftime('%Y-%m-%dT', r.started_at) \
@@ -102,7 +102,7 @@ impl Bucket {
         }
     }
 
-    fn key(self, moment: DateTime<Utc>) -> String {
+    pub(crate) fn key(self, moment: DateTime<Utc>) -> String {
         let aligned = self.align(moment);
         match self {
             Self::ThreeHours => aligned.format("%Y-%m-%dT%H:00:00Z").to_string(),
@@ -152,7 +152,7 @@ impl Window {
             .take_while(|moment| *moment <= self.end)
     }
 
-    fn bounds(&self) -> [String; 2] {
+    pub(crate) fn bounds(&self) -> [String; 2] {
         [
             self.start.to_rfc3339_opts(SecondsFormat::Millis, true),
             self.end.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -190,6 +190,9 @@ impl UsageTotals {
 #[derive(Debug, Default, PartialEq, Eq, FromQueryResult, Serialize)]
 pub struct ContextTotals {
     pub requests: i64,
+    /// Requests whose price was unknown. Their bytes are counted; their share
+    /// of every component cost below is not, so those costs are understated.
+    pub unpriced_requests: i64,
     pub tool_definition_bytes: i64,
     pub system_bytes: i64,
     pub user_text_bytes: i64,
@@ -234,6 +237,9 @@ pub struct ToolCalls {
     pub calls: i64,
     pub bytes: i64,
     pub cost_nanodollars: i64,
+    /// Contributions whose request price was unknown. Their bytes are counted;
+    /// their cost is not, so `cost_nanodollars` is understated by that much.
+    pub unpriced_requests: i64,
 }
 
 /// One skill's Skill tool calls over the window, measured like a tool but
@@ -244,6 +250,8 @@ pub struct SkillCalls {
     pub calls: i64,
     pub bytes: i64,
     pub cost_nanodollars: i64,
+    /// Contributions whose request price was unknown, as on [`ToolCalls`].
+    pub unpriced_requests: i64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
@@ -253,6 +261,8 @@ pub struct McpServer {
     pub tools: i64,
     pub bytes: i64,
     pub cost_nanodollars: i64,
+    /// Contributions whose request price was unknown, as on [`ToolCalls`].
+    pub unpriced_requests: i64,
 }
 
 /// Every tool part of the window's requests, read once.
@@ -263,6 +273,11 @@ pub struct ToolUsage {
     pub tools: Vec<ToolCalls>,
     /// Ordered by calls, most first, then by name.
     pub skills: Vec<SkillCalls>,
+    /// Calls whose identity resolved to more than one tool, or resolved in one
+    /// request and not in another. They are held out of `tools` so they are
+    /// never counted against a tool that may not own them.
+    pub ambiguous_calls: i64,
+    pub ambiguous_bytes: i64,
 }
 
 impl ToolUsage {
@@ -285,6 +300,7 @@ impl ToolUsage {
             server.tools += 1;
             server.bytes += tool.bytes;
             server.cost_nanodollars += tool.cost_nanodollars;
+            server.unpriced_requests += tool.unpriced_requests;
         }
         let mut servers: Vec<McpServer> = by_server.into_values().collect();
         servers.sort_by(|left, right| {
@@ -380,6 +396,7 @@ const TOTALS_SQL: &str = "SELECT COUNT(*) requests, \
      {from}";
 
 const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
+     COALESCE(SUM(u.cost_nanodollars IS NULL), 0) unpriced_requests, \
      COALESCE(SUM(m.tool_definition_bytes), 0) tool_definition_bytes, \
      COALESCE(SUM(m.system_bytes), 0) system_bytes, \
      COALESCE(SUM(m.user_text_bytes), 0) user_text_bytes, \
@@ -581,7 +598,14 @@ impl UsageStore {
                 .cmp(&left.calls)
                 .then_with(|| left.label.cmp(&right.label))
         });
-        Ok(ToolUsage { tools, skills })
+        // This path attributes parts directly and has no identity state, so it
+        // has no ambiguity to report.
+        Ok(ToolUsage {
+            tools,
+            skills,
+            ambiguous_calls: 0,
+            ambiguous_bytes: 0,
+        })
     }
 
     pub async fn by_model(
@@ -1611,6 +1635,7 @@ mod tests {
             label: label.map(str::to_owned),
             calls,
             bytes,
+            unpriced_requests: 0,
             cost_nanodollars,
         };
         assert_eq!(
@@ -1643,6 +1668,7 @@ mod tests {
                 calls: 1,
                 bytes: 1_000,
                 cost_nanodollars: 140_000,
+                unpriced_requests: 0,
             }],
             "the Skill call and the body it returned, once each; the body replayed by t-1 \
              costs that request its share too"
@@ -1655,6 +1681,7 @@ mod tests {
                 tools: 1,
                 bytes: 6_000,
                 cost_nanodollars: 450_000,
+                unpriced_requests: 0,
             }]
         );
 
@@ -1672,6 +1699,7 @@ mod tests {
             calls,
             bytes,
             cost_nanodollars: bytes * 10,
+            unpriced_requests: 0,
         };
         let usage = ToolUsage {
             tools: vec![
@@ -1683,6 +1711,8 @@ mod tests {
                 tool("mcp__a__w", 0, 5),
             ],
             skills: vec![],
+            ambiguous_calls: 0,
+            ambiguous_bytes: 0,
         };
         assert_eq!(
             usage
@@ -1741,6 +1771,7 @@ mod tests {
             totals,
             ContextTotals {
                 requests: 2,
+                unpriced_requests: 1,
                 tool_definition_bytes: 200,
                 system_bytes: 40,
                 user_text_bytes: 60,
@@ -1763,7 +1794,8 @@ mod tests {
                 tool_result_cost_nanodollars: 60_000,
                 other_cost_nanodollars: 1_000,
             },
-            "the priced request's cost is split by each part's share of its bytes; the unpriced one adds nothing"
+            "the priced request's cost is split by each part's share of its bytes; the unpriced \
+             one adds no cost and is counted so the total reads as understated, not free"
         );
         assert_eq!(ContextTotals::estimated_tokens(3529), 1000);
 

@@ -185,6 +185,7 @@ mod tests {
             calls,
             bytes,
             cost_nanodollars,
+            unpriced_requests: 0,
         }
     }
 
@@ -200,6 +201,7 @@ mod tests {
                     calls: 0,
                     bytes: 700,
                     cost_nanodollars: 35_000,
+                    unpriced_requests: 0,
                 },
                 tool(
                     "mcp__claude_ai_Microsoft_365__outlook_send_mail",
@@ -220,14 +222,18 @@ mod tests {
                     calls: 5,
                     bytes: 27_000,
                     cost_nanodollars: 120_000_000,
+                    unpriced_requests: 0,
                 },
                 SkillCalls {
                     label: "artifact-design".to_owned(),
                     calls: 1,
                     bytes: 3_529,
                     cost_nanodollars: 0,
+                    unpriced_requests: 0,
                 },
             ],
+            ambiguous_calls: 0,
+            ambiguous_bytes: 0,
         }
     }
 
