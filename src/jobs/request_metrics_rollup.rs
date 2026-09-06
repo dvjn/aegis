@@ -36,8 +36,8 @@ async fn requests_without_metrics(
             "SELECT g.id
              FROM gateway_requests g
              WHERE g.id > ?
-               AND EXISTS (SELECT 1 FROM gateway_payload_part_refs r
-                           WHERE r.request_id = g.id AND r.direction = 'request')
+               AND EXISTS (SELECT 1 FROM gateway_payload_parts p
+                           WHERE p.request_seq = g.seq)
                AND NOT EXISTS (SELECT 1 FROM gateway_request_metrics m
                                WHERE m.request_id = g.id)
              ORDER BY g.id

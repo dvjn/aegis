@@ -13,6 +13,7 @@ mod migration;
 mod oauth;
 mod origin;
 mod payload_facts;
+mod payload_parts;
 mod pricing;
 mod providers;
 mod request_id;

@@ -1,18 +1,19 @@
-use crate::telemetry::timestamp;
+use crate::{payload_parts, telemetry::timestamp};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 const COMPONENT_SQL: &str = "CASE
-    WHEN r.path = 'tools' OR r.kind = 'additional_tools' THEN 'tool_definition'
-    WHEN r.path IN ('system', 'instructions') THEN 'system'
-    WHEN r.kind IN ('thinking', 'redacted_thinking', 'reasoning') THEN 'thinking'
-    WHEN r.kind IN ('tool_use', 'server_tool_use', 'function_call', 'custom_tool_call') THEN 'tool_use'
-    WHEN r.kind IN ('tool_result', 'web_search_tool_result', 'function_call_output', 'custom_tool_call_output') THEN 'tool_result'
-    WHEN r.kind IN ('text', 'message')
-      OR (r.kind = 'messages' AND NOT EXISTS (
-            SELECT 1 FROM gateway_payload_part_refs c
-            WHERE c.request_id = r.request_id AND c.direction = 'request'
-              AND c.path = 'messages/' || r.position || '/content'))
-    THEN CASE r.role
+    WHEN k.path = 'tools' OR k.kind = 'additional_tools' THEN 'tool_definition'
+    WHEN k.path IN ('system', 'instructions') THEN 'system'
+    WHEN k.kind IN ('thinking', 'redacted_thinking', 'reasoning') THEN 'thinking'
+    WHEN k.kind IN ('tool_use', 'server_tool_use', 'function_call', 'custom_tool_call') THEN 'tool_use'
+    WHEN k.kind IN ('tool_result', 'web_search_tool_result', 'function_call_output', 'custom_tool_call_output') THEN 'tool_result'
+    WHEN k.kind IN ('text', 'message')
+      OR (k.kind = 'messages' AND NOT EXISTS (
+            SELECT 1 FROM gateway_payload_parts c
+            JOIN gateway_payload_part_kinds ck ON ck.seq = c.kind_seq
+            WHERE c.request_seq = p.request_seq
+              AND ck.path = 'messages/' || p.position || '/content'))
+    THEN CASE k.role
         WHEN 'user' THEN 'user_text'
         WHEN 'assistant' THEN 'assistant_text'
         WHEN 'system' THEN 'system'
@@ -21,6 +22,11 @@ const COMPONENT_SQL: &str = "CASE
     END
     ELSE 'other'
 END";
+
+const FACT_COUNT_SQL: &str = "(SELECT COUNT(*) FROM gateway_payload_parts p
+     JOIN gateway_payload_blobs b ON b.seq = p.blob_seq
+     JOIN gateway_payload_blob_facts f ON f.blob_id = b.id
+     WHERE p.request_seq = ?3 AND {condition})";
 
 const ROLLUP_SQL: &str = "INSERT OR IGNORE INTO gateway_request_metrics (
     request_id, tool_definition_bytes, system_bytes, user_text_bytes, assistant_text_bytes,
@@ -36,34 +42,50 @@ SELECT ?1,
     SUM(CASE WHEN component = 'tool_result' THEN bytes ELSE 0 END),
     SUM(CASE WHEN component = 'other' THEN bytes ELSE 0 END),
     SUM(bytes),
-    (SELECT COUNT(*) FROM gateway_payload_part_refs r
-     JOIN gateway_payload_blob_facts f ON f.blob_id = r.part_id
-     WHERE r.request_id = ?1 AND r.direction = 'request' AND f.block_type = 'tool_definition'),
-    (SELECT COUNT(*) FROM gateway_payload_part_refs r
-     JOIN gateway_payload_blob_facts f ON f.blob_id = r.part_id
-     WHERE r.request_id = ?1 AND r.direction = 'request' AND f.block_type = 'tool_use'),
-    (SELECT COUNT(*) FROM gateway_payload_part_refs r
-     JOIN gateway_payload_blob_facts f ON f.blob_id = r.part_id
-     WHERE r.request_id = ?1 AND r.direction = 'request' AND f.block_type = 'tool_result' AND f.is_error = 1),
-    (SELECT COUNT(*) FROM gateway_payload_part_refs r
-     JOIN gateway_payload_blob_facts f ON f.blob_id = r.part_id
-     WHERE r.request_id = ?1 AND r.direction = 'request' AND f.cache_ttl IS NOT NULL),
+    {count:f.block_type = 'tool_definition'},
+    {count:f.block_type = 'tool_use'},
+    {count:f.block_type = 'tool_result' AND f.is_error = 1},
+    {count:f.cache_ttl IS NOT NULL},
     ?2
 FROM (SELECT b.original_bytes bytes, {component} component
-      FROM gateway_payload_part_refs r
-      JOIN gateway_payload_blobs b ON b.id = r.part_id
-      WHERE r.request_id = ?1 AND r.direction = 'request')
+      FROM gateway_payload_parts p
+      JOIN gateway_payload_part_kinds k ON k.seq = p.kind_seq
+      JOIN gateway_payload_blobs b ON b.seq = p.blob_seq
+      WHERE p.request_seq = ?3)
 HAVING COUNT(*) > 0";
+
+fn rollup_sql() -> String {
+    let mut sql = ROLLUP_SQL.replace("{component}", COMPONENT_SQL);
+    for condition in [
+        "f.block_type = 'tool_definition'",
+        "f.block_type = 'tool_use'",
+        "f.block_type = 'tool_result' AND f.is_error = 1",
+        "f.cache_ttl IS NOT NULL",
+    ] {
+        sql = sql.replace(
+            &format!("{{count:{condition}}}"),
+            &FACT_COUNT_SQL.replace("{condition}", condition),
+        );
+    }
+    sql
+}
 
 pub(crate) async fn rollup(
     database: &impl ConnectionTrait,
     request_id: &str,
 ) -> Result<bool, DbErr> {
+    let Some(request_seq) = payload_parts::request_seq(database, request_id).await? else {
+        return Ok(false);
+    };
     let result = database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            ROLLUP_SQL.replace("{component}", COMPONENT_SQL),
-            [request_id.to_owned().into(), timestamp().into()],
+            rollup_sql(),
+            [
+                request_id.to_owned().into(),
+                timestamp().into(),
+                request_seq.into(),
+            ],
         ))
         .await?;
     Ok(result.rows_affected() > 0)
@@ -223,10 +245,12 @@ pub(crate) mod tests {
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "SELECT SUM(b.original_bytes) total,
-                        SUM(CASE WHEN r.path = 'messages' THEN b.original_bytes ELSE 0 END) shells
-                 FROM gateway_payload_part_refs r
-                 JOIN gateway_payload_blobs b ON b.id = r.part_id
-                 WHERE r.request_id = ? AND r.direction = 'request'",
+                        SUM(CASE WHEN k.path = 'messages' THEN b.original_bytes ELSE 0 END) shells
+                 FROM gateway_payload_parts p
+                 JOIN gateway_payload_part_kinds k ON k.seq = p.kind_seq
+                 JOIN gateway_payload_blobs b ON b.seq = p.blob_seq
+                 JOIN gateway_requests r ON r.seq = p.request_seq
+                 WHERE r.id = ?",
                 [request_id.clone().into()],
             ))
             .await

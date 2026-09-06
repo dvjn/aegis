@@ -2,6 +2,7 @@ use crate::{
     compression::{decode_body, decode_brotli_unsniffable, gzip_if_smaller},
     db::begin_immediate,
     payload_facts::{self, BlobFact},
+    payload_parts,
     pricing::Cost,
     providers::{Provider, Usage},
     request_metrics, usage_hourly, usage_json,
@@ -14,6 +15,9 @@ use uuid::Uuid;
 
 const INTERRUPTED_AFTER: TimeDelta = TimeDelta::minutes(15);
 const INTERRUPTED_MESSAGE: &str = "interrupted before the response completed";
+/// A body that did not split into semantic parts is stored as content-defined chunks.
+pub(crate) const CHUNK_PATH: &str = "$bytes";
+pub(crate) const CHUNK_KIND: &str = "chunk";
 
 #[derive(Clone)]
 pub struct SqliteSink {
@@ -61,11 +65,12 @@ impl StoredPayload {
     }
 }
 
+/// Stores the blob unless its hash is already known and returns its integer key.
 pub(crate) async fn store_blob(
     database: &impl ConnectionTrait,
     payload: &StoredPayload,
-) -> Result<bool, sea_orm::DbErr> {
-    let result = database
+) -> Result<i64, sea_orm::DbErr> {
+    database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -78,7 +83,15 @@ pub(crate) async fn store_blob(
             ],
         ))
         .await?;
-    Ok(result.rows_affected() > 0)
+    let row = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT seq FROM gateway_payload_blobs WHERE id = ?",
+            [payload.id.clone().into()],
+        ))
+        .await?
+        .ok_or_else(|| sea_orm::DbErr::RecordNotFound(format!("blob {}", payload.id)))?;
+    row.try_get("", "seq")
 }
 
 pub(crate) fn chunk_payload(body: &[u8]) -> Vec<StoredPayload> {
@@ -290,10 +303,10 @@ impl SqliteSink {
         let chunked_payload = (semantic_payload.is_none() && !record.request_body.is_empty())
             .then(|| chunk_payload(record.request_body));
         let transaction = begin_immediate(&self.database).await?;
-        transaction
-            .execute_raw(Statement::from_sql_and_values(
+        let inserted = transaction
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
                 [
                     id.to_string().into(),
                     record.request_id.to_owned().into(),
@@ -308,11 +321,13 @@ impl SqliteSink {
                     (record.request_body.len() as i64).into(),
                 ],
             ))
-            .await?;
+            .await?
+            .ok_or_else(|| sea_orm::DbErr::RecordNotInserted)?;
+        let request_seq: i64 = inserted.try_get("", "seq")?;
         if let Some(payload) = semantic_payload {
-            Self::store_semantic_payload(&transaction, id, payload).await?;
+            Self::store_semantic_payload(&transaction, request_seq, payload).await?;
         } else if let Some(payloads) = chunked_payload {
-            Self::store_chunked_payload(&transaction, id, payloads).await?;
+            Self::store_chunked_payload(&transaction, request_seq, payloads).await?;
         }
         transaction
             .execute_raw(Statement::from_sql_and_values(
@@ -397,29 +412,20 @@ impl SqliteSink {
 
     async fn store_chunked_payload(
         database: &impl ConnectionTrait,
-        request_id: Uuid,
+        request_seq: i64,
         payloads: Vec<StoredPayload>,
     ) -> Result<(), sea_orm::DbErr> {
+        let kind = payload_parts::kind_seq(database, CHUNK_PATH, None, CHUNK_KIND).await?;
         for (position, payload) in payloads.into_iter().enumerate() {
-            store_blob(database, &payload).await?;
-            database
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, kind, part_id) VALUES (?, 'request', '$bytes', ?, 'chunk', ?)",
-                    [
-                        request_id.to_string().into(),
-                        (position as i64).into(),
-                        payload.id.into(),
-                    ],
-                ))
-                .await?;
+            let blob = store_blob(database, &payload).await?;
+            payload_parts::insert(database, request_seq, kind, position as i64, blob).await?;
         }
         Ok(())
     }
 
     async fn store_semantic_payload(
         database: &impl ConnectionTrait,
-        request_id: Uuid,
+        request_seq: i64,
         payload: SemanticPayload,
     ) -> Result<(), sea_orm::DbErr> {
         let envelope = payload.envelope;
@@ -427,27 +433,17 @@ impl SqliteSink {
         database
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_payload_envelopes (request_id, direction, body_id) VALUES (?, 'request', ?)",
-                [request_id.to_string().into(), envelope.id.into()],
+                "INSERT INTO gateway_payload_envelopes (request_id, direction, body_id) SELECT id, 'request', ? FROM gateway_requests WHERE seq = ?",
+                [envelope.id.into(), request_seq.into()],
             ))
             .await?;
         for part in payload.parts {
-            store_blob(database, &part.payload).await?;
+            let blob = store_blob(database, &part.payload).await?;
             payload_facts::store(database, &part.payload.id, &part.facts).await?;
-            database
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO gateway_payload_part_refs (request_id, direction, path, position, role, kind, part_id) VALUES (?, 'request', ?, ?, ?, ?, ?)",
-                    [
-                        request_id.to_string().into(),
-                        part.path.into(),
-                        part.position.into(),
-                        part.role.into(),
-                        part.kind.into(),
-                        part.payload.id.into(),
-                    ],
-                ))
-                .await?;
+            let kind =
+                payload_parts::kind_seq(database, &part.path, part.role.as_deref(), &part.kind)
+                    .await?;
+            payload_parts::insert(database, request_seq, kind, part.position, blob).await?;
         }
         Ok(())
     }

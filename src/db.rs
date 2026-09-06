@@ -9,6 +9,8 @@ use std::{path::Path, time::Duration};
 
 pub async fn connect(database_url: &str) -> Result<DatabaseConnection> {
     ensure_sqlite_parent(database_url)?;
+    migrate(database_url).await?;
+
     let mut options = ConnectOptions::new(database_url);
     options.max_connections(4);
     options.map_sqlx_sqlite_opts(|options| {
@@ -18,13 +20,35 @@ pub async fn connect(database_url: &str) -> Result<DatabaseConnection> {
             .busy_timeout(Duration::from_secs(30))
     });
 
+    Database::connect(options)
+        .await
+        .context("failed to connect to the database")
+}
+
+/// Rebuilding a table means dropping it, which cascades into its children
+/// unless foreign key enforcement is off for the whole rebuild. `PRAGMA
+/// foreign_keys` applies to one connection, so migrations get a pool of one
+/// and every statement of a migration lands on the connection its pragmas
+/// were set on.
+async fn migrate(database_url: &str) -> Result<()> {
+    let mut options = ConnectOptions::new(database_url);
+    options.max_connections(1);
+    options.map_sqlx_sqlite_opts(|options| {
+        options
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(30))
+    });
     let database = Database::connect(options)
         .await
         .context("failed to connect to the database")?;
     Migrator::up(&database, None)
         .await
         .context("failed to apply database migrations")?;
-    Ok(database)
+    database
+        .close()
+        .await
+        .context("failed to close the migration connection")
 }
 
 /// Isolate reporting queries from gateway connection acquisition. Open only after migrations.
