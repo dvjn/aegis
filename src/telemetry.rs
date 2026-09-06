@@ -1,16 +1,15 @@
 use crate::{
-    compression::{decode_body, decode_brotli_unsniffable},
+    compression::{decode_body, decode_brotli_unsniffable, gzip_if_smaller},
     db::begin_immediate,
     payload_facts::{self, BlobFact},
     pricing::Cost,
     providers::{Provider, Usage},
-    request_metrics, usage_hourly,
+    request_metrics, usage_hourly, usage_json,
 };
 use chrono::{SecondsFormat, TimeDelta, Utc};
-use flate2::{Compression, write::GzEncoder};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, io::Write};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const INTERRUPTED_AFTER: TimeDelta = TimeDelta::minutes(15);
@@ -49,16 +48,7 @@ impl StoredPayload {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        let compressed = encoder
-            .write_all(body)
-            .and_then(|()| encoder.finish())
-            .unwrap_or_default();
-        let (stored, encoding) = if !compressed.is_empty() && compressed.len() < body.len() {
-            (compressed, "gzip")
-        } else {
-            (body.to_vec(), "identity")
-        };
+        let (stored, encoding) = gzip_if_smaller(body);
         Some(Self {
             id,
             original_bytes: body.len() as i64,
@@ -378,11 +368,12 @@ impl SqliteSink {
                 ],
             ))
             .await?;
-        if record.usage.raw_json.is_some() {
+        if let Some(raw_json) = &record.usage.raw_json {
+            let (usage_bytes, usage_encoding) = usage_json::encode(raw_json);
             transaction
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
-                    "INSERT OR REPLACE INTO gateway_usage (request_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, raw_usage_json, cost_nanodollars, cost_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO gateway_usage (request_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, raw_usage_json, raw_usage_encoding, cost_nanodollars, cost_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         record.id.to_string().into(),
                         record.usage.input_tokens.into(),
@@ -390,7 +381,8 @@ impl SqliteSink {
                         record.usage.cache_read_tokens.into(),
                         record.usage.cache_write_tokens.into(),
                         record.usage.reasoning_tokens.into(),
-                        record.usage.raw_json.clone().into(),
+                        usage_bytes.into(),
+                        usage_encoding.into(),
                         record.cost.nanodollars.into(),
                         record.cost.source.as_str().into(),
                     ],
@@ -566,6 +558,57 @@ mod tests {
         assert_eq!(row.try_get::<i64>("", "usages").unwrap(), 1);
         assert_eq!(row.try_get::<i64>("", "metrics").unwrap(), 1);
         assert_eq!(row.try_get::<i64>("", "tokens").unwrap(), 10);
+        db.close_by_ref().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_usage_json_is_stored_compressed_and_reads_back_verbatim() {
+        let fixture = crate::db::tests::FileDatabase::new().await;
+        let db = &fixture.database;
+        let id =
+            crate::request_metrics::tests::started(db, Provider::Anthropic, REQUEST_BODY).await;
+        let raw_json = serde_json::json!({
+            "input_tokens": 10,
+            "attribution": (0..64).map(|index| serde_json::json!({"message": index, "share": 0.5})).collect::<Vec<_>>(),
+        })
+        .to_string();
+        SqliteSink::new(db.clone())
+            .complete(CompletionRecord {
+                id: Uuid::parse_str(&id).unwrap(),
+                status: 200,
+                first_byte_at: None,
+                response_body: b"response",
+                response_bytes: 8,
+                response_truncated: false,
+                client_disconnected: false,
+                usage: &Usage {
+                    input_tokens: Some(10),
+                    raw_json: Some(raw_json.clone()),
+                    ..Default::default()
+                },
+                cost: Cost {
+                    nanodollars: None,
+                    source: crate::pricing::CostSource::Calculated,
+                },
+                error_message: None,
+            })
+            .await
+            .unwrap();
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT raw_usage_encoding, length(raw_usage_json) stored FROM gateway_usage WHERE request_id = ?",
+                [id.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "raw_usage_encoding").unwrap(),
+            "gzip"
+        );
+        assert!(row.try_get::<i64>("", "stored").unwrap() < raw_json.len() as i64);
+        assert_eq!(usage_json::load(db, &id).await.unwrap(), Some(raw_json));
         db.close_by_ref().await.unwrap();
     }
 

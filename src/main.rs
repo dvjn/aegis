@@ -21,6 +21,7 @@ mod telemetry;
 mod tool_usage_hourly;
 mod usage;
 mod usage_hourly;
+mod usage_json;
 mod web;
 
 use anyhow::{Context, Result, bail};
