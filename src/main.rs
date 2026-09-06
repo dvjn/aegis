@@ -141,10 +141,7 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
     let cancellation = CancellationToken::new();
     match pricing::load_effective_map(&database, &config.pricing).await {
         Ok(map) => {
-            pricing::install(map.clone());
-            if let Err(error) = pricing::backfill_costs(&database, &map).await {
-                tracing::warn!(%error, "failed to backfill historical request costs");
-            }
+            pricing::install(map);
         }
         Err(error) => tracing::warn!(%error, "failed to load stored model prices"),
     }

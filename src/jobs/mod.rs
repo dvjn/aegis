@@ -1,3 +1,4 @@
+pub(crate) mod hourly_buckets;
 mod payload_facts_backfill;
 mod payload_resplit;
 mod request_metrics_rollup;
@@ -7,44 +8,55 @@ use crate::telemetry::timestamp;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 use std::time::Instant;
 
-/// Each job reads what the one before it wrote, so the chain stops at the
-/// first failure instead of recording a pass over half-converted rows.
+/// Each job reads what the one before it wrote. Retry prerequisites before
+/// starting the continuous bucket worker; completed jobs are skipped.
 pub fn spawn(database: DatabaseConnection) {
     tokio::spawn(async move {
-        if !run(&database, payload_resplit::NAME, payload_resplit::run).await {
-            return;
+        while !prepare(&database).await {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
-        if !run(
-            &database,
-            requested_model_backfill::NAME,
-            requested_model_backfill::run,
-        )
-        .await
-        {
-            return;
-        }
-        if let Err(error) =
-            crate::pricing::backfill_costs(&database, &crate::pricing::active_map()).await
-        {
-            tracing::error!(%error, "failed to price requests after the model backfill");
-            return;
-        }
-        if !run(
-            &database,
-            payload_facts_backfill::NAME,
-            payload_facts_backfill::run,
-        )
-        .await
-        {
-            return;
-        }
-        run(
-            &database,
-            request_metrics_rollup::NAME,
-            request_metrics_rollup::run,
-        )
-        .await;
+        hourly_buckets::run(&database).await;
     });
+}
+
+async fn prepare(database: &DatabaseConnection) -> bool {
+    if !run(database, payload_resplit::NAME, payload_resplit::run).await {
+        return false;
+    }
+    if !run(
+        database,
+        requested_model_backfill::NAME,
+        requested_model_backfill::run,
+    )
+    .await
+    {
+        return false;
+    }
+    if let Err(error) =
+        crate::pricing::backfill_costs(database, &crate::pricing::active_map()).await
+    {
+        tracing::error!(%error, "failed to price requests after the model backfill");
+        return false;
+    }
+    if !run(
+        database,
+        payload_facts_backfill::NAME,
+        payload_facts_backfill::run,
+    )
+    .await
+    {
+        return false;
+    }
+    if !run(
+        database,
+        request_metrics_rollup::NAME,
+        request_metrics_rollup::run,
+    )
+    .await
+    {
+        return false;
+    }
+    true
 }
 
 async fn run(

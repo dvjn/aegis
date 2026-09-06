@@ -49,7 +49,6 @@ impl MigrationTrait for Migration {
                  ON gateway_requests (id) WHERE tools_aggregated_at IS NULL",
             )
             .await?;
-        crate::tool_usage_hourly::rebuild(connection).await?;
         Ok(())
     }
 

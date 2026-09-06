@@ -11,12 +11,11 @@
 //! that carried it; `gateway_tool_calls_seen` remembers which ids have been
 //! counted. A result borrows the label and skill of the call it answers.
 //!
-//! A request enters its buckets once, when it finishes, and is stamped with
-//! `tools_aggregated_at` so a retried completion cannot count it twice.
-//! `rebuild` throws every bucket and every seen id away and recounts from
-//! the request rows in start order.
+//! A background worker drains completed requests in start order and stamps
+//! `tools_aggregated_at` in the same transaction as their bucket updates.
+//! Reports are eventually consistent while the worker catches up.
 
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, DbErr, QueryResult, Statement};
 
 use crate::telemetry::timestamp;
 use crate::usage_hourly::HOUR_FORMAT;
@@ -52,7 +51,7 @@ const DEFINITIONS_SQL: &str = "INSERT INTO gateway_tool_usage_hourly \
      SELECT user_id, hour, block_type, COALESCE(tool_name, ''), '', \
      COUNT(*), \
      SUM(bytes * 1.0 / facts), \
-     SUM(bytes * cost_per_byte / facts) \
+     SUM(bytes * 1.0 * cost_per_byte / facts) \
      FROM part \
      GROUP BY 1, 2, 3, 4, 5 \
      {upsert}";
@@ -79,6 +78,7 @@ const CALLS_SQL: &str = "{requests}, \
      ROW_NUMBER() OVER (PARTITION BY user_id, block_type, call_id ORDER BY started_at, request_id) appearance \
      FROM part GROUP BY user_id, hour, block_type, call_id, started_at, request_id)";
 
+#[cfg(test)]
 const CALL_BUCKETS_SQL: &str = "INSERT INTO gateway_tool_usage_hourly \
      (user_id, hour, block_type, label, skill, calls, bytes, cost_nanodollars) \
      WITH {calls}, \
@@ -94,16 +94,127 @@ const CALL_BUCKETS_SQL: &str = "INSERT INTO gateway_tool_usage_hourly \
      GROUP BY 1, 2, 3, 4, 5 \
      {upsert}";
 
+#[cfg(test)]
 const CALLS_SEEN_SQL: &str = "INSERT OR IGNORE INTO gateway_tool_calls_seen (user_id, block_type, call_id) \
      WITH {calls} SELECT DISTINCT user_id, block_type, call_id FROM call";
 
 const STAMP_SQL: &str = "UPDATE gateway_requests SET tools_aggregated_at = ? \
      WHERE tools_aggregated_at IS NULL AND completed_at IS NOT NULL {filter}";
 
+/// Read the expensive payload joins on a WAL snapshot, before acquiring the writer.
+/// The worker checks its rebuild generation and the request checkpoint before applying.
+pub struct Prepared {
+    definitions: Vec<QueryResult>,
+    calls: Vec<QueryResult>,
+}
+
+pub async fn prepare(database: &impl ConnectionTrait, id: &str) -> Result<Prepared, DbErr> {
+    let requests = REQUESTS_SQL
+        .replace("{hour}", HOUR_FORMAT)
+        .replace("{filter}", "AND r.id = ?");
+    let definitions = DEFINITIONS_SQL
+        .split_once("WITH ")
+        .expect("definition query has a CTE")
+        .1
+        .replace("{requests}", &requests)
+        .replace("{upsert}", "");
+    let definitions = database
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("WITH {definitions}"),
+            [id.into()],
+        ))
+        .await?;
+    let calls = database
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!(
+                "WITH {} SELECT user_id, hour, block_type, COALESCE(label, ''), \
+                 COALESCE(skill, ''), call_id, CAST(bytes AS REAL), CAST(cost AS REAL) FROM call",
+                CALLS_SQL.replace("{requests}", &requests)
+            ),
+            [id.into()],
+        ))
+        .await?;
+    Ok(Prepared { definitions, calls })
+}
+
+impl Prepared {
+    pub async fn apply(self, database: &impl ConnectionTrait, id: &str) -> Result<(), DbErr> {
+        for row in self.definitions {
+            let values = vec![
+                row.try_get_by_index::<String>(0)?.into(),
+                row.try_get_by_index::<String>(1)?.into(),
+                row.try_get_by_index::<String>(2)?.into(),
+                row.try_get_by_index::<String>(3)?.into(),
+                row.try_get_by_index::<String>(4)?.into(),
+                row.try_get_by_index::<i64>(5)?.into(),
+                row.try_get_by_index::<f64>(6)?.into(),
+                row.try_get_by_index::<f64>(7)?.into(),
+            ];
+            upsert(database, values).await?;
+        }
+        for row in self.calls {
+            let user: String = row.try_get_by_index(0)?;
+            let kind: String = row.try_get_by_index(2)?;
+            let call: String = row.try_get_by_index(5)?;
+            // Deduplicate under the writer lock, including another worker's commits.
+            let new = database.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT OR IGNORE INTO gateway_tool_calls_seen (user_id, block_type, call_id) VALUES (?, ?, ?)",
+                [user.clone().into(), kind.clone().into(), call.into()],
+            )).await?.rows_affected() > 0;
+            upsert(
+                database,
+                vec![
+                    user.into(),
+                    row.try_get_by_index::<String>(1)?.into(),
+                    kind.into(),
+                    row.try_get_by_index::<String>(3)?.into(),
+                    row.try_get_by_index::<String>(4)?.into(),
+                    i64::from(new).into(),
+                    (if new {
+                        row.try_get_by_index::<f64>(6)?
+                    } else {
+                        0.0
+                    })
+                    .into(),
+                    row.try_get_by_index::<f64>(7)?.into(),
+                ],
+            )
+            .await?;
+        }
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                STAMP_SQL.replace("{filter}", "AND id = ?"),
+                [timestamp().into(), id.into()],
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
+async fn upsert(database: &impl ConnectionTrait, values: Vec<sea_orm::Value>) -> Result<(), DbErr> {
+    database
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!(
+                "INSERT INTO gateway_tool_usage_hourly \
+                 (user_id, hour, block_type, label, skill, calls, bytes, cost_nanodollars) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) {UPSERT_SQL}"
+            ),
+            values,
+        ))
+        .await?;
+    Ok(())
+}
+
 /// Adds the tool parts of every finished, not yet counted request to their
 /// buckets, or only the given request's. Returns how many requests were
 /// counted. Run inside the transaction that finished the request so the
 /// buckets and the row agree.
+#[cfg(test)]
 pub async fn aggregate(
     database: &impl ConnectionTrait,
     request_id: Option<&str>,
@@ -149,6 +260,7 @@ pub async fn aggregate(
 
 /// Recounts every bucket from the request rows. Use after anything that
 /// changes a finished request's cost or parts after the fact.
+#[cfg(test)]
 pub async fn rebuild(database: &impl ConnectionTrait) -> Result<u64, DbErr> {
     database
         .execute_unprepared("DELETE FROM gateway_tool_usage_hourly")
@@ -278,6 +390,117 @@ mod tests {
             .unwrap()
             .unwrap();
         row.try_get_by_index(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn background_batches_resume_and_match_a_full_rebuild() {
+        use crate::jobs::hourly_buckets::{batch, invalidate};
+        let db = database().await;
+        for n in 0..35 {
+            let id = format!("r{n:03}");
+            request(&db, &id, if n < 34 { "10:15" } else { "11:15" }, 100).await;
+            part(
+                &db,
+                &id,
+                0,
+                "def",
+                1000,
+                &[("tool_definition", Some("Bash"), None, None)],
+            )
+            .await;
+            part(
+                &db,
+                &id,
+                1,
+                "call",
+                100,
+                &[("tool_use", Some("Bash"), None, Some("call1"))],
+            )
+            .await;
+            part(
+                &db,
+                &id,
+                2,
+                "result",
+                200,
+                &[("tool_result", None, None, Some("call1"))],
+            )
+            .await;
+        }
+        rebuild(&db).await.unwrap();
+        let expected = rows(&db).await;
+        // Simulate the old migration stopping after writing some buckets but
+        // before stamping requests. Initialization must repair, not double them.
+        db.execute_unprepared("UPDATE gateway_requests SET tools_aggregated_at = NULL")
+            .await
+            .unwrap();
+        assert_eq!(batch(&db).await.unwrap(), 32);
+        assert_eq!(
+            batch(&db).await.unwrap(),
+            2,
+            "do not cross the hour boundary"
+        );
+        assert_eq!(batch(&db).await.unwrap(), 1);
+        assert_eq!(batch(&db).await.unwrap(), 0);
+        assert_eq!(rows(&db).await, expected);
+        assert_eq!(seen(&db).await, 2);
+
+        // A later request replaying the same call adds cost, but no extra call.
+        request(&db, "z", "12:15", 50).await;
+        part(
+            &db,
+            "z",
+            0,
+            "call",
+            100,
+            &[("tool_use", Some("Bash"), None, Some("call1"))],
+        )
+        .await;
+        assert_eq!(batch(&db).await.unwrap(), 1);
+        let incremental = rows(&db).await;
+        rebuild(&db).await.unwrap();
+        assert_eq!(rows(&db).await, incremental);
+
+        db.execute_unprepared(
+            "UPDATE gateway_usage SET cost_nanodollars = 200000 WHERE request_id = 'z'",
+        )
+        .await
+        .unwrap();
+        invalidate(&db).await.unwrap();
+        while batch(&db).await.unwrap() > 0 {}
+        let repriced = rows(&db).await;
+        rebuild(&db).await.unwrap();
+        assert_eq!(rows(&db).await, repriced);
+    }
+
+    #[tokio::test]
+    async fn bucket_migrations_do_not_scan_or_stamp_existing_requests() {
+        let db = database().await;
+        Migrator::down(&db, Some(2)).await.unwrap();
+        request(&db, "a", "10:15", 100).await;
+        part(
+            &db,
+            "a",
+            0,
+            "def",
+            1000,
+            &[("tool_definition", Some("Bash"), None, None)],
+        )
+        .await;
+        Migrator::up(&db, None).await.unwrap();
+        assert!(rows(&db).await.is_empty());
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT aggregated_at, tools_aggregated_at FROM gateway_requests WHERE id = 'a'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get_by_index::<Option<String>>(0).unwrap(), None);
+        assert_eq!(row.try_get_by_index::<Option<String>>(1).unwrap(), None);
+        assert_eq!(crate::jobs::hourly_buckets::batch(&db).await.unwrap(), 1);
+        assert_eq!(rows(&db).await.len(), 1);
     }
 
     #[tokio::test]

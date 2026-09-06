@@ -166,6 +166,7 @@ pub async fn backfill_unknown_costs(
             continue;
         }
 
+        let updated_before = stats.updated;
         let transaction = crate::db::begin_immediate(database).await?;
         for (request_id, cost) in updates {
             let result = transaction
@@ -178,6 +179,9 @@ pub async fn backfill_unknown_costs(
                 ))
                 .await?;
             stats.updated += result.rows_affected();
+        }
+        if stats.updated > updated_before {
+            crate::jobs::hourly_buckets::invalidate(&transaction).await?;
         }
         transaction.commit().await?;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
