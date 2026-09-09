@@ -8,7 +8,11 @@ pub static DETECTORS: [Detector; 12] = [
     },
     Detector {
         name: "openai_api_key",
-        pattern: r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{32,}",
+        // The longest issued key body is around 160 characters. The upper bound
+        // caps how much a stray `sk-` inside a long base64 blob can swallow into
+        // a single placeholder; a closing `\b` would not, because `-` is both a
+        // word boundary and a member of the run.
+        pattern: r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{32,256}",
         validate: None,
     },
     Detector {
@@ -141,6 +145,39 @@ mod tests {
         ] {
             assert!(set.find(text).is_empty(), "{text}");
         }
+    }
+
+    fn base64url_run(length: usize) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        (0..length)
+            .map(|index| ALPHABET[index * 31 % 64] as char)
+            .collect()
+    }
+
+    #[test]
+    fn a_vendor_prefix_inside_a_long_blob_swallows_no_more_than_the_bound() {
+        let run = base64url_run(2000);
+        let text = format!("{}-sk-{}", &run[..300], &run[300..]);
+        let set = all();
+        let findings = set.find(&text);
+        assert!(!findings.is_empty(), "the stray prefix still matches");
+        for finding in findings {
+            assert!(finding.secret.len() <= 259, "{}", finding.secret.len());
+        }
+    }
+
+    #[test]
+    fn a_project_key_of_the_full_issued_length_is_still_recognised() {
+        let key = format!("sk-proj-{}", base64url_run(160));
+        let text = format!("export X={key} # done");
+        let set = all();
+        let findings = set.find(&text);
+        let [finding] = findings.as_slice() else {
+            panic!("a full-length project key should produce exactly one finding");
+        };
+        assert_eq!(finding.detector, "openai_api_key");
+        assert_eq!(finding.secret, key);
     }
 
     #[test]
