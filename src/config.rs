@@ -4,7 +4,7 @@ use hkdf::Hkdf;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     env, fs,
     io::{ErrorKind, Write},
     net::SocketAddr,
@@ -23,6 +23,69 @@ pub struct Config {
     pub auth: AuthConfig,
     pub oauth: OAuthConfig,
     pub pricing: PricingConfig,
+    pub guardrails: GuardrailsConfig,
+    pub secret_placeholder_key: [u8; 32],
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GuardrailsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: GuardrailsMode,
+    #[serde(default = "GuardrailConfig::on")]
+    pub secrets: GuardrailConfig,
+    #[serde(default)]
+    pub regex: RegexGuardrailConfig,
+}
+
+/// One guardrail. `detectors` names the subset to run; absent, every detector
+/// of that guardrail runs.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GuardrailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub detectors: Option<Vec<String>>,
+}
+
+impl GuardrailConfig {
+    pub fn on() -> Self {
+        Self {
+            enabled: true,
+            detectors: None,
+        }
+    }
+}
+
+/// User-defined detectors: a name and the regex it runs. Every match is
+/// masked like a secret.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RegexGuardrailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub detectors: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailsMode {
+    #[default]
+    Observe,
+    Mask,
+}
+
+impl std::str::FromStr for GuardrailsMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "observe" => Ok(Self::Observe),
+            "mask" => Ok(Self::Mask),
+            other => bail!("guardrails mode {other:?} must be observe or mask"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -105,6 +168,8 @@ struct FileConfig {
     registration_enabled: bool,
     #[serde(default)]
     pricing: PricingConfig,
+    #[serde(default)]
+    guardrails: GuardrailsConfig,
 }
 
 impl Default for FileConfig {
@@ -117,6 +182,7 @@ impl Default for FileConfig {
             public_url: None,
             registration_enabled: false,
             pricing: PricingConfig::default(),
+            guardrails: GuardrailsConfig::default(),
         }
     }
 }
@@ -170,6 +236,22 @@ impl Config {
         }
         validate_pricing(&pricing)?;
 
+        let mut guardrails = file.guardrails;
+        if let Some(enabled) = optional_var("GUARDRAILS_ENABLED")? {
+            guardrails.enabled = enabled
+                .parse()
+                .context("GUARDRAILS_ENABLED must be true or false")?;
+        }
+        if let Some(mode) = optional_var("GUARDRAILS_MODE")? {
+            guardrails.mode = mode.parse()?;
+        }
+        if let Some(enabled) = optional_var("GUARDRAILS_SECRETS_ENABLED")? {
+            guardrails.secrets.enabled = enabled
+                .parse()
+                .context("GUARDRAILS_SECRETS_ENABLED must be true or false")?;
+        }
+        validate_detectors(&guardrails)?;
+
         let smtp = smtp_config()?;
         let root_key = root_key()?;
         Ok(Self {
@@ -194,6 +276,8 @@ impl Config {
                 key_id: "v1".into(),
             },
             pricing,
+            guardrails,
+            secret_placeholder_key: derive_key(&root_key, b"aegis/v1/secret-placeholder"),
         })
     }
 }
@@ -380,6 +464,54 @@ fn validate_pricing(pricing: &PricingConfig) -> Result<()> {
     Ok(())
 }
 
+/// A misspelled detector would silently mask nothing, so a name that no
+/// guardrail defines is refused at startup.
+fn validate_detectors(guardrails: &GuardrailsConfig) -> Result<()> {
+    if let Some(names) = &guardrails.secrets.detectors {
+        let known = crate::policies::detect::names(&crate::policies::secrets::DETECTORS);
+        for name in names {
+            if !known.contains(&name.as_str()) {
+                bail!("guardrails secrets detector {name:?} is unknown, expected one of {known:?}");
+            }
+        }
+    }
+    validate_regex_detectors(&guardrails.regex)
+}
+
+/// A regex detector name becomes a capture group and a placeholder, so it has
+/// to be a snake_case identifier that no secrets detector already uses.
+fn validate_regex_detectors(regex: &RegexGuardrailConfig) -> Result<()> {
+    let built_in = crate::policies::detect::names(&crate::policies::secrets::DETECTORS);
+    for (name, pattern) in &regex.detectors {
+        if !is_snake_case_identifier(name) {
+            bail!(
+                "guardrails regex detector {name:?} must be a lowercase snake_case identifier such as \"internal_token\""
+            );
+        }
+        if built_in.contains(&name.as_str()) {
+            bail!(
+                "guardrails regex detector {name:?} collides with the built-in secrets detector of the same name"
+            );
+        }
+        regex::Regex::new(pattern).with_context(|| {
+            format!("guardrails regex detector {name:?} pattern {pattern:?} does not compile")
+        })?;
+    }
+    crate::policies::detect::DetectorSet::regex(&regex.detectors)
+        .context("guardrails regex detectors do not compile together")?;
+    Ok(())
+}
+
+fn is_snake_case_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +601,56 @@ mod tests {
             ..PricingConfig::default()
         };
         assert!(validate_pricing(&never_refreshed).is_err());
+    }
+
+    #[test]
+    fn guardrails_default_to_disabled_observation_and_parse_mask_mode() {
+        let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
+        assert!(!config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, GuardrailsMode::Observe);
+
+        let config: FileConfig = toml::from_str(
+            r#"
+            [guardrails]
+            enabled = true
+            mode = "mask"
+            "#,
+        )
+        .expect("configuration should parse");
+        assert!(config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, GuardrailsMode::Mask);
+        assert!(toml::from_str::<FileConfig>("[guardrails]\nmode = \"block\"").is_err());
+        assert!("block".parse::<GuardrailsMode>().is_err());
+    }
+
+    #[test]
+    fn regex_detectors_parse_and_are_refused_when_misnamed_or_broken() {
+        let parsed = |detectors: &str| {
+            let config: FileConfig = toml::from_str(&format!(
+                "[guardrails.regex]\nenabled = true\n[guardrails.regex.detectors]\n{detectors}"
+            ))
+            .expect("configuration should parse");
+            validate_detectors(&config.guardrails)
+        };
+        let empty: FileConfig = toml::from_str("").unwrap();
+        assert!(!empty.guardrails.regex.enabled);
+        assert!(empty.guardrails.regex.detectors.is_empty());
+
+        let ok =
+            parsed("internal_token = '\\bint_[a-z0-9]{32}\\b'\nemployee_id = '\\bEMP-\\d{6}\\b'");
+        assert!(ok.is_ok(), "{ok:?}");
+
+        let misnamed = parsed("Internal-Token = 'x'").unwrap_err().to_string();
+        assert!(misnamed.contains("\"Internal-Token\""), "{misnamed}");
+        assert!(misnamed.contains("snake_case"), "{misnamed}");
+
+        let collision = parsed("github_token = 'x'").unwrap_err().to_string();
+        assert!(collision.contains("\"github_token\""), "{collision}");
+        assert!(collision.contains("built-in secrets"), "{collision}");
+
+        let broken = format!("{:#}", parsed("open_group = '('").unwrap_err());
+        assert!(broken.contains("\"open_group\""), "{broken}");
+        assert!(broken.contains("does not compile"), "{broken}");
     }
 
     #[test]

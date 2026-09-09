@@ -1,0 +1,63 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","object":"response","created_at":1788255572,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.6-luna","moderation":null,"output":[],"parallel_tool_calls":false,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"lorem ipsum dolor sit amet consectet","prompt_cache_retention":"24h","reasoning":{"context":"all_turns","effort":"low","mode":"standard","summary":null},"safety_identifier":"lorem ipsum dolor sit amet co","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","object":"response","created_at":1788255572,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.6-luna","moderation":null,"output":[],"parallel_tool_calls":false,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"lorem ipsum dolor sit amet consectet","prompt_cache_retention":"24h","reasoning":{"context":"all_turns","effort":"low","mode":"standard","summary":null},"safety_identifier":"lorem ipsum dolor sit amet co","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"rs_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","type":"reasoning","content":[],"encrypted_content":"ENCRYPTED_REASONING_PLACEHOLDER","internal_chat_message_metadata_passthrough":{"turn_id":"00000000-0000-7000-8000-000000000000"},"summary":[],"metadata":{"turn_id":"00000000-0000-7000-8000-000000000000"}},"output_index":0,"sequence_number":2}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"rs_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","type":"reasoning","content":[],"encrypted_content":"ENCRYPTED_REASONING_PLACEHOLDER","internal_chat_message_metadata_passthrough":{"turn_id":"00000000-0000-7000-8000-000000000000"},"summary":[],"metadata":{"turn_id":"00000000-0000-7000-8000-000000000000"}},"output_index":0,"sequence_number":3}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","type":"message","status":"in_progress","content":[],"internal_chat_message_metadata_passthrough":{"turn_id":"00000000-0000-7000-8000-000000000000"},"phase":"commentary","role":"assistant","metadata":{"turn_id":"00000000-0000-7000-8000-000000000000"}},"output_index":1,"sequence_number":4}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","output_index":1,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":5}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"l","item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","logprobs":[],"obfuscation":"lorem ipsum dol","output_index":1,"sequence_number":6}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"lo","item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","logprobs":[],"obfuscation":"lorem ipsum do","output_index":1,"sequence_number":7}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"lorem ","item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","logprobs":[],"obfuscation":"lorem ipsu","output_index":1,"sequence_number":8}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"lore","item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","logprobs":[],"obfuscation":"lorem ipsum ","output_index":1,"sequence_number":9}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","logprobs":[],"output_index":1,"sequence_number":21,"text":"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod "}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","output_index":1,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod "},"sequence_number":22}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod "}],"internal_chat_message_metadata_passthrough":{"create_time":1788255572.807621,"turn_id":"00000000-0000-7000-8000-000000000000"},"phase":"commentary","role":"assistant","metadata":{"turn_id":"00000000-0000-7000-8000-000000000000"}},"output_index":1,"sequence_number":23}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","type":"custom_tool_call","status":"in_progress","call_id":"call_0123456789abcdefghijklmn","input":"","internal_chat_message_metadata_passthrough":{"turn_id":"00000000-0000-7000-8000-000000000000"},"name":"exec","metadata":{"turn_id":"00000000-0000-7000-8000-000000000000"}},"output_index":2,"sequence_number":24}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","delta":"lorem","item_id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","obfuscation":"lorem ipsum","output_index":2,"sequence_number":25}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","delta":"lo","item_id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","obfuscation":"lorem ipsum do","output_index":2,"sequence_number":26}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","delta":"lo","item_id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","obfuscation":"lorem ipsum do","output_index":2,"sequence_number":27}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","delta":"lorem ","item_id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","obfuscation":"lorem ipsu","output_index":2,"sequence_number":28}
+
+event: response.custom_tool_call_input.done
+data: {"type":"response.custom_tool_call_input.done","input":"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua lorem ipsum dolor sit amet consectetur adipisc","item_id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","output_index":2,"sequence_number":80}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"ctc_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","type":"custom_tool_call","status":"completed","call_id":"call_0123456789abcdefghijklmn","input":"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua lorem ipsum dolor sit amet consectetur adipisc","internal_chat_message_metadata_passthrough":{"create_time":1788255572.807621,"turn_id":"00000000-0000-7000-8000-000000000000"},"name":"exec","metadata":{"turn_id":"00000000-0000-7000-8000-000000000000"}},"output_index":2,"sequence_number":81}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd","object":"response","created_at":1788255572,"status":"completed","background":false,"completed_at":1788255575,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.6-luna","moderation":null,"output":[],"parallel_tool_calls":false,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"lorem ipsum dolor sit amet consectet","prompt_cache_retention":"24h","reasoning":{"context":"all_turns","effort":"low","mode":"standard","summary":null},"safety_identifier":"lorem ipsum dolor sit amet co","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"attribution":{"items":{"at_648d75eb-4b7e-5719-bdc6-27ea390d0b98":{"cache_write_tokens":0,"cached_tokens":4223,"input_tokens":4223,"output_tokens":0},"msg_8b16c83f-6ea3-5091-9666-52a35a3cba57":{"cache_write_tokens":0,"cached_tokens":3556,"content":[{"cache_write_tokens":0,"cached_tokens":3556,"input_tokens":3556,"output_tokens":0}],"input_tokens":3556,"output_tokens":0},"msg_01a05c50-59ea-7fb1-88d0-b66841c5e6d6":{"cache_write_tokens":0,"cached_tokens":6301,"content":[{"cache_write_tokens":0,"cached_tokens":3331,"input_tokens":3331,"output_tokens":0},{"cache_write_tokens":0,"cached_tokens":1800,"input_tokens":1800,"output_tokens":0},{"cache_write_tokens":0,"cached_tokens":1170,"input_tokens":1186,"output_tokens":0},{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":179,"output_tokens":0},{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":145,"output_tokens":0},{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":209,"output_tokens":0}],"input_tokens":6850,"output_tokens":0},"msg_01a05c50-59ea-7fb1-88d0-b6789e73729b":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":222,"output_tokens":0}],"input_tokens":222,"output_tokens":0},"msg_01a05c50-5aba-7262-9466-12d371eba1fb":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":5,"output_tokens":0}],"input_tokens":5,"output_tokens":0},"msg_0a1929c99c9a1ed1016a969bc0436c87d0905b998c2dd3a588":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":16,"output_tokens":0}],"input_tokens":16,"output_tokens":0},"msg_01a05c56-8b3e-75b3-b6a2-230a6b06cec5":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":15,"output_tokens":0}],"input_tokens":15,"output_tokens":0},"rs_0a1929c99c9a1ed1016a969d55591887d0aec602c7ed5d6ca8":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":2,"output_tokens":43},"msg_0a1929c99c9a1ed1016a969d562a8487d0a186fe938b49e147":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":0,"output_tokens":22}],"input_tokens":0,"output_tokens":22},"ctc_0a1929c99c9a1ed1016a969d56a52087d0868cd0c64da4ece0":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":0,"output_tokens":67}}},"input_tokens":14889,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":14080},"output_tokens":132,"output_tokens_details":{"reasoning_tokens":43},"total_tokens":15021},"user":null,"metadata":{}},"sequence_number":82}
+

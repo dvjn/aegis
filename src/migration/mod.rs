@@ -20,6 +20,8 @@ pub(crate) mod m20260906_000018_gateway_usage_hourly;
 pub(crate) mod m20260906_000021_tool_usage_hourly;
 mod m20260906_000022_compress_usage_json;
 mod m20260906_000023_integer_payload_keys;
+mod m20260908_000024_policy_evaluations;
+mod m20260909_000025_guardrails_hourly;
 
 pub struct Migrator;
 
@@ -47,6 +49,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260906_000021_tool_usage_hourly::Migration),
             Box::new(m20260906_000022_compress_usage_json::Migration),
             Box::new(m20260906_000023_integer_payload_keys::Migration),
+            Box::new(m20260908_000024_policy_evaluations::Migration),
+            Box::new(m20260909_000025_guardrails_hourly::Migration),
         ]
     }
 }

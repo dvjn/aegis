@@ -9,6 +9,7 @@
 
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
+use crate::guardrails_hourly;
 use crate::telemetry::timestamp;
 
 pub const HOUR_FORMAT: &str = "%Y-%m-%dT%H:00:00.000Z";
@@ -72,6 +73,7 @@ pub async fn aggregate(
             id.clone(),
         ))
         .await?;
+    guardrails_hourly::aggregate(database, request_id).await?;
     let stamped = database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -89,6 +91,7 @@ pub async fn rebuild(database: &impl ConnectionTrait) -> Result<u64, DbErr> {
     database
         .execute_unprepared("DELETE FROM gateway_usage_hourly")
         .await?;
+    guardrails_hourly::rebuild(database).await?;
     database
         .execute_unprepared("UPDATE gateway_requests SET aggregated_at = NULL")
         .await?;

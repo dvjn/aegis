@@ -4,7 +4,7 @@ use crate::{db::begin_immediate, tool_usage_hourly, usage_hourly};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 use std::time::{Duration, Instant};
 
-const GENERATION: &str = "hourly_buckets_generation_v1";
+const GENERATION: &str = "hourly_buckets_generation_v2";
 const BATCH: usize = 32;
 
 /// Invalidate in the same transaction that changes historical prices. The
@@ -44,6 +44,9 @@ async fn initialize(database: &DatabaseConnection) -> Result<(), DbErr> {
             "DELETE FROM gateway_tool_usage_hourly",
             "DELETE FROM gateway_tool_calls_seen",
             "DELETE FROM gateway_usage_hourly",
+            "DELETE FROM gateway_guardrails_hourly",
+            "DELETE FROM gateway_guardrail_detectors_hourly",
+            "DELETE FROM gateway_guardrail_values_hourly",
             "UPDATE gateway_requests SET aggregated_at = NULL, tools_aggregated_at = NULL",
         ] {
             tx.execute_unprepared(sql).await?;

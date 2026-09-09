@@ -3,6 +3,9 @@ use anyhow::Context;
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
     config::{ProviderConfig, ProviderKind},
+    policies::{
+        Decision, Pipeline, PolicyError, PolicyFailure, RequestContext, restore::StreamRestorer,
+    },
     pricing::cost,
     providers::{Provider, extract_usage, requested_model},
     request_id::RequestId,
@@ -14,7 +17,7 @@ mod http;
 use axum::{
     body::{Body, Bytes, to_bytes},
     extract::Request,
-    http::{HeaderMap, HeaderName, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -25,6 +28,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const BLOCKING_POLICY_BYTES: usize = 256 * 1024;
+const POLICY_HEADER: HeaderName = HeaderName::from_static("x-aegis-policy");
 
 pub(crate) fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
@@ -47,6 +52,7 @@ pub struct Gateway {
     client: reqwest::Client,
     sink: SqliteSink,
     keys: KeyStore,
+    policies: Pipeline,
     providers: Arc<HashMap<String, ProviderTarget>>,
     max_capture_bytes: usize,
 }
@@ -79,6 +85,7 @@ impl Gateway {
     pub fn new(
         sink: SqliteSink,
         keys: KeyStore,
+        policies: Pipeline,
         providers: Vec<ProviderConfig>,
         max_capture_bytes: usize,
     ) -> anyhow::Result<Self> {
@@ -111,6 +118,7 @@ impl Gateway {
             client,
             sink,
             keys,
+            policies,
             providers: Arc::new(providers),
             max_capture_bytes,
         })
@@ -170,6 +178,31 @@ impl Gateway {
             Err(error) => return Ok(authentication_error(error)),
         };
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
+        let model = requested_model(&body);
+        let context = RequestContext {
+            body: body.clone(),
+            content_encoding: parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        };
+        let decision = match self.evaluate_policies(context).await? {
+            Ok(decision) => decision,
+            Err(failure) => return Ok(policy_failure(failure)),
+        };
+        let transformed = decision.body.as_ptr() != body.as_ptr();
+        let Decision {
+            body,
+            evaluations,
+            restore,
+        } = decision;
+        let mut restorer =
+            (!restore.replacements.is_empty()).then(|| StreamRestorer::new(restore.replacements));
+        if transformed {
+            parts.headers.remove(header::CONTENT_ENCODING);
+            parts.headers.remove(header::CONTENT_LENGTH);
+        }
         let endpoint = parts
             .uri
             .path_and_query()
@@ -178,7 +211,6 @@ impl Gateway {
         let route_prefix = format!("/providers/{provider_id}");
         let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
         let upstream_url = target.upstream_url(upstream_path);
-        let model = requested_model(&body);
         let span = tracing::Span::current();
         span.record("user_id", tracing::field::display(&authenticated.user_id));
         span.record("key_id", tracing::field::display(&authenticated.id));
@@ -199,6 +231,9 @@ impl Gateway {
                 requested_model: model.as_deref(),
                 request_body: &body,
             })
+            .await?;
+        self.sink
+            .record_evaluations(capture_id, &evaluations)
             .await?;
 
         let mut outbound = self
@@ -240,12 +275,16 @@ impl Gateway {
                         if first_byte_at.is_none() {
                             first_byte_at = Some(timestamp());
                         }
-                        response_bytes = response_bytes.saturating_add(chunk.len());
                         let remaining = max_capture_bytes.saturating_sub(capture.len());
                         if remaining > 0 {
                             capture.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                         }
-                        truncated |= response_bytes > max_capture_bytes;
+                        truncated |= chunk.len() > remaining;
+                        let chunk = match &mut restorer {
+                            Some(restorer) => Bytes::from(restorer.rewrite_chunk(&chunk)),
+                            None => chunk,
+                        };
+                        response_bytes = response_bytes.saturating_add(chunk.len());
                         if sender.send(Ok(chunk)).await.is_err() {
                             disconnected = true;
                             break;
@@ -256,6 +295,16 @@ impl Gateway {
                         stream_error = Some(message.clone());
                         let _ = sender.send(Err(io::Error::other(message))).await;
                         break;
+                    }
+                }
+            }
+
+            if let Some(restorer) = &mut restorer {
+                let tail = restorer.finish();
+                if !tail.is_empty() && !disconnected && stream_error.is_none() {
+                    response_bytes = response_bytes.saturating_add(tail.len());
+                    if sender.send(Ok(Bytes::from(tail))).await.is_err() {
+                        disconnected = true;
                     }
                 }
             }
@@ -310,6 +359,19 @@ impl Gateway {
     }
 }
 
+impl Gateway {
+    async fn evaluate_policies(
+        &self,
+        context: RequestContext,
+    ) -> anyhow::Result<Result<Decision, PolicyFailure>> {
+        if context.body.len() <= BLOCKING_POLICY_BYTES {
+            return Ok(self.policies.evaluate(context));
+        }
+        let policies = self.policies.clone();
+        Ok(tokio::task::spawn_blocking(move || policies.evaluate(context)).await?)
+    }
+}
+
 fn authentication_error(error: AuthenticationError) -> Response {
     let status = match error {
         AuthenticationError::ProviderNotAllowed(_) => StatusCode::FORBIDDEN,
@@ -327,6 +389,36 @@ fn authentication_error(error: AuthenticationError) -> Response {
         })),
     )
         .into_response()
+}
+
+fn policy_failure(failure: PolicyFailure) -> Response {
+    let (status, code, message) = match &failure.error {
+        PolicyError::InvalidRequest(message) => {
+            tracing::warn!(error = %failure, "request policy rejected the request body");
+            (StatusCode::BAD_REQUEST, "invalid_request", message.clone())
+        }
+        PolicyError::Internal(_) => {
+            tracing::error!(error = %failure, "request policy failed; refusing to forward");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "policy_failure",
+                "a request policy failed, so the request was not forwarded".to_owned(),
+            )
+        }
+    };
+    let mut response = (
+        status,
+        axum::Json(json!({
+            "error": code,
+            "policy": failure.policy,
+            "message": message
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(POLICY_HEADER, HeaderValue::from_static("failed"));
+    response
 }
 
 fn filtered_headers(headers: &HeaderMap) -> HeaderMap {
@@ -429,5 +521,363 @@ mod tests {
             local.upstream_url("/backend-api/codex/responses"),
             "http://127.0.0.1:4000/backend-api/codex/responses"
         );
+    }
+}
+
+#[cfg(test)]
+mod guardrail_tests {
+    use super::Gateway;
+    use crate::{
+        api_keys::{API_KEY_HEADER, KeyStore},
+        compression::decode_body,
+        config::{
+            GuardrailConfig, GuardrailsConfig, GuardrailsMode, ProviderConfig, ProviderKind,
+            RegexGuardrailConfig,
+        },
+        migration::Migrator,
+        policies::{
+            mask::{PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX},
+            pipeline,
+            sse::{Frame, FrameParser},
+        },
+        telemetry::SqliteSink,
+    };
+    use axum::{
+        Router,
+        body::{Body, Bytes, to_bytes},
+        extract::{Request, State},
+        http::{HeaderMap, StatusCode, header},
+        response::Response,
+        routing::post,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use sea_orm_migration::MigratorTrait;
+    use serde_json::json;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    const SECRET: &str = "sk-ant-api03-TESTONLYTESTONLYTESTONLYTESTONLYTEST0000";
+    const PROVIDER_ID: &str = "claude";
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        SplitStream,
+        Json,
+    }
+
+    #[derive(Clone)]
+    struct Upstream {
+        received: Arc<Mutex<Vec<Bytes>>>,
+        reply: Reply,
+    }
+
+    struct Harness {
+        gateway: Gateway,
+        database: DatabaseConnection,
+        api_key: String,
+        received: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    fn request_body() -> String {
+        json!({
+            "model": "claude-test",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": format!("run export ANTHROPIC_API_KEY={SECRET}")}]
+        })
+        .to_string()
+    }
+
+    fn placeholder_in(text: &str) -> Option<&str> {
+        let start = text.find(PLACEHOLDER_PREFIX)?;
+        let end = start + text[start..].find(PLACEHOLDER_SUFFIX)? + PLACEHOLDER_SUFFIX.len();
+        text.get(start..end)
+    }
+
+    fn text_delta(text: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            })
+        )
+    }
+
+    async fn respond(State(upstream): State<Upstream>, body: Bytes) -> Response {
+        upstream.received.lock().unwrap().push(body.clone());
+        let text = String::from_utf8_lossy(&body);
+        let echoed = placeholder_in(&text).unwrap_or(SECRET).to_owned();
+        match upstream.reply {
+            Reply::SplitStream => {
+                let (head, tail) = echoed.split_at(echoed.len() / 2);
+                let stream = format!(
+                    "{}{}{}event: content_block_stop\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                    text_delta("token "),
+                    text_delta(head),
+                    text_delta(tail),
+                    json!({"type": "content_block_stop", "index": 0}),
+                    json!({"type": "message_stop"}),
+                );
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(stream))
+                    .unwrap()
+            }
+            Reply::Json => Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "msg_0123",
+                        "type": "message",
+                        "content": [{"type": "text", "text": format!("token {echoed}")}],
+                        "usage": {"input_tokens": 3, "output_tokens": 2}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        }
+    }
+
+    async fn serve_upstream(reply: Reply) -> (String, Arc<Mutex<Vec<Bytes>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route("/v1/messages", post(respond))
+            .with_state(Upstream {
+                received: received.clone(),
+                reply,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{address}"), received)
+    }
+
+    async fn harness(mode: GuardrailsMode, reply: Reply) -> Harness {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&database, None).await.unwrap();
+        let user = Uuid::now_v7();
+        database.execute_unprepared(&format!("INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('{user}','user@example.com','user@example.com','user','active',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")).await.unwrap();
+        let keys = KeyStore::new(database.clone());
+        let (_, api_key) = keys
+            .create(user, "guardrails", &[PROVIDER_ID.into()])
+            .await
+            .unwrap();
+        let (base_url, received) = serve_upstream(reply).await;
+        let guardrails = GuardrailsConfig {
+            enabled: true,
+            mode,
+            secrets: GuardrailConfig {
+                enabled: true,
+                detectors: None,
+            },
+            regex: RegexGuardrailConfig::default(),
+        };
+        let gateway = Gateway::new(
+            SqliteSink::new(database.clone()),
+            keys,
+            pipeline(&guardrails, [7; 32]),
+            vec![ProviderConfig {
+                id: PROVIDER_ID.into(),
+                kind: ProviderKind::ClaudeSubscription { base_url },
+            }],
+            1024 * 1024,
+        )
+        .unwrap();
+        Harness {
+            gateway,
+            database,
+            api_key,
+            received,
+        }
+    }
+
+    impl Harness {
+        async fn send(&self) -> (StatusCode, HeaderMap, String) {
+            let request = Request::post(format!("/providers/{PROVIDER_ID}/v1/messages"))
+                .header(API_KEY_HEADER, &self.api_key)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request_body()))
+                .unwrap();
+            let response = self.gateway.forward(PROVIDER_ID, request).await;
+            let (parts, body) = response.into_parts();
+            let body = to_bytes(body, 1024 * 1024).await.unwrap();
+            self.wait_for_completion().await;
+            (
+                parts.status,
+                parts.headers,
+                String::from_utf8(body.to_vec()).unwrap(),
+            )
+        }
+
+        async fn wait_for_completion(&self) {
+            for _ in 0..200 {
+                let completed: i64 = self
+                    .database
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT COUNT(*) completed FROM gateway_requests WHERE completed_at IS NOT NULL",
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "completed")
+                    .unwrap();
+                if completed == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the capture never completed");
+        }
+
+        fn upstream_body(&self) -> String {
+            let received = self.received.lock().unwrap();
+            let [body] = received.as_slice() else {
+                panic!("the upstream should see exactly one request");
+            };
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+
+        async fn stored_bodies(&self) -> Vec<String> {
+            self.decoded_blobs("SELECT body FROM gateway_payload_blobs")
+                .await
+        }
+
+        async fn stored_response(&self) -> String {
+            let bodies = self
+                .decoded_blobs(
+                    "SELECT blobs.body FROM gateway_payload_blobs blobs JOIN gateway_payloads payloads ON payloads.response_body_id = blobs.id",
+                )
+                .await;
+            let [body] = bodies.as_slice() else {
+                panic!("exactly one response body should be stored");
+            };
+            body.clone()
+        }
+
+        async fn decoded_blobs(&self, sql: &str) -> Vec<String> {
+            self.database
+                .query_all_raw(Statement::from_string(DbBackend::Sqlite, sql))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    let body: Vec<u8> = row.try_get("", "body").unwrap();
+                    String::from_utf8(decode_body(&body)).unwrap()
+                })
+                .collect()
+        }
+
+        async fn evaluation(&self) -> (String, i64) {
+            let row = self
+                .database
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT outcome, match_count FROM policy_evaluations WHERE policy = 'secrets'",
+                ))
+                .await
+                .unwrap()
+                .expect("the secrets guardrail records one evaluation");
+            (
+                row.try_get("", "outcome").unwrap(),
+                row.try_get("", "match_count").unwrap(),
+            )
+        }
+    }
+
+    fn assert_masked_everywhere_but_the_client(harness: &Harness, stored: &[String]) {
+        let upstream = harness.upstream_body();
+        let placeholder = placeholder_in(&upstream).expect("the upstream sees a placeholder");
+        assert!(placeholder.starts_with("AEGIS_MASKED_ANTHROPIC_API_KEY_"));
+        assert_eq!(
+            placeholder.len(),
+            "AEGIS_MASKED_ANTHROPIC_API_KEY_".len() + 22 + 4
+        );
+        assert!(!upstream.contains(SECRET));
+        assert!(!stored.is_empty());
+        for body in stored {
+            assert!(
+                !body.contains(SECRET),
+                "stored body leaks the secret: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_split_stream_is_restored_for_the_client_and_stored_with_the_placeholder() {
+        let harness = harness(GuardrailsMode::Mask, Reply::SplitStream).await;
+
+        let (status, _headers, client_body) = harness.send().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(client_body.contains(SECRET), "{client_body}");
+        assert!(!client_body.contains(PLACEHOLDER_PREFIX), "{client_body}");
+        assert!(
+            client_body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+        );
+
+        let stored = harness.stored_bodies().await;
+        assert_masked_everywhere_but_the_client(&harness, &stored);
+        let response = harness.stored_response().await;
+        let upstream = harness.upstream_body();
+        let placeholder = placeholder_in(&upstream).unwrap();
+        assert_eq!(delta_text(&response), format!("token {placeholder}"));
+        assert_eq!(delta_text(&client_body), format!("token {SECRET}"));
+        assert_eq!(harness.evaluation().await, ("transform".to_owned(), 1));
+    }
+
+    fn delta_text(stream: &str) -> String {
+        let mut parser = FrameParser::default();
+        let frames = parser.push(stream.as_bytes());
+        assert!(
+            parser.finish().is_empty(),
+            "stream ends on a frame boundary"
+        );
+        frames
+            .iter()
+            .filter_map(Frame::data)
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .filter_map(|data| data["delta"]["text"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_json_reply_is_restored_for_the_client_and_stored_with_the_placeholder() {
+        let harness = harness(GuardrailsMode::Mask, Reply::Json).await;
+
+        let (status, _headers, client_body) = harness.send().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let document: serde_json::Value = serde_json::from_str(&client_body).unwrap();
+        assert_eq!(
+            document["content"][0]["text"].as_str().unwrap(),
+            format!("token {SECRET}")
+        );
+
+        let stored = harness.stored_bodies().await;
+        assert_masked_everywhere_but_the_client(&harness, &stored);
+        let response = harness.stored_response().await;
+        let upstream = harness.upstream_body();
+        assert!(response.contains(placeholder_in(&upstream).unwrap()));
+        assert!(response.contains(r#""output_tokens":2"#));
+    }
+
+    #[tokio::test]
+    async fn observe_mode_forwards_the_body_unchanged_and_records_the_match() {
+        let harness = harness(GuardrailsMode::Observe, Reply::Json).await;
+
+        let (status, _headers, client_body) = harness.send().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(harness.upstream_body(), request_body());
+        assert!(client_body.contains(SECRET));
+        assert_eq!(harness.evaluation().await, ("allow".to_owned(), 1));
     }
 }
