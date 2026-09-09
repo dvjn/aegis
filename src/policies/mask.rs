@@ -569,6 +569,124 @@ mod tests {
         assert_eq!(verdict.findings.match_count, 1);
     }
 
+    const REASONING_ID: &str = "rs_0ec282262dc0e3bb016aa1809b0f0087d09c419d9e786d1541";
+    const BASE64_ALPHABET: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const BASE64URL_ALPHABET: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    fn deterministic_blob(seed: u64, length: usize, alphabet: &str) -> String {
+        let symbols: Vec<char> = alphabet.chars().collect();
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                symbols[(state >> 33) as usize % symbols.len()]
+            })
+            .collect()
+    }
+
+    fn responses_body(encrypted_content: &str) -> Bytes {
+        Bytes::from(
+            json!({
+                "model": "gpt-5",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": REASONING_ID,
+                        "encrypted_content": encrypted_content,
+                        "summary": [],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                ],
+            })
+            .to_string(),
+        )
+    }
+
+    fn reasoning_item(body: &Bytes) -> Value {
+        serde_json::from_slice::<Value>(body).expect("the masked body is JSON")["input"][0].clone()
+    }
+
+    fn reasoning_blobs() -> [(&'static str, String); 4] {
+        [
+            (
+                "standard base64, trailing padding",
+                format!("{}==", deterministic_blob(1, 510, BASE64_ALPHABET)),
+            ),
+            (
+                "standard base64, no padding",
+                deterministic_blob(2, 684, BASE64_ALPHABET),
+            ),
+            (
+                "base64url with - and _",
+                deterministic_blob(3, 640, BASE64URL_ALPHABET),
+            ),
+            (
+                "base64url, single = pad",
+                format!("{}=", deterministic_blob(4, 767, BASE64URL_ALPHABET)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn responses_reasoning_items_pass_through_untouched_unless_a_detector_matches() {
+        for (shape, blob) in reasoning_blobs() {
+            let body = responses_body(&blob);
+            let verdict = policy(GuardrailsMode::Mask)
+                .evaluate(&context(&body))
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+            assert!(
+                matches!(verdict.outcome, Outcome::Allow),
+                "{shape}: no secrets detector matches an opaque base64 blob"
+            );
+            assert_eq!(verdict.findings.match_count, 0, "{shape}");
+        }
+    }
+
+    /// `input` is a scanned field, so nothing shields `encrypted_content`: a blob
+    /// whose bytes happen to spell a vendor prefix is rewritten like any secret.
+    #[test]
+    fn a_vendor_prefix_inside_encrypted_content_is_masked_and_corrupts_the_blob() {
+        let head = deterministic_blob(5, 300, BASE64URL_ALPHABET);
+        let tail = deterministic_blob(6, 200, BASE64URL_ALPHABET);
+        let blob = format!("{head}-sk-{tail}");
+        let body = responses_body(&blob);
+        let policy = policy(GuardrailsMode::Mask);
+        let verdict = policy.evaluate(&context(&body)).expect("JSON evaluates");
+        let Outcome::Transform { body: masked, .. } = verdict.outcome else {
+            panic!("an embedded vendor prefix must transform the body");
+        };
+        assert_eq!(
+            verdict.findings.metadata["detectors"],
+            json!({"openai_api_key": 1})
+        );
+        let item = reasoning_item(&masked);
+        let content = item["encrypted_content"].as_str().unwrap();
+        assert!(content.starts_with(&head));
+        assert!(!content.contains(&tail), "the blob tail is gone");
+        assert!(content.contains("AEGIS_MASKED_OPENAI_API_KEY_"));
+        assert_eq!(item["id"], REASONING_ID, "only the blob was rewritten");
+    }
+
+    #[test]
+    fn the_reasoning_item_id_matches_no_secrets_detector() {
+        let text = format!("id {REASONING_ID} here");
+        assert!(
+            policy(GuardrailsMode::Mask)
+                .detectors
+                .find(&text)
+                .is_empty(),
+            "{REASONING_ID}"
+        );
+    }
+
     #[test]
     fn an_empty_body_is_allowed() {
         let body = Bytes::new();
