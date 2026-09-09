@@ -2,6 +2,7 @@ use super::{
     Findings, Outcome, PolicyError, Replacement, RequestContext, RequestPolicy, RestorationState,
     Verdict,
     detect::{DetectorSet, select},
+    is_provider_signed_item,
 };
 use crate::{
     compression::decode_declared,
@@ -21,6 +22,7 @@ const PLACEHOLDER_DIGEST_BYTES: usize = 11;
 
 const SCANNED_FIELDS: [&str; 5] = ["system", "messages", "tools", "instructions", "input"];
 const TOOL_CREDENTIAL_FIELDS: [&str; 2] = ["headers", "authorization_token"];
+const SIGNED_ITEM_CONTAINERS: [&str; 2] = ["messages", "input"];
 const ATTACHMENT_DATA_FIELD: &str = "data";
 
 const SEVERITY: &str = "high";
@@ -138,15 +140,24 @@ impl MaskingPolicy {
         *text = masked;
     }
 
-    fn mask_value(&self, value: &mut Value, scan: &mut Scan, skip: &[&str]) {
+    fn mask_value(
+        &self,
+        value: &mut Value,
+        scan: &mut Scan,
+        skip: &[&str],
+        skip_signed_items: bool,
+    ) {
         match value {
             Value::String(text) => self.mask_string(text, scan),
             Value::Array(items) => {
                 for item in items {
-                    self.mask_value(item, scan, skip);
+                    self.mask_value(item, scan, skip, skip_signed_items);
                 }
             }
             Value::Object(fields) => {
+                if skip_signed_items && is_provider_signed_item(fields) {
+                    return;
+                }
                 let is_attachment_source = fields.contains_key("media_type")
                     || fields
                         .get("type")
@@ -159,7 +170,7 @@ impl MaskingPolicy {
                     if is_attachment_source && name == ATTACHMENT_DATA_FIELD {
                         continue;
                     }
-                    self.mask_value(field, scan, skip);
+                    self.mask_value(field, scan, skip, skip_signed_items);
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -174,8 +185,9 @@ impl MaskingPolicy {
             } else {
                 &[]
             };
+            let skip_signed_items = SIGNED_ITEM_CONTAINERS.contains(&name);
             if let Some(value) = fields.get_mut(name) {
-                self.mask_value(value, &mut scan, skip);
+                self.mask_value(value, &mut scan, skip, skip_signed_items);
             }
         }
         scan
@@ -588,6 +600,11 @@ mod tests {
             .collect()
     }
 
+    // Assembled at runtime so the fixture is not itself flagged as a live key.
+    fn aws_key_shaped() -> String {
+        format!("AKIA{}", "ABCDEFGHIJKLMNOP")
+    }
+
     fn responses_body(encrypted_content: &str) -> Bytes {
         Bytes::from(
             json!({
@@ -650,29 +667,93 @@ mod tests {
         }
     }
 
-    /// `input` is a scanned field, so nothing shields `encrypted_content`: a blob
-    /// whose bytes happen to spell a vendor prefix is rewritten like any secret.
     #[test]
-    fn a_vendor_prefix_inside_encrypted_content_is_masked_and_corrupts_the_blob() {
+    fn a_vendor_prefix_inside_encrypted_content_survives_masking() {
         let head = deterministic_blob(5, 300, BASE64URL_ALPHABET);
         let tail = deterministic_blob(6, 200, BASE64URL_ALPHABET);
-        let blob = format!("{head}-sk-{tail}");
-        let body = responses_body(&blob);
+        let body = responses_body(&format!("{head}-sk-{tail}"));
+        let verdict = policy(GuardrailsMode::Mask)
+            .evaluate(&context(&body))
+            .expect("JSON evaluates");
+        assert!(
+            matches!(verdict.outcome, Outcome::Allow),
+            "a sealed reasoning item is never rewritten"
+        );
+        assert_eq!(verdict.findings.match_count, 0);
+    }
+
+    #[test]
+    fn a_sealed_reasoning_item_survives_while_a_secret_beside_it_is_masked() {
+        let head = deterministic_blob(7, 300, BASE64URL_ALPHABET);
+        let tail = deterministic_blob(8, 200, BASE64URL_ALPHABET);
+        let secret = aws_key_shaped();
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": REASONING_ID,
+            "encrypted_content": format!("{head}-sk-{tail}"),
+            "summary": [],
+        });
+        let body = Bytes::from(
+            json!({
+                "model": "gpt-5",
+                "input": [
+                    reasoning.clone(),
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": format!("key {secret}")}],
+                    },
+                ],
+            })
+            .to_string(),
+        );
         let policy = policy(GuardrailsMode::Mask);
         let verdict = policy.evaluate(&context(&body)).expect("JSON evaluates");
         let Outcome::Transform { body: masked, .. } = verdict.outcome else {
-            panic!("an embedded vendor prefix must transform the body");
+            panic!("the secret beside the reasoning item must transform the body");
         };
+        assert_eq!(reasoning_item(&masked), reasoning);
+        let masked_text = std::str::from_utf8(&masked).unwrap();
+        assert!(!masked_text.contains(&secret));
+        assert!(masked_text.contains(&policy.placeholder("aws_access_key_id", &secret)));
         assert_eq!(
             verdict.findings.metadata["detectors"],
-            json!({"openai_api_key": 1})
+            json!({"aws_access_key_id": 1})
         );
-        let item = reasoning_item(&masked);
-        let content = item["encrypted_content"].as_str().unwrap();
-        assert!(content.starts_with(&head));
-        assert!(!content.contains(&tail), "the blob tail is gone");
-        assert!(content.contains("AEGIS_MASKED_OPENAI_API_KEY_"));
-        assert_eq!(item["id"], REASONING_ID, "only the blob was rewritten");
+    }
+
+    #[test]
+    fn an_anthropic_thinking_block_and_its_signature_survive_masking() {
+        let secret = aws_key_shaped();
+        let thinking = json!({
+            "type": "thinking",
+            "thinking": format!("the operator pasted {secret}"),
+            "signature": deterministic_blob(9, 256, BASE64_ALPHABET),
+        });
+        let body = Bytes::from(
+            json!({
+                "model": "claude-test",
+                "messages": [
+                    {"role": "assistant", "content": [thinking.clone()]},
+                    {"role": "user", "content": [{"type": "text", "text": format!("use {secret}")}]},
+                ],
+            })
+            .to_string(),
+        );
+        let policy = policy(GuardrailsMode::Mask);
+        let verdict = policy.evaluate(&context(&body)).expect("JSON evaluates");
+        let Outcome::Transform { body: masked, .. } = verdict.outcome else {
+            panic!("the secret in the user message must transform the body");
+        };
+        let document: Value = serde_json::from_slice(&masked).expect("the masked body is JSON");
+        assert_eq!(document["messages"][0]["content"][0], thinking);
+        let masked_text = std::str::from_utf8(&masked).unwrap();
+        assert_eq!(masked_text.matches(&secret).count(), 1);
+        assert!(masked_text.contains(&format!(
+            "use {}",
+            policy.placeholder("aws_access_key_id", &secret)
+        )));
+        assert_eq!(verdict.findings.match_count, 1);
     }
 
     #[test]

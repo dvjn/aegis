@@ -1,4 +1,5 @@
 use axum::body::Bytes;
+use serde_json::{Map, Value};
 use std::{sync::Arc, time::Instant};
 
 pub mod detect;
@@ -10,6 +11,19 @@ pub mod sse;
 /// Evaluation metadata describes what a policy saw in a payload, so reading it
 /// takes the same permission as reading the payload itself.
 pub const EVALUATION_METADATA_SCOPE: &str = "payloads:read";
+
+/// Items the provider seals or covers with a signature: `encrypted_content` on
+/// an OpenAI reasoning item, `signature` on an Anthropic thinking block.
+/// Rewriting any byte inside one makes the client's next replay of it fail
+/// verification, so masking and restoration both leave the whole item alone.
+const PROVIDER_SIGNED_ITEM_TYPES: [&str; 3] = ["reasoning", "thinking", "redacted_thinking"];
+
+fn is_provider_signed_item(fields: &Map<String, Value>) -> bool {
+    fields
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| PROVIDER_SIGNED_ITEM_TYPES.contains(&kind))
+}
 
 #[derive(Clone)]
 pub struct RequestContext {
