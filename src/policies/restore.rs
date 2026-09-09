@@ -1,5 +1,5 @@
-use super::Replacement;
 use super::sse::{Frame, FrameParser};
+use super::{Replacement, is_provider_signed_item};
 use serde_json::Value;
 
 /// Rewrites masking placeholders back to their originals in a streamed
@@ -355,6 +355,9 @@ fn substitute_value_as(
             changed
         }
         Value::Object(fields) => {
+            if is_provider_signed_item(fields) {
+                return false;
+            }
             let mut changed = false;
             for (name, field) in fields.iter_mut() {
                 let encoding = if name == JSON_ENCODED_FIELD && field.is_string() {
@@ -1119,6 +1122,34 @@ mod tests {
                 r#"{{"id":"msg_0123","content":[{{"type":"text","text":"token {}"}}]}}"#,
                 replacements()[0].original
             )
+        );
+    }
+
+    #[test]
+    fn a_placeholder_inside_a_sealed_reasoning_item_is_not_substituted() {
+        use serde_json::json;
+
+        let mut document = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_0123",
+                    "encrypted_content": format!("head{PLACEHOLDER}tail"),
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": format!("token {PLACEHOLDER}")}],
+                },
+            ],
+        });
+        let sealed = document["output"][0].clone();
+
+        assert!(substitute_value(&mut document, &replacements()));
+
+        assert_eq!(document["output"][0], sealed);
+        assert_eq!(
+            document["output"][1]["content"][0]["text"],
+            json!(format!("token {SECRET}"))
         );
     }
 }
