@@ -1,0 +1,51 @@
+name: 🏋️ Load
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load:
+    name: 🏋️ Run Load Suite
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(github.event.pull_request.labels.*.name, 'test:load')
+    runs-on: ubuntu-latest
+    env:
+      AEGIS_LOAD_PEAK_MODE: maxrss
+      # A GitHub runner has no user systemd session, so the cap falls back to
+      # RLIMIT_AS, which the default 500M cannot even start the gateway under.
+      AEGIS_LOAD_OOM_MEMORY_MAX: 4G
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 🧰 Install Tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - name: 📦 Cache Rust Build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: load
+      - name: 🏋️ Run Load Suite
+        run: mise run test:load
+      - name: ⬆️ Upload Load Report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: load-report
+          path: |
+            target/nextest/load/load-junit.xml
+            target/test-report/load-benchmark.json
+          if-no-files-found: warn
