@@ -1,11 +1,25 @@
 [profile.default]
+default-filter = 'not binary(load)'
 # terminate-after counts slow-timeout periods, so this kills a test after 60s.
 slow-timeout = { period = "20s", terminate-after = 3 }
 
 [profile.ci]
+default-filter = 'not binary(load)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 fail-fast = false
 retries = 2
 
 [profile.ci.junit]
 path = "junit.xml"
+
+[profile.load]
+default-filter = 'binary(load)'
+test-threads = 1
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 10 }
+final-status-level = "all"
+
+[profile.load.junit]
+path = "load-junit.xml"
+# Metrics ride on a passing case's stdout.
+store-success-output = true
