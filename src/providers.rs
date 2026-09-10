@@ -35,11 +35,10 @@ pub fn requested_model(body: &[u8]) -> Option<String> {
 }
 
 pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
-    let values = decoded_json_values(body);
-    let usage = values.iter().rev().find_map(find_usage);
-    let Some(value) = usage else {
+    let Some(owned_usage) = decoded_last_usage(body) else {
         return Usage::default();
     };
+    let value = &owned_usage;
 
     match provider {
         Provider::Anthropic => Usage {
@@ -74,43 +73,60 @@ pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
     }
 }
 
-fn decoded_json_values(body: &[u8]) -> Vec<Value> {
-    let values = json_values(&decode_body(body));
-    if !values.is_empty() {
-        return values;
-    }
-    decode_brotli_unsniffable(body)
-        .map(|decoded| json_values(&decoded))
-        .unwrap_or_default()
+enum Scan {
+    NoValues,
+    LastUsage(Option<Value>),
 }
 
-fn json_values(body: &[u8]) -> Vec<Value> {
-    if let Ok(value) = serde_json::from_slice(body) {
-        return vec![value];
+fn decoded_last_usage(body: &[u8]) -> Option<Value> {
+    match scan_last_usage(&decode_body(body)) {
+        Scan::LastUsage(usage) => usage,
+        Scan::NoValues => match scan_last_usage(&decode_brotli_unsniffable(body)?) {
+            Scan::LastUsage(usage) => usage,
+            Scan::NoValues => None,
+        },
+    }
+}
+
+fn scan_last_usage(body: &[u8]) -> Scan {
+    if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
+        return Scan::LastUsage(take_usage(&mut value));
     }
 
-    String::from_utf8_lossy(body)
+    let mut parsed_any = false;
+    let mut last_usage = None;
+    let frames = String::from_utf8_lossy(body);
+    let frames = frames
         .lines()
         .filter_map(|line| line.strip_prefix("data:"))
         .map(str::trim)
-        .filter(|data| *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
+        .filter(|data| *data != "[DONE]");
+    for data in frames {
+        let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        parsed_any = true;
+        if let Some(usage) = take_usage(&mut value) {
+            last_usage = Some(usage);
+        }
+    }
+
+    if parsed_any {
+        Scan::LastUsage(last_usage)
+    } else {
+        Scan::NoValues
+    }
 }
 
-fn find_usage(value: &Value) -> Option<&Value> {
-    if let Some(usage) = value.get("usage") {
-        return Some(usage);
+fn take_usage(value: &mut Value) -> Option<Value> {
+    if let Some(usage) = value.get_mut("usage") {
+        return Some(usage.take());
     }
-    if let Some(response) = value.get("response")
-        && let Some(usage) = response.get("usage")
-    {
-        return Some(usage);
+    if let Some(usage) = value.get_mut("response").and_then(|it| it.get_mut("usage")) {
+        return Some(usage.take());
     }
-    if let Some(message) = value.get("message")
-        && let Some(usage) = message.get("usage")
-    {
-        return Some(usage);
+    if let Some(usage) = value.get_mut("message").and_then(|it| it.get_mut("usage")) {
+        return Some(usage.take());
     }
     None
 }
