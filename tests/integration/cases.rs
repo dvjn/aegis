@@ -1,14 +1,14 @@
 //! Functional correctness of the aegis gateway: forwarding, guardrails,
 //! telemetry, auth.
 
-use crate::{
-    harness::{Aegis, GuardrailsMode, fake_secrets},
+use crate::shared::{
+    gateway::{Gateway, GuardrailsMode, Response, fake_secrets},
     telemetry::wait_for_usage_row,
 };
 
 const PLACEHOLDER_MARKER: &str = "AEGIS_MASKED";
 
-fn require_ok(response: &crate::harness::Response) {
+fn require_ok(response: &Response) {
     assert_eq!(
         response.status,
         Some(200),
@@ -37,11 +37,11 @@ fn secrets_missing_from(text: &str) -> Vec<&'static str> {
 /// A streamed provider request is forwarded and returns 200 with SSE frames.
 #[tokio::test]
 async fn forwards_streamed_request() {
-    let aegis = Aegis::start().await;
+    let aegis = Gateway::started().await;
     let response = aegis
-        .post(
+        .post_text(
             &aegis.claude_url("mode=sse&bytes=8192&chunks=4"),
-            aegis.request_body(false),
+            aegis.text_body(false),
         )
         .await;
 
@@ -59,11 +59,11 @@ async fn forwards_streamed_request() {
 /// Masking rewrites secrets out of the request body before the upstream sees it.
 #[tokio::test]
 async fn masking_scrubs_secrets_before_upstream() {
-    let aegis = Aegis::with_guardrails(GuardrailsMode::Mask).await;
+    let aegis = Gateway::started_with(GuardrailsMode::Mask).await;
     let response = aegis
-        .post(
+        .post_text(
             &aegis.claude_url("mode=sse&bytes=1024&chunks=2"),
-            aegis.request_body(true),
+            aegis.text_body(true),
         )
         .await;
     require_ok(&response);
@@ -83,11 +83,11 @@ async fn masking_scrubs_secrets_before_upstream() {
 /// Placeholders echoed back by the upstream are restored to the original secrets.
 #[tokio::test]
 async fn restore_rewrites_placeholders_in_response() {
-    let aegis = Aegis::with_guardrails(GuardrailsMode::Mask).await;
+    let aegis = Gateway::started_with(GuardrailsMode::Mask).await;
     let response = aegis
-        .post(
+        .post_text(
             &aegis.claude_url("mode=sse&bytes=512&chunks=2&echo=1"),
-            aegis.request_body(true),
+            aegis.text_body(true),
         )
         .await;
     require_ok(&response);
@@ -109,10 +109,10 @@ async fn restore_rewrites_placeholders_in_response() {
             forwarded unchanged (filtered_headers, src/gateway/mod.rs:424-444; content-length is \
             dropped on the request side only, src/gateway/mod.rs:204), so the client read ends short"]
 async fn restore_on_non_sse_response_keeps_the_body_readable() {
-    let aegis = Aegis::with_guardrails(GuardrailsMode::Mask).await;
+    let aegis = Gateway::started_with(GuardrailsMode::Mask).await;
     let url = aegis.claude_url("mode=json&bytes=4096&echo=1");
 
-    let without_secrets = aegis.post(&url, aegis.request_body(false)).await;
+    let without_secrets = aegis.post_text(&url, aegis.text_body(false)).await;
     assert_eq!(
         without_secrets.status,
         Some(200),
@@ -120,7 +120,7 @@ async fn restore_on_non_sse_response_keeps_the_body_readable() {
         without_secrets.error
     );
 
-    let with_secrets = aegis.post(&url, aegis.request_body(true)).await;
+    let with_secrets = aegis.post_text(&url, aegis.text_body(true)).await;
     assert!(
         with_secrets.error.is_none(),
         "restored non-SSE response was truncated: {:?}",
@@ -144,12 +144,12 @@ async fn restore_on_non_sse_response_keeps_the_body_readable() {
 /// A non-SSE upstream response reaches the client intact.
 #[tokio::test]
 async fn json_response_passes_through() {
-    let aegis = Aegis::start().await;
+    let aegis = Gateway::started().await;
     let filler_bytes = 32768;
     let response = aegis
-        .post(
+        .post_text(
             &aegis.claude_url(&format!("mode=json&bytes={filler_bytes}")),
-            aegis.request_body(false),
+            aegis.text_body(false),
         )
         .await;
     require_ok(&response);
@@ -169,11 +169,11 @@ async fn json_response_passes_through() {
 /// Token usage from the upstream lands in the sqlite telemetry tables.
 #[tokio::test]
 async fn usage_is_recorded() {
-    let aegis = Aegis::start().await;
+    let aegis = Gateway::started().await;
     let response = aegis
-        .post(
+        .post_text(
             &aegis.claude_url("mode=sse&bytes=1024&chunks=2"),
-            aegis.request_body(false),
+            aegis.text_body(false),
         )
         .await;
     require_ok(&response);
@@ -192,17 +192,17 @@ async fn usage_is_recorded() {
 /// The codex provider forwards and stores input_tokens minus cached_tokens.
 #[tokio::test]
 async fn codex_provider_records_its_own_usage_shape() {
-    let aegis = Aegis::start().await;
+    let aegis = Gateway::started().await;
     // The fake upstream picks the codex usage shape when "codex" appears in the
     // forwarded path.
     let response = aegis
-        .post(
+        .post_text(
             &aegis.provider_url(
                 "codex",
                 "/codex/v1/responses",
                 "mode=sse&bytes=1024&chunks=2",
             ),
-            aegis.request_body_for("gpt-5-codex", false),
+            aegis.text_body_for("gpt-5-codex", false),
         )
         .await;
     require_ok(&response);
@@ -226,19 +226,15 @@ async fn codex_provider_records_its_own_usage_shape() {
 /// A missing or wrong client key is rejected before reaching the upstream.
 #[tokio::test]
 async fn auth_is_enforced() {
-    let aegis = Aegis::start().await;
+    let aegis = Gateway::started().await;
     aegis.upstream.reset();
     let url = aegis.claude_url("mode=sse&chunks=1");
 
     let missing = aegis
-        .post_with_key(&url, aegis.request_body(false), None)
+        .post_text_with_key(&url, aegis.text_body(false), None)
         .await;
     let wrong = aegis
-        .post_with_key(
-            &url,
-            aegis.request_body(false),
-            Some("not-a-real-key".into()),
-        )
+        .post_text_with_key(&url, aegis.text_body(false), Some("not-a-real-key".into()))
         .await;
 
     assert_eq!(missing.status, Some(401), "missing key was not rejected");
@@ -252,11 +248,11 @@ async fn auth_is_enforced() {
 /// In observe mode the upstream receives the request body unchanged.
 #[tokio::test]
 async fn observe_mode_does_not_rewrite() {
-    let aegis = Aegis::with_guardrails(GuardrailsMode::Observe).await;
+    let aegis = Gateway::started_with(GuardrailsMode::Observe).await;
     let response = aegis
-        .post(
+        .post_text(
             &aegis.claude_url("mode=sse&bytes=1024&chunks=2"),
-            aegis.request_body(true),
+            aegis.text_body(true),
         )
         .await;
     require_ok(&response);
