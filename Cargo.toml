@@ -67,3 +67,8 @@ tower = { version = "0.5.3", features = ["util"] }
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+
+[[test]]
+name = "load"
+path = "tests/load/main.rs"
+harness = false

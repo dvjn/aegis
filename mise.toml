@@ -208,6 +208,37 @@ fi
 [tasks.check]
 depends = ["fmt-check", "lint", "test", "audit"]
 
+[tasks."test:load"]
+description = "Every memory and OOM load case, serially, quick profile"
+run = "mise run test:load:profile"
+
+[tasks."test:load:full"]
+description = "Every value of every dimension; takes many minutes"
+env = { AEGIS_LOAD_PROFILE = "full" }
+run = "mise run test:load:profile"
+
+[tasks."test:load:oom"]
+description = "Bisect for the in-flight payload that OOM-kills a gateway"
+env = { LOAD_FILTER = "test(oom_bisection)" }
+run = "mise run test:load:profile"
+
+[tasks."test:load:profile"]
+description = "The nextest load profile plus its merged benchmark series"
+hide = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+fragments=target/test-report/load-benchmark
+merged=target/test-report/load-benchmark.json
+rm -rf "$fragments"
+mkdir -p "$fragments"
+AEGIS_LOAD_BENCHMARK_DIR="$PWD/$fragments" \\
+  cargo nextest run --release --profile load -E "${LOAD_FILTER:-all()}"
+jq -s add "$fragments"/*.json > "$merged"
+printf 'junit:     %s\\n' target/nextest/load/load-junit.xml
+printf 'benchmark: %s (%s series)\\n' "$merged" "$(jq length "$merged")"
+"""
+
 [tasks.fmt-check]
 run = "cargo fmt --all --check"
 
