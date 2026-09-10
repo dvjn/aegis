@@ -5,6 +5,7 @@ mod shared;
 
 mod analysis;
 mod cases;
+mod compare;
 mod context;
 mod harness;
 mod report;
@@ -13,7 +14,7 @@ mod runner;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use cases::Profile;
 use harness::Request;
@@ -46,9 +47,20 @@ in-flight payload that gets it killed under a memory cap.",
   AEGIS_LOAD_BENCHMARK_DIR   write one benchmark fragment per case here
 
 A nextest run has no argv to spend on flags, so it takes these instead. The
-matching flag overrides the variable."
+matching flag overrides the variable.
+
+COMPARING TWO RUNS
+  Every run writes benchmark JSON. Keep one aside, then put a later run next to
+  it as a table of signed percentage changes:
+
+    cp target/test-report/load-benchmark.json /tmp/main.json
+    mise run test:load:compare target/test-report/load-benchmark.json \\
+      --baseline /tmp/main.json --baseline-name 'stock main' --name mimalloc"
 )]
 struct Arguments {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(long = "case", help = "Run only this case. Repeatable.")]
     cases: Vec<String>,
 
@@ -77,6 +89,26 @@ struct Arguments {
     benchmark_json: Option<PathBuf>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    #[command(about = "Put a run's benchmark JSON beside a baseline's, as a table.")]
+    Compare {
+        run: PathBuf,
+
+        #[arg(long, help = "The column header for the run. Its filename by default.")]
+        name: Option<String>,
+
+        #[arg(
+            long,
+            help = "The run to compare against. Without one, no percentages."
+        )]
+        baseline: Option<PathBuf>,
+
+        #[arg(long, help = "The column header for the baseline.")]
+        baseline_name: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // reqwest is built on rustls-no-provider, so building a Client panics
@@ -102,6 +134,19 @@ async fn main() -> Result<()> {
 
 async fn run_every_case(all: &[cases::Case]) -> Result<()> {
     let arguments = Arguments::parse();
+    if let Some(Command::Compare {
+        run,
+        name,
+        baseline,
+        baseline_name,
+    }) = arguments.command
+    {
+        print!(
+            "{}",
+            compare::compare(&run, name, baseline.as_deref(), baseline_name)?
+        );
+        return Ok(());
+    }
 
     let selected: Vec<&cases::Case> = all
         .iter()

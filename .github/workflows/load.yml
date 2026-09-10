@@ -24,6 +24,10 @@ jobs:
       github.event_name != 'pull_request'
       || contains(github.event.pull_request.labels.*.name, 'test:load')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only to download main's benchmark JSON as the comparison baseline.
+      actions: read
     env:
       AEGIS_LOAD_PEAK_MODE: maxrss
       # A GitHub runner has no user systemd session, so the cap falls back to
@@ -40,6 +44,44 @@ jobs:
           key: load
       - name: 🏋️ Run Load Suite
         run: mise run test:load
+      - name: 📥 Fetch Main Baseline
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id="$(gh run list --workflow load.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [[ -z $id ]]; then
+            echo "no successful main run to compare against"
+            exit 0
+          fi
+          gh run download "$id" --name load-baseline --dir baseline
+      - name: 📝 Render Comparison Table
+        if: always()
+        run: |
+          run=target/test-report/load-benchmark.json
+          baseline=baseline/load-benchmark.json
+          if [[ ! -f $run ]]; then
+            echo '## 🏋️ Load Suite' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The suite did not get far enough to write any metrics.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          arguments=("$run" --name "${GITHUB_SHA::7}")
+          if [[ -f $baseline ]]; then
+            arguments+=(--baseline "$baseline" --baseline-name main)
+          fi
+          {
+            echo '## 🏋️ Load Suite'
+            if [[ ! -f $baseline ]]; then
+              echo
+              echo 'No main baseline to compare against, so these are absolute.'
+            fi
+            echo
+            echo '```'
+            mise run test:load:compare "${arguments[@]}" 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: ⬆️ Upload Load Report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -48,4 +90,11 @@ jobs:
           path: |
             target/nextest/load/load-junit.xml
             target/test-report/load-benchmark.json
+          if-no-files-found: warn
+      - name: ⬆️ Publish Main Baseline
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: load-baseline
+          path: target/test-report/load-benchmark.json
           if-no-files-found: warn
