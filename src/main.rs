@@ -38,6 +38,11 @@ use tokio::{net::TcpListener, signal};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+// glibc and musl both retain the multi-MiB body allocations of the proxy path
+// after free, so resident memory ratchets to several times the live set.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "aegis", version, about = "Personal LLM gateway")]
 struct Cli {

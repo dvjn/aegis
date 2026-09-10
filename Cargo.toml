@@ -30,6 +30,7 @@ hmac = "0.13"
 libc = "0.2.189"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots", "pool", "ring"] }
 maud = { version = "0.27", features = ["axum"] }
+mimalloc = { version = "0.1.52", features = ["no_thp"] }
 rand = "0.10"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "rustls-no-provider", "stream"] }

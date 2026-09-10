@@ -16,7 +16,11 @@ WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 8765
 
+# The allocator options have to arrive through the environment, because the
+# first arena is committed before the process can set them itself.
 ENV HTTP_ADDR=0.0.0.0:8765 \
-    DATABASE_URL="sqlite:///data/aegis.db?mode=rwc"
+    DATABASE_URL="sqlite:///data/aegis.db?mode=rwc" \
+    MIMALLOC_ARENA_EAGER_COMMIT=0 \
+    MIMALLOC_PURGE_DELAY=0
 
 ENTRYPOINT ["/usr/local/bin/aegis"]
