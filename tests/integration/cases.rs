@@ -105,9 +105,6 @@ async fn restore_rewrites_placeholders_in_response() {
 
 /// A restored non-SSE response must still reach the client completely.
 #[tokio::test]
-#[ignore = "known gateway bug: restore rewrites a non-SSE body while the upstream content-length is \
-            forwarded unchanged (filtered_headers, src/gateway/mod.rs:424-444; content-length is \
-            dropped on the request side only, src/gateway/mod.rs:204), so the client read ends short"]
 async fn restore_on_non_sse_response_keeps_the_body_readable() {
     let aegis = Gateway::started_with(GuardrailsMode::Mask).await;
     let url = aegis.claude_url("mode=json&bytes=4096&echo=1");
@@ -126,14 +123,19 @@ async fn restore_on_non_sse_response_keeps_the_body_readable() {
         "restored non-SSE response was truncated: {:?}",
         with_secrets.error
     );
+    require_ok(&with_secrets);
     assert!(
         secrets_missing_from(&with_secrets.body).is_empty(),
         "secrets not restored: {:?}",
         secrets_missing_from(&with_secrets.body)
     );
-    // Restore grows the body past the stale content-length, so the client stops
-    // reading mid-document. hyper treats an over-long body as satisfied rather
-    // than as a transport error, so completeness has to be asserted here.
+    assert!(
+        !with_secrets.body.contains(PLACEHOLDER_MARKER),
+        "placeholder text survived into the client response"
+    );
+    // Restore grows the body past the upstream content-length. hyper treats an
+    // over-long body as satisfied rather than as a transport error, so a
+    // truncated document arrives as a clean 200 and only the parse catches it.
     assert!(
         serde_json::from_str::<serde_json::Value>(&with_secrets.body).is_ok(),
         "restored non-SSE body ended after {} bytes and does not parse",

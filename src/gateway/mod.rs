@@ -254,7 +254,12 @@ impl Gateway {
             }
         };
         let status = upstream.status();
-        let response_headers = filtered_headers(upstream.headers());
+        let mut response_headers = filtered_headers(upstream.headers());
+        if restorer.is_some() {
+            // Restoring a placeholder changes the body length, and the rewritten
+            // body is streamed, so the final length is unknown here.
+            response_headers.remove(header::CONTENT_LENGTH);
+        }
         let sink = self.sink.clone();
         let max_capture_bytes = self.max_capture_bytes;
         let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(16);
