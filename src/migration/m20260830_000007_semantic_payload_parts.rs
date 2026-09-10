@@ -95,7 +95,7 @@ async fn store_chunks(
     request_id: &str,
     body: &[u8],
 ) -> Result<(), DbErr> {
-    for (position, payload) in chunk_payload(body).into_iter().enumerate() {
+    for (position, payload) in chunk_payload(body).enumerate() {
         let id = store(database, payload).await?;
         database
             .execute_raw(Statement::from_sql_and_values(
@@ -146,21 +146,23 @@ async fn store_semantic(
 }
 
 async fn store(database: &impl ConnectionTrait, payload: StoredPayload) -> Result<String, DbErr> {
+    let id = payload.id.clone();
+    let original_bytes = payload.original_bytes;
     let (body, encoding) = payload.encoded();
     database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
             [
-                payload.id.clone().into(),
+                id.clone().into(),
                 body.into(),
                 encoding.into(),
-                payload.original_bytes.into(),
+                original_bytes.into(),
                 timestamp().into(),
             ],
         ))
         .await?;
-    Ok(payload.id)
+    Ok(id)
 }
 
 fn decode(body: Vec<u8>, encoding: &str) -> Result<Vec<u8>, DbErr> {

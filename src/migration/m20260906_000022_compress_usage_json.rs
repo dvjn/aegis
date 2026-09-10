@@ -42,7 +42,7 @@ impl MigrationTrait for Migration {
             for row in &rows {
                 let request_id: String = row.try_get("", "request_id")?;
                 let raw: Vec<u8> = row.try_get("", "raw_usage_json")?;
-                let (stored, encoding) = crate::compression::gzip_if_smaller(&raw);
+                let (stored, encoding) = crate::compression::gzip_if_smaller(raw);
                 if encoding == usage_json::IDENTITY {
                     after_request_id = request_id;
                     continue;

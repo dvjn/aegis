@@ -28,16 +28,17 @@ pub(crate) fn decode_gzip(body: &[u8]) -> Option<Vec<u8>> {
     read_bounded(GzDecoder::new(body))
 }
 
-pub(crate) fn gzip_if_smaller(body: &[u8]) -> (Vec<u8>, &'static str) {
+/// Takes ownership so that the identity result is the input itself rather than a copy of it.
+pub(crate) fn gzip_if_smaller(body: Vec<u8>) -> (Vec<u8>, &'static str) {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     let compressed = encoder
-        .write_all(body)
+        .write_all(&body)
         .and_then(|()| encoder.finish())
         .unwrap_or_default();
     if !compressed.is_empty() && compressed.len() < body.len() {
         (compressed, "gzip")
     } else {
-        (body.to_vec(), "identity")
+        (body, "identity")
     }
 }
 

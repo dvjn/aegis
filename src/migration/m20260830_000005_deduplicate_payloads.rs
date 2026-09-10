@@ -77,22 +77,24 @@ async fn store(
     database: &impl ConnectionTrait,
     body: Option<&[u8]>,
 ) -> Result<Option<String>, DbErr> {
-    let Some(payload) = body.and_then(StoredPayload::new) else {
+    let Some(payload) = body.map(<[u8]>::to_vec).and_then(StoredPayload::new) else {
         return Ok(None);
     };
+    let id = payload.id.clone();
+    let original_bytes = payload.original_bytes;
     let (body, encoding) = payload.encoded();
     database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO gateway_payload_blobs (id, body, encoding, original_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
             [
-                payload.id.clone().into(),
+                id.clone().into(),
                 body.into(),
                 encoding.into(),
-                payload.original_bytes.into(),
+                original_bytes.into(),
                 timestamp().into(),
             ],
         ))
         .await?;
-    Ok(Some(payload.id))
+    Ok(Some(id))
 }

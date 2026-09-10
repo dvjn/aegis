@@ -248,16 +248,16 @@ async fn store_semantic(
     request_seq: i64,
     payload: SemanticPayload,
 ) -> Result<(), DbErr> {
-    store_blob(database, &payload.envelope).await?;
+    let (_, envelope_id) = store_blob(database, payload.envelope).await?;
     database
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR REPLACE INTO gateway_payload_envelopes (request_id, direction, body_id) VALUES (?, 'request', ?)",
-            [request_id.to_owned().into(), payload.envelope.id.into()],
+            [request_id.to_owned().into(), envelope_id.into()],
         ))
         .await?;
     for part in payload.parts {
-        let blob = store_blob(database, &part.payload).await?;
+        let (blob, _) = store_blob(database, part.payload).await?;
         let kind =
             payload_parts::kind_seq(database, &part.path, part.role.as_deref(), &part.kind).await?;
         payload_parts::insert(database, request_seq, kind, part.position, blob).await?;
@@ -545,8 +545,8 @@ mod tests {
             .await
             .unwrap();
         for (position, chunk) in compressed.chunks(8).enumerate() {
-            let payload = StoredPayload::new(chunk).unwrap();
-            let blob = store_blob(&database, &payload).await.unwrap();
+            let payload = StoredPayload::new(chunk.to_vec()).unwrap();
+            let (blob, _) = store_blob(&database, payload).await.unwrap();
             payload_parts::insert(&database, request, chunk_kind, position as i64, blob)
                 .await
                 .unwrap();

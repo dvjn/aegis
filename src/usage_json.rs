@@ -4,7 +4,7 @@ pub(crate) const IDENTITY: &str = "identity";
 pub(crate) const GZIP: &str = "gzip";
 
 pub(crate) fn encode(json: &str) -> (Vec<u8>, &'static str) {
-    compression::gzip_if_smaller(json.as_bytes())
+    compression::gzip_if_smaller(json.as_bytes().to_vec())
 }
 
 pub(crate) fn decode(bytes: &[u8], encoding: &str) -> Option<String> {

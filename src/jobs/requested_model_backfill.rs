@@ -103,14 +103,14 @@ mod tests {
             "input": []
         }))
         .unwrap();
-        let payload = StoredPayload::new(&body).unwrap();
-        store_blob(database, &payload).await.unwrap();
+        let payload = StoredPayload::new(body).unwrap();
+        let (_, body_id) = store_blob(database, payload).await.unwrap();
         database
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO gateway_payload_envelopes (request_id, direction, body_id)
                  VALUES (?, 'request', ?)",
-                [id.into(), payload.id.into()],
+                [id.into(), body_id.into()],
             ))
             .await
             .unwrap();
