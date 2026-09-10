@@ -750,6 +750,26 @@
     "input": 0.000005,
     "output": 0
   },
+  "gpt-image-2.5-flare": {
+    "cache_read": 0.00000125,
+    "input": 0.000005,
+    "output": 0
+  },
+  "gpt-image-2.5-flare-2026-09-08": {
+    "cache_read": 0.00000125,
+    "input": 0.000005,
+    "output": 0
+  },
+  "gpt-image-2.5-sunburst": {
+    "cache_read": 0.00000125,
+    "input": 0.000005,
+    "output": 0
+  },
+  "gpt-image-2.5-sunburst-2026-09-08": {
+    "cache_read": 0.00000125,
+    "input": 0.000005,
+    "output": 0
+  },
   "gpt-realtime": {
     "cache_read": 4E-7,
     "input": 0.000004,
