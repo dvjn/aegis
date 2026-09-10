@@ -173,7 +173,16 @@ printf 'Priced models: %s\n' "$(jq length src/pricing/model_prices.json)"
 '''
 
 [tasks.test]
+description = "Run every test"
 run = "cargo nextest run"
+
+[tasks."test:unit"]
+description = "Run the in-crate unit tests"
+run = "cargo nextest run --bins"
+
+[tasks."test:integration"]
+description = "Run the black-box integration suite"
+run = "cargo nextest run --test integration"
 
 [tasks.fmt]
 run = "cargo fmt --all"
