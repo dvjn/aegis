@@ -1,0 +1,11 @@
+[profile.default]
+# terminate-after counts slow-timeout periods, so this kills a test after 60s.
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 4 }
+fail-fast = false
+retries = 2
+
+[profile.ci.junit]
+path = "junit.xml"

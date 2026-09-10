@@ -3,6 +3,7 @@ rust = { version = "1.98.1", components = "rustfmt,clippy" }
 zig = "0.16.0"
 "github:rustsec/rustsec" = { version = "cargo-audit/v0.22.2", exe = "cargo-audit" }
 "github:rust-cross/cargo-zigbuild" = { version = "0.23.4", exe = "cargo-zigbuild" }
+"github:nextest-rs/nextest" = { version = "cargo-nextest-0.9.143", exe = "cargo-nextest" }
 watchexec = "2.7.2"
 
 [env]
@@ -172,7 +173,7 @@ printf 'Priced models: %s\n' "$(jq length src/pricing/model_prices.json)"
 '''
 
 [tasks.test]
-run = "cargo test"
+run = "cargo nextest run"
 
 [tasks.fmt]
 run = "cargo fmt --all"
