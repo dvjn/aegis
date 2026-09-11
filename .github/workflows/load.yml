@@ -4,8 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  schedule:
+    - cron: "47 3 * * *"
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Load suite
+        type: choice
+        options: [all, steady, scale, soak, resilience]
+        default: all
+      baseline:
+        description: Baseline revision, defaults to the current revision for A/A calibration
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -19,82 +31,61 @@ env:
 
 jobs:
   load:
-    name: 🏋️ Run Load Suite
+    name: 🏋️ Compare Load
     if: >-
       github.event_name != 'pull_request'
-      || contains(github.event.pull_request.labels.*.name, 'test:load')
+      || contains(toJSON(github.event.pull_request.labels.*.name), 'load:')
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # Only to download main's benchmark JSON as the comparison baseline.
-      actions: read
     env:
-      AEGIS_LOAD_PEAK_MODE: maxrss
-      # A GitHub runner has no user systemd session, so the cap falls back to
-      # RLIMIT_AS, which the default 500M cannot even start the gateway under.
-      AEGIS_LOAD_OOM_MEMORY_MAX: 4G
+      LOAD_EVENT: ${{ github.event_name }}
+      LOAD_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+      LOAD_SUITE: ${{ inputs.suite || '' }}
     steps:
-      - name: 📥 Checkout
+      - name: 📥 Checkout Baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.before || inputs.baseline || github.sha }}
+          path: baseline
+          persist-credentials: false
+
+      - name: 📥 Checkout Candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+
       - name: 🧰 Install Tools
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          working_directory: candidate
+
       - name: 📦 Cache Rust Build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          workspaces: candidate
           key: load
-      - name: 🏋️ Run Load Suite
-        run: mise run test:load
-      - name: 📥 Fetch Main Baseline
-        if: always() && github.event_name == 'pull_request'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          id="$(gh run list --workflow load.yml --branch main --status success \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-          if [[ -z $id ]]; then
-            echo "no successful main run to compare against"
-            exit 0
-          fi
-          gh run download "$id" --name load-baseline --dir baseline
-      - name: 📝 Render Comparison Table
+
+      - name: 🏋️ Run Load Comparison
+        working-directory: candidate
+        run: mise run test:load:_ci -- "$GITHUB_WORKSPACE/baseline" "$GITHUB_WORKSPACE/load-results"
+
+      - name: 📝 Summarize Load Comparison
         if: always()
         run: |
-          run=target/test-report/load-benchmark.json
-          baseline=baseline/load-benchmark.json
-          if [[ ! -f $run ]]; then
-            echo '## 🏋️ Load Suite' >> "$GITHUB_STEP_SUMMARY"
-            echo 'The suite did not get far enough to write any metrics.' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          if [[ -f load-results/summary.md ]]; then
+            cat load-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'The harness did not produce a summary.' >> "$GITHUB_STEP_SUMMARY"
           fi
-          arguments=("$run" --name "${GITHUB_SHA::7}")
-          if [[ -f $baseline ]]; then
-            arguments+=(--baseline "$baseline" --baseline-name main)
-          fi
-          {
-            echo '## 🏋️ Load Suite'
-            if [[ ! -f $baseline ]]; then
-              echo
-              echo 'No main baseline to compare against, so these are absolute.'
-            fi
-            echo
-            echo '```'
-            mise run test:load:compare "${arguments[@]}" 2>&1 || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: ⬆️ Upload Load Report
+
+      - name: ⬆️ Upload Load Results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: load-report
-          path: |
-            target/nextest/load/load-junit.xml
-            target/test-report/load-benchmark.json
+          name: load-${{ github.run_id }}-${{ github.run_attempt }}
+          path: load-results
           if-no-files-found: warn
-      - name: ⬆️ Publish Main Baseline
-        if: always() && github.event_name == 'push'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: load-baseline
-          path: target/test-report/load-benchmark.json
-          if-no-files-found: warn
+          retention-days: 14
