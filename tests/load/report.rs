@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::runner::{CaseRecord, Status};
 use crate::shared::measure::{PeakSource, mib, mib_delta};
 
-const SUITE: &str = "memory";
+pub const SUITE: &str = "memory";
 
 fn stage_name(label: &str, description: &str) -> String {
     let collapsed = label.split_whitespace().collect::<Vec<_>>().join(" ");

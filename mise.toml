@@ -222,6 +222,19 @@ description = "Bisect for the in-flight payload that OOM-kills a gateway"
 env = { LOAD_FILTER = "test(oom_bisection)" }
 run = "mise run test:load:profile"
 
+[tasks."test:load:compare"]
+description = "Put a load run's benchmark JSON beside a baseline's, as a table"
+quiet = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+# --no-run builds the load target without running it, and prints where it landed.
+binary="$(cargo test --release --test load --no-run --message-format=json 2>/dev/null \\
+  | jq -r 'select(.executable != null and .target.name == "load") | .executable' \\
+  | tail -1)"
+"$binary" compare {{arg(name="arguments", var=true)}}
+"""
+
 [tasks."test:load:profile"]
 description = "The nextest load profile plus its merged benchmark series"
 hide = true

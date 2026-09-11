@@ -65,7 +65,11 @@ impl Fit {
             return "not enough data points to say".to_string();
         }
         if self.is_flat() {
-            return "no measurable effect".to_string();
+            return format!(
+                "no measurable effect: the fitted {:+.4} {unit} per {per} moves the total less than {:.0}% across the measured range",
+                self.slope,
+                FLAT_RESPONSE_FRACTION * 100.0
+            );
         }
         if !self.is_trustworthy() {
             return format!(
