@@ -208,49 +208,151 @@ fi
 [tasks.check]
 depends = ["fmt-check", "lint", "test", "audit"]
 
-[tasks."test:load"]
-description = "Every memory and OOM load case, serially, quick profile"
-run = "mise run test:load:profile"
+[tasks."test:load:steady"]
+description = "Compare steady-state load between two Aegis binaries"
+run = 'mise run test:load:_run -- steady "$@"'
 
-[tasks."test:load:full"]
-description = "Every value of every dimension; takes many minutes"
-env = { AEGIS_LOAD_PROFILE = "full" }
-run = "mise run test:load:profile"
+[tasks."test:load:scale"]
+description = "Compare scaling load between two Aegis binaries"
+run = 'mise run test:load:_run -- scale "$@"'
 
-[tasks."test:load:oom"]
-description = "Bisect for the in-flight payload that OOM-kills a gateway"
-env = { LOAD_FILTER = "test(oom_bisection)" }
-run = "mise run test:load:profile"
+[tasks."test:load:soak"]
+description = "Compare sustained load between two Aegis binaries"
+run = 'mise run test:load:_run -- soak "$@"'
 
-[tasks."test:load:compare"]
-description = "Put a load run's benchmark JSON beside a baseline's, as a table"
-quiet = true
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-# --no-run builds the load target without running it, and prints where it landed.
-binary="$(cargo test --release --test load --no-run --message-format=json 2>/dev/null \\
-  | jq -r 'select(.executable != null and .target.name == "load") | .executable' \\
-  | tail -1)"
-"$binary" compare {{arg(name="arguments", var=true)}}
-"""
+[tasks."test:load:resilience"]
+description = "Compare resilience load between two Aegis binaries"
+run = 'mise run test:load:_run -- resilience "$@"'
 
-[tasks."test:load:profile"]
-description = "The nextest load profile plus its merged benchmark series"
+[tasks."test:load:all"]
+description = "Compare every public load suite between two Aegis binaries"
+run = 'mise run test:load:_run -- all "$@"'
+
+[tasks."test:load:_run"]
+description = "Run one or more load suites with explicit comparison binaries"
 hide = true
-run = """
+run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-fragments=target/test-report/load-benchmark
-merged=target/test-report/load-benchmark.json
-rm -rf "$fragments"
-mkdir -p "$fragments"
-AEGIS_LOAD_BENCHMARK_DIR="$PWD/$fragments" \\
-  cargo nextest run --release --profile load -E "${LOAD_FILTER:-all()}"
-jq -s add "$fragments"/*.json > "$merged"
-printf 'junit:     %s\\n' target/nextest/load/load-junit.xml
-printf 'benchmark: %s (%s series)\\n' "$merged" "$(jq length "$merged")"
-"""
+suite="${1:-}"
+if [[ -n "$suite" ]]; then
+  shift
+fi
+if [[ "$suite" != steady && "$suite" != scale && "$suite" != soak && "$suite" != resilience && "$suite" != all ]]; then
+  echo "unknown load suite: ${suite:-<none>}" >&2
+  exit 2
+fi
+if [[ $# -ne 3 ]]; then
+  echo "usage: mise run test:load:$suite -- <baseline-binary> <candidate-binary> <output-directory>" >&2
+  exit 2
+fi
+
+baseline="$1"
+candidate="$2"
+output="$3"
+harness="${AEGIS_LOAD_HARNESS:-}"
+if [[ -z "$harness" ]]; then
+  harness_target="${AEGIS_LOAD_HARNESS_TARGET_DIR:-$PWD/target/load-harness}"
+  harness="$(
+    CARGO_TARGET_DIR="$harness_target" \
+      cargo test --locked --release --test load --no-run --message-format=json 2>/dev/null \
+      | jq -r 'select(.executable != null and .target.name == "load") | .executable' \
+      | tail -1
+  )"
+fi
+test -n "$harness" && test -x "$harness" || {
+  echo "load harness is not executable: ${harness:-<not found>}" >&2
+  exit 1
+}
+
+arguments=(
+  --baseline "$baseline"
+  --candidate "$candidate"
+  --output "$output"
+)
+if [[ "$suite" == all ]]; then
+  arguments+=(--suite steady --suite scale --suite soak --suite resilience)
+else
+  arguments+=(--suite "$suite")
+fi
+exec "$harness" "${arguments[@]}"
+'''
+
+[tasks."test:load:_ci"]
+description = "Build and compare revisions selected by the load workflow"
+hide = true
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# -ne 2 ]]; then
+  echo "usage: mise run test:load:_ci -- <baseline-directory> <output-directory>" >&2
+  exit 2
+fi
+
+baseline_dir="$1"
+output="$2"
+suites=()
+case "${LOAD_EVENT:-}" in
+  pull_request)
+    labels="${LOAD_LABELS:-[]}" 
+    if jq -e 'index("load:all") != null' <<<"$labels" >/dev/null; then
+      suites=(steady scale soak resilience)
+    else
+      for suite in steady scale soak resilience; do
+        if jq -e --arg label "load:$suite" 'index($label) != null' <<<"$labels" >/dev/null; then
+          suites+=("$suite")
+        fi
+      done
+    fi
+    ;;
+  push)
+    suites=(steady)
+    ;;
+  schedule)
+    suites=(steady scale soak resilience)
+    ;;
+  workflow_dispatch)
+    requested="${LOAD_SUITE:-all}"
+    if [[ "$requested" == all ]]; then
+      suites=(steady scale soak resilience)
+    else
+      suites=("$requested")
+    fi
+    ;;
+  *)
+    echo "unsupported load event: ${LOAD_EVENT:-<none>}" >&2
+    exit 2
+    ;;
+esac
+if [[ -z "${suites[*]:-}" ]]; then
+  echo "no load suite selected" >&2
+  exit 2
+fi
+
+baseline_target="$PWD/target/load-baseline"
+candidate_target="$PWD/target/load-candidate"
+harness_target="$PWD/target/load-harness"
+CARGO_TARGET_DIR="$baseline_target" cargo build --locked --release --bin aegis \
+  --manifest-path "$baseline_dir/Cargo.toml"
+CARGO_TARGET_DIR="$candidate_target" cargo build --locked --release --bin aegis
+harness="$(
+  CARGO_TARGET_DIR="$harness_target" \
+    cargo test --locked --release --test load --no-run --message-format=json 2>/dev/null \
+    | jq -r 'select(.executable != null and .target.name == "load") | .executable' \
+    | tail -1
+)"
+test -n "$harness" && test -x "$harness"
+
+arguments=(
+  --baseline "$baseline_target/release/aegis"
+  --candidate "$candidate_target/release/aegis"
+  --output "$output"
+)
+for suite in "${suites[@]}"; do
+  arguments+=(--suite "$suite")
+done
+exec "$harness" "${arguments[@]}"
+'''
 
 [tasks.fmt-check]
 run = "cargo fmt --all --check"

@@ -1,226 +1,136 @@
-//! A `harness = false` target: `main` gets argv, and `CARGO_BIN_EXE_aegis` is built in this profile.
+//! A `harness = false` load coordinator with an isolated worker process per observation.
 
 #[path = "../shared/mod.rs"]
 mod shared;
 
-mod analysis;
-mod cases;
-mod compare;
-mod context;
-mod harness;
+mod coordinator;
+mod model;
+mod payload;
 mod report;
-mod runner;
+mod scenarios;
+mod worker;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use cases::Profile;
-use harness::Request;
-use runner::Status;
-use shared::gateway::PeakMode;
-use shared::upstream::Upstream;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum ProfileArgument {
-    Quick,
-    Full,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum PeakModeArgument {
-    Maxrss,
-    Cgroup,
-}
+use model::Variant;
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Memory and OOM load suite for the aegis gateway",
-    long_about = "Drives synthetic traffic through a real `aegis serve` against a fake upstream, \
-and reports the gateway's peak memory per dimension, a fitted cost model per axis, and the \
-in-flight payload that gets it killed under a memory cap.",
-    after_help = "ENVIRONMENT
-  AEGIS_LOAD_PROFILE         quick (default) | full
-  AEGIS_LOAD_PEAK_MODE       maxrss (default) | cgroup
-  AEGIS_LOAD_OOM_MEMORY_MAX  a systemd size, 500M by default
-  AEGIS_LOAD_BENCHMARK_DIR   write one benchmark fragment per case here
-
-A nextest run has no argv to spend on flags, so it takes these instead. The
-matching flag overrides the variable.
-
-COMPARING TWO RUNS
-  Every run writes benchmark JSON. Keep one aside, then put a later run next to
-  it as a table of signed percentage changes:
-
-    cp target/test-report/load-benchmark.json /tmp/main.json
-    mise run test:load:compare target/test-report/load-benchmark.json \\
-      --baseline /tmp/main.json --baseline-name 'stock main' --name mimalloc"
+    about = "Compare two explicit Aegis binaries with isolated load observations",
+    after_help = "The output directory receives results.json and summary.tsv. Each selected scenario runs as two balanced pairs in A/B then B/A order."
 )]
 struct Arguments {
-    #[command(subcommand)]
-    command: Option<Command>,
+    #[arg(long, help = "Baseline Aegis executable")]
+    baseline: Option<PathBuf>,
 
-    #[arg(long = "case", help = "Run only this case. Repeatable.")]
-    cases: Vec<String>,
+    #[arg(long, help = "Candidate Aegis executable")]
+    candidate: Option<PathBuf>,
 
-    #[arg(long = "list-cases", help = "List the cases and exit.")]
+    #[arg(long, help = "Directory for results.json and summary.tsv")]
+    output: Option<PathBuf>,
+
+    #[arg(long = "suite", help = "Select a suite. Repeatable.")]
+    suites: Vec<String>,
+
+    #[arg(
+        long = "scenario",
+        help = "Select suite::scenario, or a unique scenario name. Repeatable."
+    )]
+    scenarios: Vec<String>,
+
+    #[arg(long, help = "List registered scenarios and exit")]
     list: bool,
 
-    #[arg(long, value_enum, help = "How many values each dimension sweeps.")]
-    profile: Option<ProfileArgument>,
-
-    #[arg(long, value_enum, help = "Which exact peak figure to report.")]
-    peak_mode: Option<PeakModeArgument>,
-
-    #[arg(long, help = "The memory cap for the OOM bisection case.")]
-    oom_memory_max: Option<String>,
-
-    #[arg(long, help = "Keep each case's working directory and print the path.")]
-    keep: bool,
-
-    #[arg(long, help = "Print the detail lines for passing cases too.")]
-    verbose: bool,
-
-    #[arg(long, help = "Write JUnit XML to this path.")]
-    junit: Option<PathBuf>,
-
-    #[arg(long, help = "Write benchmark JSON to this path.")]
-    benchmark_json: Option<PathBuf>,
+    #[command(subcommand)]
+    internal: Option<InternalCommand>,
 }
 
 #[derive(Subcommand, Debug)]
-enum Command {
-    #[command(about = "Put a run's benchmark JSON beside a baseline's, as a table.")]
-    Compare {
-        run: PathBuf,
-
-        #[arg(long, help = "The column header for the run. Its filename by default.")]
-        name: Option<String>,
-
-        #[arg(
-            long,
-            help = "The run to compare against. Without one, no percentages."
-        )]
-        baseline: Option<PathBuf>,
-
-        #[arg(long, help = "The column header for the baseline.")]
-        baseline_name: Option<String>,
+enum InternalCommand {
+    #[command(name = "__worker", hide = true)]
+    Worker {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        suite: String,
+        #[arg(long)]
+        scenario: String,
+        #[arg(long, value_enum)]
+        variant: WorkerVariant,
+        #[arg(long)]
+        pair: u8,
+        #[arg(long)]
+        position: u8,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum WorkerVariant {
+    Baseline,
+    Candidate,
+}
+
+impl From<WorkerVariant> for Variant {
+    fn from(value: WorkerVariant) -> Self {
+        match value {
+            WorkerVariant::Baseline => Self::Baseline,
+            WorkerVariant::Candidate => Self::Candidate,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // reqwest is built on rustls-no-provider, so building a Client panics
-    // until a provider is installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    #[cfg(not(target_os = "linux"))]
+    bail!("the load harness requires Linux /proc process status metrics");
 
-    let all = cases::all();
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    match Request::parse(&arguments) {
-        Some(Request::List { ignored_only }) => {
-            harness::list(&all, ignored_only);
-            Ok(())
-        }
-        Some(Request::Run { name }) => {
-            if harness::run_one(&all, &name).await? != Status::Pass {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        None => run_every_case(&all).await,
-    }
-}
-
-async fn run_every_case(all: &[cases::Case]) -> Result<()> {
     let arguments = Arguments::parse();
-    if let Some(Command::Compare {
-        run,
-        name,
-        baseline,
-        baseline_name,
-    }) = arguments.command
+    if let Some(InternalCommand::Worker {
+        binary,
+        suite,
+        scenario,
+        variant,
+        pair,
+        position,
+    }) = arguments.internal
     {
-        print!(
-            "{}",
-            compare::compare(&run, name, baseline.as_deref(), baseline_name)?
-        );
+        let observation =
+            worker::run(&binary, &suite, &scenario, variant.into(), pair, position).await;
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        serde_json::to_writer(&mut output, &observation)?;
+        writeln!(output)?;
         return Ok(());
     }
 
-    let selected: Vec<&cases::Case> = all
-        .iter()
-        .filter(|case| {
-            arguments.cases.is_empty() || arguments.cases.iter().any(|name| name == case.name)
-        })
-        .collect();
-    if selected.is_empty() {
-        bail!("no cases matched");
-    }
     if arguments.list {
-        for case in selected {
-            println!("memory/{}: {}", case.name, case.description);
-        }
+        coordinator::list();
         return Ok(());
     }
 
-    let mut settings = harness::settings_from_environment()?;
-    if let Some(profile) = arguments.profile {
-        settings.profile = match profile {
-            ProfileArgument::Quick => Profile::Quick,
-            ProfileArgument::Full => Profile::Full,
-        };
-    }
-    if let Some(limit) = &arguments.oom_memory_max {
-        settings.oom_memory_max = limit.clone();
-    }
-    let peak_mode = match arguments.peak_mode {
-        Some(PeakModeArgument::Maxrss) => PeakMode::MaxRss,
-        Some(PeakModeArgument::Cgroup) => PeakMode::Cgroup,
-        None => harness::peak_mode_from_environment()?,
+    let Some(baseline) = arguments.baseline else {
+        bail!("--baseline is required");
+    };
+    let Some(candidate) = arguments.candidate else {
+        bail!("--candidate is required");
+    };
+    let Some(output) = arguments.output else {
+        bail!("--output is required");
     };
 
-    let upstream = Upstream::start().await;
-    println!(
-        "fake upstream on {}, aegis binary {}, profile {}, peaks from {}",
-        upstream.base_url(),
-        env!("CARGO_BIN_EXE_aegis"),
-        match settings.profile {
-            Profile::Quick => "quick",
-            Profile::Full => "full",
-        },
-        match peak_mode {
-            PeakMode::MaxRss => "ru_maxrss",
-            PeakMode::Cgroup => "cgroup memory.peak",
-        }
-    );
-
-    let mut records = Vec::new();
-    for case in selected {
-        records.push(
-            runner::run_case(
-                case,
-                &settings,
-                &upstream,
-                peak_mode,
-                arguments.keep,
-                arguments.verbose,
-            )
-            .await,
-        );
-    }
-    let failed = runner::print_summary(&records);
-
-    if let Some(path) = &arguments.junit {
-        report::write_junit(&records, path)?;
-        println!("junit xml written to {}", path.display());
-    }
-    if let Some(path) = &arguments.benchmark_json {
-        report::write_benchmark(&records, path)?;
-        println!("benchmark json written to {}", path.display());
-    }
-
-    if failed > 0 {
+    let invalid = coordinator::run(coordinator::Options {
+        baseline,
+        candidate,
+        output,
+        suites: arguments.suites,
+        scenarios: arguments.scenarios,
+    })?;
+    if invalid > 0 {
         std::process::exit(1);
     }
     Ok(())

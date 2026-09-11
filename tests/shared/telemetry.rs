@@ -4,7 +4,10 @@
 //! client response completes and every read has to poll. Tables and columns are
 //! discovered from the live schema rather than hardcoded.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
@@ -26,6 +29,97 @@ pub async fn wait_for_usage_row(database: &Path, expected: &[(&str, i64)]) -> Op
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     None
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TelemetryState {
+    pub completed: usize,
+    pub disconnected: usize,
+    pub usage_rows: usize,
+}
+
+pub async fn wait_for_background_jobs(database: &Path, expected: usize, timeout: Duration) -> bool {
+    let url = format!("sqlite://{}?mode=ro", database.display());
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(connection) = Database::connect(&url).await {
+            let completed = connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT COUNT(*) AS completed FROM background_jobs".to_string(),
+                ))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.try_get::<i64>("", "completed").ok())
+                .unwrap_or_default();
+            if completed >= expected as i64 {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+pub async fn wait_for_telemetry(
+    database: &Path,
+    expected_completed: usize,
+    expected_disconnected: usize,
+    timeout: Duration,
+) -> TelemetryState {
+    let url = format!("sqlite://{}?mode=ro", database.display());
+    let deadline = Instant::now() + timeout;
+    let mut latest = TelemetryState::default();
+    while Instant::now() < deadline {
+        if let Ok(connection) = Database::connect(&url).await {
+            latest = telemetry_state(&connection).await;
+            if latest.completed >= expected_completed
+                && latest.disconnected >= expected_disconnected
+            {
+                return latest;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    latest
+}
+
+async fn telemetry_state(connection: &impl ConnectionTrait) -> TelemetryState {
+    let request = connection
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS completed, COALESCE(SUM(client_disconnected), 0) AS disconnected FROM gateway_requests WHERE completed_at IS NOT NULL".to_string(),
+        ))
+        .await
+        .ok()
+        .flatten();
+    let completed = request
+        .as_ref()
+        .and_then(|row| row.try_get::<i64>("", "completed").ok())
+        .unwrap_or_default()
+        .max(0) as usize;
+    let disconnected = request
+        .as_ref()
+        .and_then(|row| row.try_get::<i64>("", "disconnected").ok())
+        .unwrap_or_default()
+        .max(0) as usize;
+    let usage_rows = connection
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS rows FROM gateway_usage".to_string(),
+        ))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.try_get::<i64>("", "rows").ok())
+        .unwrap_or_default()
+        .max(0) as usize;
+    TelemetryState {
+        completed,
+        disconnected,
+        usage_rows,
+    }
 }
 
 async fn query_column(connection: &impl ConnectionTrait, sql: String, column: &str) -> Vec<String> {

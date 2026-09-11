@@ -1,30 +1,27 @@
-use std::io::Write;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Bytes;
 use serde_json::json;
 
-use super::measure::{
-    ChildExit, KIB, MIB, PeakSource, PeakTracker, reap, resolve_cgroup_dir, systemd_run_available,
-};
+use super::measure::MIB;
 use super::upstream::Upstream;
 
-/// `MAX_REQUEST_BYTES` in src/gateway/mod.rs, matched by `DefaultBodyLimit::max` in src/app.rs.
 pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
-
 pub const DEFAULT_CAPTURE_BYTES: usize = 16 * MIB;
 
 const API_KEY_HEADER: &str = "x-aegis-api-key";
 const CLAUDE_MODEL: &str = "claude-sonnet-4-5-20250929";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Fake credentials matching the built-in detectors in src/policies/secrets.rs.
 pub fn fake_secrets() -> [(&'static str, String); 3] {
     [
         ("github_token", format!("ghp_{}", "a".repeat(36))),
@@ -89,7 +86,6 @@ impl RequestEncoding {
     }
 }
 
-/// Encoded so the declared header takes the `decode_declared` path in src/compression.rs.
 pub fn encode_request(body: &[u8], encoding: RequestEncoding) -> Result<Bytes> {
     let encoded = match encoding {
         RequestEncoding::Identity => body.to_vec(),
@@ -126,43 +122,10 @@ impl PayloadShape {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeakMode {
-    MaxRss,
-    Cgroup,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MemoryCap {
-    None,
-    Scope,
-    AddressSpace,
-}
-
-impl MemoryCap {
-    pub fn was_breached_by(&self, exit_status: Option<i32>) -> bool {
-        match (self, exit_status) {
-            (Self::Scope, Some(status)) => status == -libc::SIGKILL,
-            (Self::AddressSpace, Some(status)) => status != 0,
-            _ => false,
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::None => "absent",
-            Self::Scope => "MemoryMax",
-            Self::AddressSpace => "RLIMIT_AS",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct GatewayOptions {
     pub guardrails: GuardrailsMode,
     pub max_capture_bytes: usize,
-    pub memory_max: Option<String>,
-    pub peak_mode: PeakMode,
     pub keep_workdir: bool,
 }
 
@@ -171,8 +134,6 @@ impl Default for GatewayOptions {
         Self {
             guardrails: GuardrailsMode::Mask,
             max_capture_bytes: DEFAULT_CAPTURE_BYTES,
-            memory_max: None,
-            peak_mode: PeakMode::MaxRss,
             keep_workdir: false,
         }
     }
@@ -194,9 +155,8 @@ impl Response {
 
 #[derive(Clone, Debug)]
 pub struct Shutdown {
-    pub peak_kib: Option<u64>,
-    pub peak_source: PeakSource,
     pub exit_status: Option<i32>,
+    pub child_reaped: bool,
     pub kept_workdir: Option<PathBuf>,
 }
 
@@ -206,14 +166,10 @@ pub struct Gateway {
     port: u16,
     child: Mutex<Child>,
     pid: u32,
-    scope_unit: Option<String>,
-    cap: MemoryCap,
-    peaks: Arc<PeakTracker>,
-    exit: Mutex<Option<ChildExit>>,
+    exit: Mutex<Option<i32>>,
     shutdown: Mutex<Option<Shutdown>>,
     api_key: String,
     client: reqwest::Client,
-    pub notes: Vec<String>,
     pub upstream: Upstream,
 }
 
@@ -232,12 +188,20 @@ impl Gateway {
     }
 
     pub fn start(upstream: &Upstream, options: GatewayOptions) -> Result<Self> {
+        Self::start_with_binary(Path::new(env!("CARGO_BIN_EXE_aegis")), upstream, options)
+    }
+
+    pub fn start_with_binary(
+        binary: &Path,
+        upstream: &Upstream,
+        options: GatewayOptions,
+    ) -> Result<Self> {
         install_crypto_provider();
-        let binary = Path::new(env!("CARGO_BIN_EXE_aegis"));
         let workdir = std::env::temp_dir().join(format!("aegis-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(workdir.join("data"))?;
+        let mut cleanup = WorkdirCleanup::new(workdir.clone());
 
-        let root_key = workdir.join("data").join("root.key");
+        let root_key = workdir.join("data/root.key");
         std::fs::write(&root_key, random_bytes(32)?)?;
         set_owner_only(&root_key)?;
 
@@ -246,68 +210,32 @@ impl Gateway {
             workdir.join("aegis.toml"),
             config_file(port, upstream.base_url(), &options),
         )?;
-
         let api_key = provision_credentials(binary, &workdir)?;
-        let mut notes = Vec::new();
-        let scope = ScopePlan::decide(&options, &mut notes);
-        let child = spawn_gateway(binary, &workdir, &scope)?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+        let child = spawn_gateway(binary, &workdir)?;
         let pid = child.id();
-
-        let mut gateway = Self {
+        let gateway = Self {
             options,
             workdir,
             port,
             child: Mutex::new(child),
             pid,
-            scope_unit: scope.unit.clone(),
-            cap: scope.cap.clone(),
-            peaks: PeakTracker::new(None),
             exit: Mutex::new(None),
             shutdown: Mutex::new(None),
             api_key,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
-                .build()?,
-            notes,
+            client,
             upstream: upstream.clone(),
         };
+        cleanup.disarm();
 
-        if let Err(error) = gateway.wait_for_port() {
+        if let Err(error) = gateway.wait_until_ready() {
             let tail = gateway.log_tail(20);
-            gateway.attach_cgroup();
             gateway.shut_down();
-            return Err(error.context(format!("gateway did not start; log tail:\n{tail}")));
+            return Err(error.context(format!("gateway did not become ready; log tail:\n{tail}")));
         }
-        gateway.attach_cgroup();
         Ok(gateway)
-    }
-
-    fn attach_cgroup(&mut self) {
-        if self.scope_unit.is_none() {
-            return;
-        }
-        let cgroup_dir = resolve_cgroup_dir(self.pid);
-        if cgroup_dir.is_none() && self.options.peak_mode == PeakMode::Cgroup {
-            self.notes
-                .push("could not resolve the scope cgroup; reporting ru_maxrss instead".into());
-        }
-        self.peaks = PeakTracker::new(cgroup_dir);
-        self.peaks.peak_kib();
-    }
-
-    pub fn describe(&self) -> String {
-        let mut parts = vec![
-            format!("guardrails {}", self.options.guardrails.label()),
-            format!("max_capture {} KiB", self.options.max_capture_bytes / KIB),
-        ];
-        if let Some(limit) = &self.options.memory_max {
-            parts.push(match self.cap {
-                MemoryCap::Scope => format!("MemoryMax {limit}"),
-                MemoryCap::AddressSpace => format!("RLIMIT_AS {limit}"),
-                MemoryCap::None => format!("{limit} requested, uncapped"),
-            });
-        }
-        parts.join(", ")
     }
 
     pub fn base_url(&self) -> String {
@@ -316,14 +244,6 @@ impl Gateway {
 
     pub fn pid(&self) -> u32 {
         self.pid
-    }
-
-    pub fn peaks(&self) -> &Arc<PeakTracker> {
-        &self.peaks
-    }
-
-    pub fn memory_cap(&self) -> &MemoryCap {
-        &self.cap
     }
 
     pub fn database_path(&self) -> PathBuf {
@@ -345,33 +265,31 @@ impl Gateway {
     pub fn exit_status(&self) -> Option<i32> {
         let mut exit = self.exit.lock().expect("exit lock");
         if exit.is_none() {
-            *exit = reap(self.pid, false);
+            let status = self.child.lock().expect("child lock").try_wait().ok()?;
+            *exit = status.map(exit_code);
         }
-        exit.map(|exit| exit.status)
+        *exit
     }
 
-    fn wait_for_port(&self) -> Result<()> {
+    fn wait_until_ready(&self) -> Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < deadline {
             if let Some(status) = self.exit_status() {
                 bail!("gateway exited early with status {status}");
             }
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            if health_ready(self.port) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        bail!(
-            "gateway did not open port {} within {STARTUP_TIMEOUT:?}",
-            self.port
-        )
+        bail!("gateway health did not report ready within {STARTUP_TIMEOUT:?}")
     }
 
     pub fn log_tail(&self, lines: usize) -> String {
         let Ok(log) = std::fs::read_to_string(self.workdir.join("gateway.log")) else {
             return "(no gateway log)".to_string();
         };
-        let collected: Vec<&str> = log.lines().collect();
+        let collected = log.lines().collect::<Vec<_>>();
         collected[collected.len().saturating_sub(lines)..].join("\n")
     }
 
@@ -398,7 +316,6 @@ impl Gateway {
             }
             PayloadShape::ManySmallBlocks => {
                 let filler = "y".repeat(block_bytes.max(1));
-                // `{"type":"text","text":""},` as serialised here.
                 const BLOCK_OVERHEAD: usize = 32;
                 let per_block = block_bytes.max(1) + BLOCK_OVERHEAD;
                 let mut blocks = vec![json!({ "type": "text", "text": preamble })];
@@ -466,13 +383,7 @@ impl Gateway {
                     },
                 }
             }
-            Err(error) => Response {
-                status: None,
-                body: String::new(),
-                bytes_read: 0,
-                seconds: started.elapsed().as_secs_f64(),
-                error: Some(error.to_string()),
-            },
+            Err(error) => failed_response(started, error),
         }
     }
 
@@ -513,17 +424,10 @@ impl Gateway {
                     },
                 }
             }
-            Err(error) => Response {
-                status: None,
-                body: String::new(),
-                bytes_read: 0,
-                seconds: started.elapsed().as_secs_f64(),
-                error: Some(error.to_string()),
-            },
+            Err(error) => failed_response(started, error),
         }
     }
 
-    /// Dropping the socket is what sets `disconnected` on the relay task in src/gateway/mod.rs.
     pub async fn post_and_abandon(&self, url: &str, body: Bytes, read_bytes: usize) -> Response {
         use futures_util::StreamExt;
 
@@ -557,13 +461,7 @@ impl Gateway {
                     error: None,
                 }
             }
-            Err(error) => Response {
-                status: None,
-                body: String::new(),
-                bytes_read: 0,
-                seconds: started.elapsed().as_secs_f64(),
-                error: Some(error.to_string()),
-            },
+            Err(error) => failed_response(started, error),
         }
     }
 
@@ -571,26 +469,18 @@ impl Gateway {
         if let Some(done) = self.shutdown.lock().expect("shutdown lock").clone() {
             return done;
         }
-        let cgroup_peak = self.peaks.peak_kib();
         self.terminate();
-        self.stop_scope();
-
-        let exit = *self.exit.lock().expect("exit lock");
-        let (peak_kib, peak_source) = match self.options.peak_mode {
-            PeakMode::Cgroup if cgroup_peak.is_some() => (cgroup_peak, PeakSource::Cgroup),
-            _ => (exit.map(|exit| exit.max_rss_kib), PeakSource::MaxRss),
-        };
+        let exit_status = *self.exit.lock().expect("exit lock");
         let kept_workdir = if self.options.keep_workdir {
             Some(self.workdir.clone())
         } else {
             let _ = std::fs::remove_dir_all(&self.workdir);
             None
         };
-
         let done = Shutdown {
-            peak_kib,
-            peak_source,
-            exit_status: exit.map(|exit| exit.status),
+            exit_status,
+            child_reaped: exit_status.is_some()
+                && !Path::new(&format!("/proc/{}", self.pid)).exists(),
             kept_workdir,
         };
         *self.shutdown.lock().expect("shutdown lock") = Some(done.clone());
@@ -601,7 +491,6 @@ impl Gateway {
         if self.exit_status().is_some() {
             return;
         }
-        // SAFETY: signalling a pid this process owns.
         unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGTERM) };
         let deadline = Instant::now() + TERMINATE_TIMEOUT;
         while Instant::now() < deadline {
@@ -610,19 +499,12 @@ impl Gateway {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.child.lock().expect("child lock").kill();
-        *self.exit.lock().expect("exit lock") = reap(self.pid, true);
-    }
 
-    fn stop_scope(&self) {
-        let Some(unit) = &self.scope_unit else {
-            return;
-        };
-        let _ = Command::new("systemctl")
-            .args(["--user", "stop", unit])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let mut child = self.child.lock().expect("child lock");
+        let _ = child.kill();
+        if let Ok(status) = child.wait() {
+            *self.exit.lock().expect("exit lock") = Some(exit_code(status));
+        }
     }
 }
 
@@ -630,6 +512,57 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         self.shut_down();
     }
+}
+
+struct WorkdirCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl WorkdirCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkdirCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn failed_response(started: Instant, error: reqwest::Error) -> Response {
+    Response {
+        status: None,
+        body: String::new(),
+        bytes_read: 0,
+        seconds: started.elapsed().as_secs_f64(),
+        error: Some(error.to_string()),
+    }
+}
+
+fn health_ready(port: u16) -> bool {
+    let address = ([127, 0, 0, 1], port).into();
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok()
+        && response.starts_with("HTTP/1.1 200")
+        && response.contains("\"status\":\"ok\"")
 }
 
 fn messages_document(model: &str, content: serde_json::Value) -> serde_json::Value {
@@ -645,79 +578,6 @@ fn install_crypto_provider() {
     INSTALLED.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-pub fn memory_size_bytes(value: &str) -> Option<u64> {
-    let text = value.trim();
-    let (digits, multiplier) = match text.chars().last().map(|last| last.to_ascii_uppercase()) {
-        Some('K') => (&text[..text.len() - 1], KIB as f64),
-        Some('M') => (&text[..text.len() - 1], MIB as f64),
-        Some('G') => (&text[..text.len() - 1], (MIB * KIB) as f64),
-        _ => (text, 1.0),
-    };
-    digits
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .map(|number| (number * multiplier) as u64)
-}
-
-struct ScopePlan {
-    unit: Option<String>,
-    cap: MemoryCap,
-    address_space_bytes: Option<u64>,
-    memory_max: Option<String>,
-}
-
-impl ScopePlan {
-    fn decide(options: &GatewayOptions, notes: &mut Vec<String>) -> Self {
-        let wants_scope = options.peak_mode == PeakMode::Cgroup || options.memory_max.is_some();
-        if !wants_scope {
-            return Self {
-                unit: None,
-                cap: MemoryCap::None,
-                address_space_bytes: None,
-                memory_max: None,
-            };
-        }
-        if systemd_run_available() {
-            return Self {
-                unit: Some(format!(
-                    "aegis-gw-{}-{}.scope",
-                    std::process::id(),
-                    &uuid::Uuid::new_v4().simple().to_string()[..10]
-                )),
-                cap: match options.memory_max {
-                    Some(_) => MemoryCap::Scope,
-                    None => MemoryCap::None,
-                },
-                address_space_bytes: None,
-                memory_max: options.memory_max.clone(),
-            };
-        }
-
-        if options.peak_mode == PeakMode::Cgroup {
-            notes.push("systemd-run --user unavailable; reporting ru_maxrss instead".to_string());
-        }
-        let address_space_bytes = options
-            .memory_max
-            .as_deref()
-            .and_then(memory_size_bytes)
-            .inspect(|_| {
-                notes.push(
-                    "systemd-run --user unavailable; capping RLIMIT_AS instead, which makes allocation fail rather than the kernel killing the process".to_string(),
-                );
-            });
-        Self {
-            unit: None,
-            cap: match address_space_bytes {
-                Some(_) => MemoryCap::AddressSpace,
-                None => MemoryCap::None,
-            },
-            address_space_bytes,
-            memory_max: None,
-        }
-    }
 }
 
 fn config_file(port: u16, upstream_url: &str, options: &GatewayOptions) -> String {
@@ -757,9 +617,8 @@ base_url = "{upstream_url}"
 }
 
 fn provision_credentials(binary: &Path, workdir: &Path) -> Result<String> {
-    let password = workdir.join("data").join("password");
+    let password = workdir.join("data/password");
     std::fs::write(&password, "Aegistest1!pass\n")?;
-
     let created = run_cli(
         binary,
         workdir,
@@ -773,7 +632,6 @@ fn provision_credentials(binary: &Path, workdir: &Path) -> Result<String> {
     )?;
     let user_id = field_after(&created, "created user:")
         .ok_or_else(|| anyhow!("could not read user id from: {created}"))?;
-
     let minted = run_cli(
         binary,
         workdir,
@@ -803,14 +661,29 @@ fn field_after(output: &str, prefix: &str) -> Option<String> {
 }
 
 fn run_cli(binary: &Path, workdir: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new(binary)
+    let mut child = Command::new(binary)
         .args(arguments)
         .current_dir(workdir)
         .env("AEGIS_CONFIG", "./aegis.toml")
         .env_remove("DATABASE_URL")
         .env_remove("HTTP_ADDR")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("running aegis {}", arguments.join(" ")))?;
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("aegis {} exceeded {CLI_TIMEOUT:?}", arguments.join(" "));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         bail!(
             "aegis {} failed ({}): {}",
@@ -822,50 +695,10 @@ fn run_cli(binary: &Path, workdir: &Path, arguments: &[&str]) -> Result<String> 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn spawn_gateway(binary: &Path, workdir: &Path, scope: &ScopePlan) -> Result<Child> {
+fn spawn_gateway(binary: &Path, workdir: &Path) -> Result<Child> {
     let log = std::fs::File::create(workdir.join("gateway.log"))?;
-    let mut command = match &scope.unit {
-        None => Command::new(binary),
-        Some(unit) => {
-            let mut command = Command::new("systemd-run");
-            command.args([
-                "--user",
-                "--scope",
-                "--collect",
-                "--quiet",
-                &format!("--unit={unit}"),
-                "-p",
-                "MemoryAccounting=yes",
-            ]);
-            if let Some(limit) = &scope.memory_max {
-                // Without a swap cap the pages go to zram and nothing is killed.
-                command.args(["-p", &format!("MemoryMax={limit}"), "-p", "MemorySwapMax=0"]);
-            }
-            command.arg("--").arg(binary);
-            command
-        }
-    };
-    command.arg("serve");
-
-    if let Some(bytes) = scope.address_space_bytes {
-        let limit = libc::rlimit {
-            rlim_cur: bytes,
-            rlim_max: bytes,
-        };
-        // SAFETY: setrlimit is async-signal-safe, which is all the closure may
-        // call between fork and exec.
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(move || {
-                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    Ok(command
+    Ok(Command::new(binary)
+        .arg("serve")
         .current_dir(workdir)
         .env("AEGIS_CONFIG", "./aegis.toml")
         .env("RUST_LOG", "warn")
@@ -882,8 +715,7 @@ pub fn free_port() -> Result<u16> {
 }
 
 fn random_bytes(count: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut buffer = vec![0u8; count];
+    let mut buffer = vec![0; count];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buffer)?;
     Ok(buffer)
 }
@@ -892,4 +724,10 @@ fn set_owner_only(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+fn exit_code(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| -status.signal().unwrap_or_default())
 }
