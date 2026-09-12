@@ -775,7 +775,7 @@ mod guardrail_tests {
                 .into_iter()
                 .map(|row| {
                     let body: Vec<u8> = row.try_get("", "body").unwrap();
-                    String::from_utf8(decode_body(&body)).unwrap()
+                    String::from_utf8(decode_body(&body).into_owned()).unwrap()
                 })
                 .collect()
         }

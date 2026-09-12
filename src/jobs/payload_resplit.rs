@@ -210,7 +210,7 @@ async fn stored_parts(
             Ok(StoredPart {
                 path: row.try_get("", "path")?,
                 position: row.try_get("", "position")?,
-                body: decode_body(&body),
+                body: decode_body(&body).into_owned(),
             })
         })
         .collect()
@@ -234,7 +234,7 @@ async fn envelope_body(
         return Ok(None);
     };
     let body: Vec<u8> = row.try_get("", "body")?;
-    Ok(Some(decode_body(&body)))
+    Ok(Some(decode_body(&body).into_owned()))
 }
 
 fn concatenated(mut parts: Vec<StoredPart>) -> Vec<u8> {

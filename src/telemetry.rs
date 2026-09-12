@@ -757,7 +757,7 @@ mod tests {
     }"#;
 
     fn part_body(part: &SemanticPart) -> Vec<u8> {
-        decode_body(&part.payload.body)
+        decode_body(&part.payload.body).into_owned()
     }
 
     fn stored_parts(payload: &SemanticPayload) -> Vec<StoredPart> {

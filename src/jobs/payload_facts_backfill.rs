@@ -76,7 +76,7 @@ async fn blobs_without_facts(
             let body: Vec<u8> = row.try_get("", "body")?;
             Ok(Blob {
                 id: row.try_get("", "id")?,
-                body: decode_body(&body),
+                body: decode_body(&body).into_owned(),
                 is_tool: row.try_get("", "is_tool")?,
             })
         })

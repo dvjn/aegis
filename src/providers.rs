@@ -1,4 +1,5 @@
 use crate::compression::{decode_body, decode_brotli_unsniffable};
+use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug)]
@@ -26,12 +27,23 @@ pub struct Usage {
     pub raw_json: Option<String>,
 }
 
+/// Deserializing into this instead of a `Value` lets serde skip the rest of the
+/// body rather than building a tree that is dropped after one field is read.
+#[derive(Deserialize)]
+struct ModelOnly {
+    #[serde(default)]
+    model: Option<String>,
+}
+
 pub fn requested_model(body: &[u8]) -> Option<String> {
     let decoded = decode_body(body);
-    let value = serde_json::from_slice::<Value>(&decoded).ok().or_else(|| {
-        decode_brotli_unsniffable(body).and_then(|decoded| serde_json::from_slice(&decoded).ok())
-    })?;
-    value.get("model")?.as_str().map(str::to_owned)
+    serde_json::from_slice::<ModelOnly>(&decoded)
+        .ok()
+        .or_else(|| {
+            decode_brotli_unsniffable(body)
+                .and_then(|decoded| serde_json::from_slice(&decoded).ok())
+        })?
+        .model
 }
 
 pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {

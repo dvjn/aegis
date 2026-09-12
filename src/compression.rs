@@ -1,5 +1,8 @@
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use std::io::{Read, Write};
+use std::{
+    borrow::Cow,
+    io::{Read, Write},
+};
 
 const MAX_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -8,7 +11,7 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 // RFC 8878 section 3.1.1.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-pub(crate) fn decode_body(body: &[u8]) -> Vec<u8> {
+pub(crate) fn decode_body(body: &[u8]) -> Cow<'_, [u8]> {
     let decoded = if body.starts_with(&GZIP_MAGIC) {
         read_bounded(GzDecoder::new(body))
     } else if body.starts_with(&ZSTD_MAGIC) {
@@ -16,9 +19,9 @@ pub(crate) fn decode_body(body: &[u8]) -> Vec<u8> {
             .ok()
             .and_then(read_bounded)
     } else {
-        return body.to_vec();
+        return Cow::Borrowed(body);
     };
-    decoded.unwrap_or_else(|| body.to_vec())
+    decoded.map_or(Cow::Borrowed(body), Cow::Owned)
 }
 
 pub(crate) fn decode_gzip(body: &[u8]) -> Option<Vec<u8>> {
@@ -43,14 +46,18 @@ pub(crate) fn decode_brotli_unsniffable(body: &[u8]) -> Option<Vec<u8>> {
     read_bounded(brotli::Decompressor::new(body, 4096))
 }
 
-pub(crate) fn decode_declared(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_declared<'body>(
+    encoding: &str,
+    body: &'body [u8],
+) -> Option<Cow<'body, [u8]>> {
     match encoding.trim().to_ascii_lowercase().as_str() {
-        "" | "identity" => Some(body.to_vec()),
-        "gzip" | "x-gzip" => read_bounded(GzDecoder::new(body)),
+        "" | "identity" => Some(Cow::Borrowed(body)),
+        "gzip" | "x-gzip" => read_bounded(GzDecoder::new(body)).map(Cow::Owned),
         "zstd" => zstd::stream::read::Decoder::new(body)
             .ok()
-            .and_then(read_bounded),
-        "br" => decode_brotli_unsniffable(body),
+            .and_then(read_bounded)
+            .map(Cow::Owned),
+        "br" => decode_brotli_unsniffable(body).map(Cow::Owned),
         _ => None,
     }
 }
@@ -71,15 +78,15 @@ pub(crate) mod tests {
 
     #[test]
     fn plain_bodies_pass_through() {
-        assert_eq!(decode_body(b"{\"a\":1}"), b"{\"a\":1}");
-        assert_eq!(decode_body(b""), b"");
+        assert_eq!(decode_body(b"{\"a\":1}").as_ref(), b"{\"a\":1}");
+        assert_eq!(decode_body(b"").as_ref(), b"");
     }
 
     #[test]
     fn gzip_and_zstd_bodies_round_trip() {
-        assert_eq!(decode_body(&gzip(b"hello")), b"hello");
+        assert_eq!(decode_body(&gzip(b"hello")).as_ref(), b"hello");
         assert_eq!(
-            decode_body(&zstd::encode_all(&b"hello"[..], 0).unwrap()),
+            decode_body(&zstd::encode_all(&b"hello"[..], 0).unwrap()).as_ref(),
             b"hello"
         );
     }
@@ -87,7 +94,7 @@ pub(crate) mod tests {
     #[test]
     fn a_body_that_only_looks_compressed_is_returned_unchanged() {
         let bogus = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01];
-        assert_eq!(decode_body(&bogus), bogus);
+        assert_eq!(decode_body(&bogus).as_ref(), bogus);
     }
 
     #[test]
@@ -101,7 +108,11 @@ pub(crate) mod tests {
             bomb.len() < 1024 * 1024,
             "the fixture must stay small so the cap, not the input size, is what rejects it"
         );
-        assert_eq!(decode_body(&bomb), bomb, "an oversized decode is refused");
+        assert_eq!(
+            decode_body(&bomb).as_ref(),
+            bomb,
+            "an oversized decode is refused"
+        );
     }
 
     pub(crate) fn brotli(body: &[u8]) -> Vec<u8> {
