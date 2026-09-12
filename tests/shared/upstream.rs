@@ -211,6 +211,10 @@ impl Upstream {
                 if sender.send(Ok(frame)).await.is_err() {
                     return;
                 }
+                if knobs.stall_after.is_some_and(|limit| index + 1 >= limit) {
+                    sender.closed().await;
+                    return;
+                }
                 if !knobs.delay.is_zero() {
                     tokio::time::sleep(knobs.delay).await;
                 }
@@ -316,6 +320,7 @@ struct Knobs {
     echo: bool,
     status: u16,
     abort: bool,
+    stall_after: Option<usize>,
     no_stop: bool,
     usage: bool,
     barrier: Option<String>,
@@ -340,6 +345,9 @@ impl Knobs {
             echo: flag("echo"),
             status: number("status", 200) as u16,
             abort: flag("abort"),
+            stall_after: query
+                .get("stall_after")
+                .and_then(|value| value.parse().ok()),
             no_stop: flag("no_stop"),
             usage: query.get("usage").map(String::as_str) != Some("0"),
             barrier: query.get("barrier").cloned(),
