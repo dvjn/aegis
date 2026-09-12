@@ -1,9 +1,11 @@
 //! Functional correctness of the aegis gateway: forwarding, guardrails,
 //! telemetry, auth.
 
+use std::time::Duration;
+
 use crate::shared::{
     gateway::{Gateway, GuardrailsMode, Response, fake_secrets},
-    telemetry::wait_for_usage_row,
+    telemetry::{wait_for_telemetry, wait_for_usage_row},
 };
 
 const PLACEHOLDER_MARKER: &str = "AEGIS_MASKED";
@@ -53,6 +55,34 @@ async fn forwards_streamed_request() {
     assert!(
         response.body.contains("[DONE]"),
         "stream did not reach [DONE]"
+    );
+}
+
+/// Abandoning a response cancels an upstream that has stopped producing bytes.
+#[tokio::test]
+async fn disconnect_cancels_stalled_upstream() {
+    let aegis = Gateway::started().await;
+    let response = aegis
+        .post_and_abandon(
+            &aegis.claude_url("mode=sse&bytes=8192&chunks=4&stall_after=1"),
+            aegis.text_body(false).into(),
+            1,
+        )
+        .await;
+
+    require_ok(&response);
+    assert!(
+        aegis.upstream.wait_until_idle(Duration::from_secs(2)).await,
+        "upstream response remained active after the client disconnected"
+    );
+    let telemetry = wait_for_telemetry(&aegis.database_path(), 1, 1, Duration::from_secs(2)).await;
+    assert_eq!(
+        telemetry.completed, 1,
+        "completion telemetry was not stored"
+    );
+    assert_eq!(
+        telemetry.disconnected, 1,
+        "client disconnect was not recorded"
     );
 }
 
