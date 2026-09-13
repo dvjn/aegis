@@ -274,7 +274,18 @@ impl Gateway {
             let mut first_byte_at = None;
             let mut stream_error = None;
 
-            while let Some(item) = stream.next().await {
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    () = sender.closed() => {
+                        disconnected = true;
+                        break;
+                    }
+                    item = stream.next() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
                 match item {
                     Ok(chunk) => {
                         if first_byte_at.is_none() {
@@ -313,6 +324,9 @@ impl Gateway {
                     }
                 }
             }
+
+            drop(stream);
+            drop(sender);
 
             let usage = extract_usage(provider, &capture);
             let cost = cost(model.as_deref(), &usage);

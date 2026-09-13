@@ -67,6 +67,7 @@ pub enum Workload {
     Cancellation {
         abandon_after_bytes: usize,
         concurrency: usize,
+        stall_after_chunks: Option<usize>,
     },
     Masking {
         matches: usize,
@@ -301,6 +302,7 @@ const SCENARIOS: &[Scenario] = &[
         workload: Workload::Cancellation {
             abandon_after_bytes: 256 * KIB,
             concurrency: 8,
+            stall_after_chunks: None,
         },
     },
     Scenario {
@@ -310,6 +312,7 @@ const SCENARIOS: &[Scenario] = &[
         workload: Workload::Cancellation {
             abandon_after_bytes: 512 * KIB,
             concurrency: 32,
+            stall_after_chunks: None,
         },
     },
     Scenario {
@@ -319,6 +322,7 @@ const SCENARIOS: &[Scenario] = &[
         workload: Workload::Cancellation {
             abandon_after_bytes: 896 * KIB,
             concurrency: 96,
+            stall_after_chunks: None,
         },
     },
     Scenario {
@@ -328,6 +332,17 @@ const SCENARIOS: &[Scenario] = &[
         workload: Workload::Cancellation {
             abandon_after_bytes: 2 * MIB,
             concurrency: 1,
+            stall_after_chunks: None,
+        },
+    },
+    Scenario {
+        suite: "resilience",
+        name: "cancel-stalled-upstream",
+        description: "abandon 16 OpenAI streams after 4 MiB while the upstream is stalled",
+        workload: Workload::Cancellation {
+            abandon_after_bytes: 4 * MIB,
+            concurrency: 16,
+            stall_after_chunks: Some(7),
         },
     },
     Scenario {
@@ -373,7 +388,17 @@ pub async fn run(
         Workload::Cancellation {
             abandon_after_bytes,
             concurrency,
-        } => run_cancellation(gateway, upstream, abandon_after_bytes, concurrency).await,
+            stall_after_chunks,
+        } => {
+            run_cancellation(
+                gateway,
+                upstream,
+                abandon_after_bytes,
+                concurrency,
+                stall_after_chunks,
+            )
+            .await
+        }
         Workload::Masking { matches } => run_masking(gateway, upstream, matches).await,
         Workload::SseStress { usage, truncated } => run_sse_stress(gateway, usage, truncated).await,
         Workload::Soak => run_soak(gateway).await,
@@ -454,10 +479,19 @@ async fn run_cancellation(
     upstream: &crate::shared::upstream::Upstream,
     abandon_after_bytes: usize,
     concurrency: usize,
+    stall_after_chunks: Option<usize>,
 ) -> Result<WorkloadResult> {
     let payload = generate(OPENAI_HEAVY, abandon_after_bytes)?;
-    let response_bytes = abandon_after_bytes + 512 * KIB;
-    let query = format!("mode=sse&bytes={response_bytes}&chunks=128&delay_ms=2&usage=1");
+    let (response_bytes, chunks) = if stall_after_chunks.is_some() {
+        (abandon_after_bytes + MIB, 8)
+    } else {
+        (abandon_after_bytes + 512 * KIB, 128)
+    };
+    let stall = stall_after_chunks
+        .map(|chunks| format!("&stall_after={chunks}"))
+        .unwrap_or_default();
+    let query =
+        format!("mode=sse&bytes={response_bytes}&chunks={chunks}&delay_ms=2&usage=1{stall}");
     let url = provider_url(gateway, OPENAI_HEAVY, &query);
     let responses = join_all(
         (0..concurrency)
