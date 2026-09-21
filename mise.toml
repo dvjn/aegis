@@ -5,7 +5,7 @@ zig = "0.16.0"
 "github:rust-cross/cargo-zigbuild" = { version = "0.23.4", exe = "cargo-zigbuild" }
 "github:nextest-rs/nextest" = { version = "cargo-nextest-0.9.143", exe = "cargo-nextest" }
 watchexec = "2.7.3"
-jq = "1.8.1"
+jq = "1.8.2"
 
 [env]
 TARGETS = "{{ env.BUILD_TARGETS | default(value='x86_64-unknown-linux-musl:amd64 aarch64-unknown-linux-musl:arm64') }}"
