@@ -20,7 +20,15 @@ pub const PLACEHOLDER_PREFIX: &str = "AEGIS_MASKED_";
 pub const PLACEHOLDER_SUFFIX: &str = "_END";
 const PLACEHOLDER_DIGEST_BYTES: usize = 11;
 
-const SCANNED_FIELDS: [&str; 5] = ["system", "messages", "tools", "instructions", "input"];
+const SCANNED_FIELDS: [&str; 7] = [
+    "system",
+    "messages",
+    "tools",
+    "instructions",
+    "input",
+    "state",
+    "questions",
+];
 const TOOL_CREDENTIAL_FIELDS: [&str; 2] = ["headers", "authorization_token"];
 const SIGNED_ITEM_CONTAINERS: [&str; 2] = ["messages", "input"];
 const ATTACHMENT_DATA_FIELD: &str = "data";
@@ -450,6 +458,23 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_secret_in_typesafe_state_or_questions_is_masked() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"jev-latest","state":"config: {GITHUB_TOKEN}","questions":{{"leaks":{{"type":"noul","instructions":"Is {AWS_KEY} in it?"}}}}}}"#
+        ));
+        let verdict = policy(GuardrailsMode::Mask)
+            .evaluate(&context(&body))
+            .expect("JSON evaluates");
+        let Outcome::Transform { body: masked, .. } = verdict.outcome else {
+            panic!("a secret in the judged state must transform the body");
+        };
+        let masked = String::from_utf8(masked.to_vec()).expect("the masked body is UTF-8");
+        assert!(!masked.contains(GITHUB_TOKEN), "{masked}");
+        assert!(!masked.contains(AWS_KEY), "{masked}");
+        assert_eq!(verdict.findings.match_count, 2);
     }
 
     #[test]

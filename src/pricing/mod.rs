@@ -217,6 +217,23 @@ mod tests {
     }
 
     #[test]
+    fn every_jev_name_is_priced_and_charges_for_input_alone() {
+        let map = PriceMap::vendored();
+        for model in ["jev-1.13.0", "jev-latest", "jev-preview"] {
+            let price = map.price(model).unwrap_or_else(|| panic!("{model}"));
+            assert_eq!(price.input, 4.2e-8);
+            assert_eq!(price.output, 0.0);
+        }
+        let cost = map.cost(Some("jev-latest"), &usage(1_000_000, 0, 0, 1_000_000));
+        assert_eq!(cost.source, CostSource::Calculated);
+        assert_eq!(
+            cost.nanodollars,
+            Some((0.042 * NANODOLLARS_PER_DOLLAR) as i64),
+            "output tokens are free"
+        );
+    }
+
+    #[test]
     fn a_fetched_price_replaces_the_vendored_one() {
         let vendored = PriceMap::vendored()
             .price("claude-sonnet-4-5")

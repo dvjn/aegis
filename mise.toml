@@ -39,7 +39,8 @@ if [[ ! -s data/api-key ]]; then
     --user "$(tr -d '\r\n' < data/user-id)" \
     --name mise \
     --provider claude \
-    --provider codex)"
+    --provider codex \
+    --provider typesafe)"
   api_key="$(sed -n 's/^key: //p' <<<"$key_output")"
   test -n "$api_key" || { printf '%s\n' "$key_output" >&2; exit 1; }
   (umask 077; printf '%s\n' "$api_key" > data/api-key)
@@ -91,6 +92,18 @@ exec codex \
   --config model_providers.aegis.requires_openai_auth=true \
   --config 'model_providers.aegis.env_http_headers={ "x-aegis-api-key" = "AEGIS_API_KEY" }' \
   "$@"
+'''
+
+[tasks.typesafe]
+description = "Run a command against TypeSafe through local Aegis"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+test $# -gt 0 || { echo "usage: mise run typesafe -- <command> [args...]" >&2; exit 2; }
+test -s data/api-key || { echo "Run 'mise run serve' or 'mise run dev' once to create data/api-key" >&2; exit 1; }
+export AEGIS_API_KEY="$(tr -d '\r\n' < data/api-key)"
+export TYPESAFE_BASE_URL="http://127.0.0.1:8765/providers/typesafe"
+exec "$@"
 '''
 
 [tasks.pi]
@@ -145,11 +158,14 @@ jq -S '
   to_entries
   | map(select(
       (.value | type == "object")
-      and (.value.litellm_provider == "anthropic" or .value.litellm_provider == "openai")
+      and (.value.litellm_provider == "anthropic"
+           or .value.litellm_provider == "openai"
+           or .value.litellm_provider == "typesafe")
       and (.value.input_cost_per_token != null)
     ))
   | map({
-      key: .key,
+      key: (if .value.litellm_provider == "typesafe"
+            then (.key | sub("^typesafe/"; "")) else .key end),
       value: (
         { input: .value.input_cost_per_token,
           output: (.value.output_cost_per_token // 0) }

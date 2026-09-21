@@ -91,7 +91,7 @@ struct ContextPart {
 /// What a turn is built from, in the order it reaches the model, in one fixed
 /// order whatever the sizes, so the same row is in the same place on every
 /// visit.
-fn context_parts(context: &ContextTotals) -> [ContextPart; 8] {
+fn context_parts(context: &ContextTotals) -> Vec<ContextPart> {
     let part = |label, bytes, cost_nanodollars, class| ContextPart {
         label,
         bytes,
@@ -142,12 +142,27 @@ fn context_parts(context: &ContextTotals) -> [ContextPart; 8] {
             "context-tool-results",
         ),
         part(
-            "other",
-            context.other_bytes,
-            context.other_cost_nanodollars,
-            "context-other",
+            "evidence",
+            context.evidence_bytes,
+            context.evidence_cost_nanodollars,
+            "context-evidence",
+        ),
+        part(
+            "judgment",
+            context.judgment_bytes,
+            context.judgment_cost_nanodollars,
+            "context-judgment",
         ),
     ]
+    .into_iter()
+    .filter(|part| part.bytes > 0)
+    .chain([part(
+        "other",
+        context.other_bytes,
+        context.other_cost_nanodollars,
+        "context-other",
+    )])
+    .collect()
 }
 
 fn context_card(context: &ContextTotals) -> Markup {
@@ -723,6 +738,7 @@ mod tests {
             tool_use_cost_nanodollars: 7_737_500,
             tool_result_cost_nanodollars: 25_000_000,
             other_cost_nanodollars: 0,
+            ..ContextTotals::default()
         };
         let card = context_card(&context).into_string();
         assert!(
@@ -768,6 +784,27 @@ mod tests {
         );
         for absent in ["tool-related", "requests", "bytes per token"] {
             assert!(!card.contains(absent), "{absent} is a derived sentence");
+        }
+
+        let typesafe = ContextTotals {
+            requests: 2,
+            evidence_bytes: 700_000,
+            judgment_bytes: 300_000,
+            total_bytes: 1_000_000,
+            questions_asked: 6,
+            evidence_cost_nanodollars: 7_000_000,
+            judgment_cost_nanodollars: 3_000_000,
+            ..ContextTotals::default()
+        };
+        let card = context_card(&typesafe).into_string();
+        for label in ["evidence", "judgment", "other"] {
+            assert!(card.contains(&format!(r#"title="{label}""#)), "{card}");
+        }
+        for chat in ["tool definition", "assistant", "thinking", "tool result"] {
+            assert!(
+                !card.contains(&format!(r#"title="{chat}""#)),
+                "a System One account has no {chat} row: {card}"
+            );
         }
 
         let page = page_without_traffic().into_string();

@@ -610,6 +610,11 @@ base_url = "{upstream_url}"
 id = "codex"
 type = "codex_subscription"
 base_url = "{upstream_url}"
+
+[[providers]]
+id = "typesafe"
+type = "typesafe"
+base_url = "{upstream_url}"
 "#,
         capture = options.max_capture_bytes,
         mode = mode.label(),
@@ -646,6 +651,8 @@ fn provision_credentials(binary: &Path, workdir: &Path) -> Result<String> {
             "claude",
             "--provider",
             "codex",
+            "--provider",
+            "typesafe",
         ],
     )?;
     field_after(&minted, "key:").ok_or_else(|| anyhow!("could not read api key from: {minted}"))

@@ -140,14 +140,19 @@ pub enum ProviderKind {
         #[serde(default = "default_codex_base_url")]
         base_url: String,
     },
+    #[serde(rename = "typesafe")]
+    TypeSafe {
+        #[serde(default = "default_typesafe_base_url")]
+        base_url: String,
+    },
 }
 
 impl ProviderKind {
     pub fn base_url(&self) -> &str {
         match self {
-            Self::ClaudeSubscription { base_url } | Self::CodexSubscription { base_url } => {
-                base_url
-            }
+            Self::ClaudeSubscription { base_url }
+            | Self::CodexSubscription { base_url }
+            | Self::TypeSafe { base_url } => base_url,
         }
     }
 }
@@ -409,6 +414,10 @@ fn default_anthropic_base_url() -> String {
 
 fn default_codex_base_url() -> String {
     "https://chatgpt.com/backend-api/codex".into()
+}
+
+fn default_typesafe_base_url() -> String {
+    "https://api.typesafe.ai".into()
 }
 
 fn default_pricing_url() -> String {

@@ -101,6 +101,7 @@ impl Gateway {
                         (Provider::Anthropic, base_url)
                     }
                     ProviderKind::CodexSubscription { base_url } => (Provider::Codex, base_url),
+                    ProviderKind::TypeSafe { base_url } => (Provider::TypeSafe, base_url),
                 };
                 let parsed = url::Url::parse(&base_url)
                     .with_context(|| format!("provider {:?} has an invalid base_url", config.id))?;

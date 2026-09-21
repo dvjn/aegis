@@ -6,6 +6,7 @@ use serde_json::Value;
 pub enum Provider {
     Anthropic,
     Codex,
+    TypeSafe,
 }
 
 impl Provider {
@@ -13,6 +14,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic_messages",
             Self::Codex => "openai_responses",
+            Self::TypeSafe => "typesafe_systemone",
         }
     }
 }
@@ -82,6 +84,14 @@ pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
                 raw_json: serde_json::to_string(value).ok(),
             }
         }
+        Provider::TypeSafe => Usage {
+            input_tokens: integer(value, "input_tokens"),
+            output_tokens: integer(value, "output_tokens"),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            raw_json: serde_json::to_string(value).ok(),
+        },
     }
 }
 
@@ -246,6 +256,34 @@ data: {"type":"message_delta","usage":{"output_tokens":42,"input_tokens":10}}
         let usage = extract_usage(Provider::Codex, body);
         assert_eq!(usage.input_tokens, Some(0));
         assert_eq!(usage.cache_read_tokens, Some(400));
+    }
+
+    const TYPESAFE_BODY: &[u8] = br#"{"model":"jev-1.13.0","answers":{"blue":{"type":"noul","noul":0.97}},"usage":{"input_tokens":123,"output_tokens":7}}"#;
+
+    #[test]
+    fn extracts_typesafe_usage() {
+        let usage = extract_usage(Provider::TypeSafe, TYPESAFE_BODY);
+        assert_eq!(usage.input_tokens, Some(123));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.cache_write_tokens, None);
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn extracts_compressed_typesafe_usage() {
+        let usage = extract_usage(
+            Provider::TypeSafe,
+            &crate::compression::tests::gzip(TYPESAFE_BODY),
+        );
+        assert_eq!(usage.input_tokens, Some(123));
+        assert_eq!(usage.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn typesafe_aliases_are_read_as_the_requested_model() {
+        let body = br#"{"model":"jev-latest","state":"hello","questions":{}}"#;
+        assert_eq!(requested_model(body).as_deref(), Some("jev-latest"));
     }
 
     #[test]
