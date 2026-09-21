@@ -4,7 +4,7 @@ use std::{borrow::Cow, time::Duration};
 
 use rmcp::{
     ServerHandler,
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig},
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
@@ -35,8 +35,8 @@ impl ServerHandler for McpServer {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().build())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
