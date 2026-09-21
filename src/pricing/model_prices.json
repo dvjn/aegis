@@ -11,7 +11,7 @@
   "chatgpt-image-latest": {
     "cache_read": 0.00000125,
     "input": 0.000005,
-    "output": 0
+    "output": 0.00001
   },
   "claude-3-7-sonnet-20250219": {
     "cache_read": 3E-7,
@@ -185,6 +185,10 @@
     "cache_read": 3.75E-7,
     "input": 0.0000015,
     "output": 0.000006
+  },
+  "computer-use-preview": {
+    "input": 0.000003,
+    "output": 0.000012
   },
   "daybreak-blue-latest": {
     "cache_read": 4E-7,
@@ -413,15 +417,15 @@
     "output": 0.000005
   },
   "gpt-4o-mini-tts": {
-    "input": 0.0000025,
+    "input": 6E-7,
     "output": 0.00001
   },
   "gpt-4o-mini-tts-2025-03-20": {
-    "input": 0.0000025,
+    "input": 6E-7,
     "output": 0.00001
   },
   "gpt-4o-mini-tts-2025-12-15": {
-    "input": 0.0000025,
+    "input": 6E-7,
     "output": 0.00001
   },
   "gpt-4o-realtime-preview": {
@@ -619,12 +623,10 @@
     "output": 0.00000125
   },
   "gpt-5.4-pro": {
-    "cache_read": 0.000003,
     "input": 0.00003,
     "output": 0.00018
   },
   "gpt-5.4-pro-2026-03-05": {
-    "cache_read": 0.000003,
     "input": 0.00003,
     "output": 0.00018
   },
@@ -638,13 +640,16 @@
     "input": 0.000005,
     "output": 0.00003
   },
+  "gpt-5.5-cyber": {
+    "cache_read": 0.00000125,
+    "input": 0.0000125,
+    "output": 0.000075
+  },
   "gpt-5.5-pro": {
-    "cache_read": 0.000003,
     "input": 0.00003,
     "output": 0.00018
   },
   "gpt-5.5-pro-2026-04-23": {
-    "cache_read": 0.000003,
     "input": 0.00003,
     "output": 0.00018
   },
@@ -801,6 +806,7 @@
     "output": 0.000016
   },
   "gpt-realtime-mini": {
+    "cache_read": 6E-8,
     "input": 6E-7,
     "output": 0.0000024
   },
@@ -813,6 +819,11 @@
     "cache_read": 6E-8,
     "input": 6E-7,
     "output": 0.0000024
+  },
+  "gpt-rosalind-research": {
+    "cache_read": 5E-7,
+    "input": 0.000005,
+    "output": 0.000025
   },
   "o1": {
     "cache_read": 0.0000075,
