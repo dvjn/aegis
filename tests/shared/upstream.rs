@@ -182,7 +182,30 @@ impl Upstream {
         self.active_streams.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _active = ActiveStream::new(Arc::clone(&upstream.active_streams));
+            if openai {
+                let created = event_frame(
+                    "response.created",
+                    &json!({
+                        "type":"response.created",
+                        "sequence_number":0,
+                        "response":{"id":"resp_load","status":"in_progress","model":RESOLVED_MODEL,"usage":null}
+                    }),
+                );
+                if sender.send(Ok(created)).await.is_err() {
+                    return;
+                }
+            }
             if !openai {
+                let start = event_frame(
+                    "message_start",
+                    &json!({
+                        "type":"message_start",
+                        "message":{"id":"msg_load","type":"message","role":"assistant","model":RESOLVED_MODEL,"usage":{"input_tokens":0}}
+                    }),
+                );
+                if sender.send(Ok(start)).await.is_err() {
+                    return;
+                }
                 let start = event_frame(
                     "content_block_start",
                     &json!({
@@ -254,7 +277,7 @@ impl Upstream {
                         &json!({
                             "type":"response.completed",
                             "sequence_number":knobs.chunks + 1,
-                            "response":{"id":"resp_load","status":"completed","usage":usage(true)}
+                            "response":{"id":"resp_load","status":"completed","model":RESOLVED_MODEL,"usage":usage(true)}
                         }),
                     );
                     if sender.send(Ok(completed)).await.is_err() {
@@ -397,7 +420,7 @@ async fn handle(
 fn json_response(knobs: &Knobs, openai: bool, typesafe: bool, echoed: &str) -> Response {
     let document = json!({
         "id":"resp_fake",
-        "model":"fake-model",
+        "model":RESOLVED_MODEL,
         "content":"x".repeat(knobs.bytes) + echoed,
         "usage":if typesafe { typesafe_usage() } else { usage(openai) },
     })
@@ -413,6 +436,9 @@ fn json_response(knobs: &Knobs, openai: bool, typesafe: bool, echoed: &str) -> R
 fn event_frame(event: &str, payload: &Value) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {payload}\n\n"))
 }
+
+/// What every fake upstream reports running, whatever alias was requested.
+pub const RESOLVED_MODEL: &str = "fake-model-2026-09-22";
 
 fn typesafe_usage() -> Value {
     json!({

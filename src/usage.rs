@@ -456,7 +456,8 @@ pub struct UsageStore {
 /// Parameters, in order: user, window start, first whole hour, last whole
 /// hour end, window end, user, first whole hour, last whole hour end.
 const WINDOW_ROWS_SQL: &str = "WITH r AS ( \
-     SELECT q.started_at moment, q.provider, q.requested_model, k.name key_name, \
+     SELECT q.started_at moment, q.provider, \
+     COALESCE(q.resolved_model, q.requested_model) requested_model, k.name key_name, \
      1 requests, \
      CASE WHEN q.http_status < 400 AND q.error_message IS NULL THEN 1 ELSE 0 END succeeded, \
      CASE WHEN q.http_status >= 400 OR q.error_message IS NOT NULL THEN 1 ELSE 0 END failed, \

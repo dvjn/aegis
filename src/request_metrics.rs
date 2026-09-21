@@ -419,6 +419,7 @@ pub(crate) mod tests {
                 response_truncated: false,
                 client_disconnected: false,
                 usage: &Usage::default(),
+                resolved_model: None,
                 cost: Cost {
                     nanodollars: None,
                     source: CostSource::Unknown,

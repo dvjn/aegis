@@ -125,7 +125,9 @@ pub async fn backfill_unknown_costs(
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
-                    "SELECT u.request_id, r.requested_model, u.input_tokens, u.output_tokens, \
+                    "SELECT u.request_id, \
+                     COALESCE(r.resolved_model, r.requested_model) requested_model, \
+                     u.input_tokens, u.output_tokens, \
                      u.cache_read_tokens, u.cache_write_tokens \
                      FROM gateway_usage u JOIN gateway_requests r ON r.id = u.request_id \
                      WHERE u.cost_nanodollars IS NULL \

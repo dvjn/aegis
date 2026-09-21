@@ -48,12 +48,37 @@ pub fn requested_model(body: &[u8]) -> Option<String> {
         .model
 }
 
-pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
-    let Some(owned_usage) = decoded_last_usage(body) else {
-        return Usage::default();
-    };
-    let value = &owned_usage;
+/// What the response reported: the tokens it spent, and the model that spent
+/// them, which is the resolved id behind an alias like `claude-sonnet-4-5` or
+/// `jev-latest`.
+#[derive(Debug, Default)]
+pub struct Completion {
+    pub usage: Usage,
+    pub model: Option<String>,
+}
 
+pub fn extract_completion(provider: Provider, body: &[u8]) -> Completion {
+    let found = decoded_response(body);
+    Completion {
+        usage: found
+            .usage
+            .map(|usage| usage_from(provider, &usage))
+            .unwrap_or_default(),
+        model: found.model,
+    }
+}
+
+/// The model a stored response reported, for rows captured before the gateway
+/// recorded it.
+pub fn response_model(body: &[u8]) -> Option<String> {
+    decoded_response(body).model
+}
+
+pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
+    extract_completion(provider, body).usage
+}
+
+fn usage_from(provider: Provider, value: &Value) -> Usage {
     match provider {
         Provider::Anthropic => Usage {
             input_tokens: integer(value, "input_tokens"),
@@ -95,28 +120,41 @@ pub fn extract_usage(provider: Provider, body: &[u8]) -> Usage {
     }
 }
 
-enum Scan {
-    NoValues,
-    LastUsage(Option<Value>),
+/// The last usage a body reported and the first model it named. Usage comes
+/// last because a stream totals it as it goes; the model comes first because it
+/// is named in the opening frame and never changes, and a capture that hit its
+/// byte limit keeps the head of the body but not the tail.
+#[derive(Default)]
+struct Found {
+    usage: Option<Value>,
+    model: Option<String>,
 }
 
-fn decoded_last_usage(body: &[u8]) -> Option<Value> {
-    match scan_last_usage(&decode_body(body)) {
-        Scan::LastUsage(usage) => usage,
-        Scan::NoValues => match scan_last_usage(&decode_brotli_unsniffable(body)?) {
-            Scan::LastUsage(usage) => usage,
-            Scan::NoValues => None,
+enum Scan {
+    NoValues,
+    Found(Found),
+}
+
+fn decoded_response(body: &[u8]) -> Found {
+    match scan_response(&decode_body(body)) {
+        Scan::Found(found) => found,
+        Scan::NoValues => match decode_brotli_unsniffable(body).map(|body| scan_response(&body)) {
+            Some(Scan::Found(found)) => found,
+            _ => Found::default(),
         },
     }
 }
 
-fn scan_last_usage(body: &[u8]) -> Scan {
+fn scan_response(body: &[u8]) -> Scan {
     if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
-        return Scan::LastUsage(take_usage(&mut value));
+        return Scan::Found(Found {
+            model: take_model(&value),
+            usage: take_usage(&mut value),
+        });
     }
 
     let mut parsed_any = false;
-    let mut last_usage = None;
+    let mut found = Found::default();
     let frames = String::from_utf8_lossy(body);
     let frames = frames
         .lines()
@@ -128,16 +166,29 @@ fn scan_last_usage(body: &[u8]) -> Scan {
             continue;
         };
         parsed_any = true;
+        if found.model.is_none() {
+            found.model = take_model(&value);
+        }
         if let Some(usage) = take_usage(&mut value) {
-            last_usage = Some(usage);
+            found.usage = Some(usage);
         }
     }
 
     if parsed_any {
-        Scan::LastUsage(last_usage)
+        Scan::Found(found)
     } else {
         Scan::NoValues
     }
+}
+
+/// The three dialects name the model in the same three places they carry usage:
+/// at the top level, under `response`, or under `message`.
+fn take_model(value: &Value) -> Option<String> {
+    [Some(value), value.get("response"), value.get("message")]
+        .into_iter()
+        .flatten()
+        .find_map(|owner| owner.get("model").and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn take_usage(value: &mut Value) -> Option<Value> {
@@ -284,6 +335,93 @@ data: {"type":"message_delta","usage":{"output_tokens":42,"input_tokens":10}}
     fn typesafe_aliases_are_read_as_the_requested_model() {
         let body = br#"{"model":"jev-latest","state":"hello","questions":{}}"#;
         assert_eq!(requested_model(body).as_deref(), Some("jev-latest"));
+    }
+
+    const ANTHROPIC_STREAM: &[u8] = br#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":10}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":42}}
+
+"#;
+
+    const CODEX_STREAM: &[u8] = br#"event: response.created
+data: {"type":"response.created","response":{"model":"gpt-5.6-luna","usage":null}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"model":"gpt-5.6-luna","usage":{"input_tokens":100,"output_tokens":20}}}
+
+"#;
+
+    #[test]
+    fn reads_the_model_each_dialect_reports() {
+        for (provider, body, expected) in [
+            (
+                Provider::Anthropic,
+                ANTHROPIC_STREAM,
+                "claude-sonnet-4-5-20250929",
+            ),
+            (Provider::Codex, CODEX_STREAM, "gpt-5.6-luna"),
+            (Provider::TypeSafe, TYPESAFE_BODY, "jev-1.13.0"),
+        ] {
+            let completion = extract_completion(provider, body);
+            assert_eq!(completion.model.as_deref(), Some(expected));
+            assert!(
+                completion.usage.output_tokens.is_some(),
+                "usage extraction must be unchanged for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_model_survives_a_capture_that_lost_its_tail() {
+        // Capture keeps the head of a body and drops the tail, so a stream cut
+        // short still carries the frame that names the model, but not the one
+        // that totals usage.
+        let first_frame_end = ANTHROPIC_STREAM
+            .windows(6)
+            .position(|window| window == b"event:")
+            .and_then(|start| {
+                ANTHROPIC_STREAM[start + 6..]
+                    .windows(6)
+                    .position(|window| window == b"event:")
+                    .map(|next| start + 6 + next)
+            })
+            .expect("the fixture has two frames");
+        let completion =
+            extract_completion(Provider::Anthropic, &ANTHROPIC_STREAM[..first_frame_end]);
+        assert_eq!(
+            completion.model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(
+            completion.usage.output_tokens, None,
+            "the frame totalling usage never arrived"
+        );
+    }
+
+    #[test]
+    fn a_capture_cut_inside_the_opening_frame_recovers_nothing() {
+        let completion = extract_completion(Provider::Anthropic, &ANTHROPIC_STREAM[..90]);
+        assert_eq!(completion.model, None);
+        assert_eq!(completion.usage.input_tokens, None);
+    }
+
+    #[test]
+    fn a_response_naming_no_model_resolves_to_none() {
+        let body = br#"{"usage":{"input_tokens":1,"output_tokens":2}}"#;
+        let completion = extract_completion(Provider::TypeSafe, body);
+        assert_eq!(completion.model, None);
+        assert_eq!(completion.usage.input_tokens, Some(1));
+    }
+
+    #[test]
+    fn the_model_is_read_from_a_compressed_body() {
+        let completion = extract_completion(
+            Provider::TypeSafe,
+            &crate::compression::tests::gzip(TYPESAFE_BODY),
+        );
+        assert_eq!(completion.model.as_deref(), Some("jev-1.13.0"));
     }
 
     #[test]

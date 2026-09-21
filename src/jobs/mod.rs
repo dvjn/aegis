@@ -3,6 +3,7 @@ mod payload_facts_backfill;
 mod payload_resplit;
 mod request_metrics_rollup;
 mod requested_model_backfill;
+mod resolved_model_backfill;
 mod vacuum;
 
 use crate::telemetry::timestamp;
@@ -28,6 +29,15 @@ async fn prepare(database: &DatabaseConnection) -> bool {
         database,
         requested_model_backfill::NAME,
         requested_model_backfill::run,
+    )
+    .await
+    {
+        return false;
+    }
+    if !run(
+        database,
+        resolved_model_backfill::NAME,
+        resolved_model_backfill::run,
     )
     .await
     {

@@ -65,7 +65,7 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                         cost_by_model_bar(overview.models),
                     ))
                     (masked_tile(overview.guardrails))
-                    (breakdown_card("Models", "Requests, tokens, and cost by the model each request asked for.", "Model", "grid-half rows-3", overview.models, overview.model_series))
+                    (breakdown_card("Models", "Requests, tokens, and cost by the model that answered.", "Model", "grid-half rows-3", overview.models, overview.model_series))
                     (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", "grid-half rows-2", overview.providers, overview.provider_series))
                     (breakdown_card("Keys", "Requests, tokens, and cost by the key that sent them.", "Key", "grid-half rows-2", overview.keys, overview.key_series))
                     (context_card(overview.context))

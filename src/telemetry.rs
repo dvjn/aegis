@@ -330,6 +330,8 @@ pub struct CompletionRecord<'a> {
     pub response_truncated: bool,
     pub client_disconnected: bool,
     pub usage: &'a Usage,
+    /// The model the upstream reported running, when it named one.
+    pub resolved_model: Option<&'a str>,
     pub cost: Cost,
     pub error_message: Option<&'a str>,
 }
@@ -428,7 +430,7 @@ impl SqliteSink {
         transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "UPDATE gateway_requests SET first_byte_at = ?, completed_at = ?, http_status = ?, response_bytes = ?, client_disconnected = ?, error_message = ? WHERE id = ?",
+                "UPDATE gateway_requests SET first_byte_at = ?, completed_at = ?, http_status = ?, response_bytes = ?, client_disconnected = ?, error_message = ?, resolved_model = COALESCE(?, resolved_model) WHERE id = ?",
                 [
                     record.first_byte_at.map(str::to_owned).into(),
                     completed_at.to_owned().into(),
@@ -436,6 +438,7 @@ impl SqliteSink {
                     (record.response_bytes as i64).into(),
                     record.client_disconnected.into(),
                     record.error_message.map(str::to_owned).into(),
+                    record.resolved_model.map(str::to_owned).into(),
                     record.id.to_string().into(),
                 ],
             ))
@@ -589,6 +592,7 @@ mod tests {
                 raw_json: Some("{}".into()),
                 ..Default::default()
             },
+            resolved_model: None,
             cost: Cost {
                 nanodollars: Some(100),
                 source: crate::pricing::CostSource::Calculated,
@@ -653,6 +657,7 @@ mod tests {
                     raw_json: Some(raw_json.clone()),
                     ..Default::default()
                 },
+                resolved_model: None,
                 cost: Cost {
                     nanodollars: None,
                     source: crate::pricing::CostSource::Calculated,

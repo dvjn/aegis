@@ -31,6 +31,25 @@ pub async fn wait_for_usage_row(database: &Path, expected: &[(&str, i64)]) -> Op
     None
 }
 
+/// Polls `gateway_requests` until some row holds `value` in `column`.
+pub async fn wait_for_request_value(database: &Path, column: &str, value: &str) -> bool {
+    let url = format!("sqlite://{}?mode=ro", database.display());
+    let sql =
+        format!(r#"SELECT COUNT(*) AS matches FROM gateway_requests WHERE "{column}" = '{value}'"#);
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(connection) = Database::connect(&url).await
+            && let Ok(Some(row)) = connection
+                .query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, sql.clone()))
+                .await
+            && row.try_get::<i64>("", "matches").unwrap_or(0) > 0
+        {
+            return true;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TelemetryState {
     pub completed: usize,
