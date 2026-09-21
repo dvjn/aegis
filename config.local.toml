@@ -21,3 +21,7 @@ type = "claude_subscription"
 [[providers]]
 id = "codex"
 type = "codex_subscription"
+
+[[providers]]
+id = "typesafe"
+type = "typesafe"

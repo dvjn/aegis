@@ -22,6 +22,7 @@ mod m20260906_000022_compress_usage_json;
 mod m20260906_000023_integer_payload_keys;
 mod m20260908_000024_policy_evaluations;
 mod m20260909_000025_guardrails_hourly;
+mod m20260921_000026_typesafe_request_metrics;
 
 pub struct Migrator;
 
@@ -51,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260906_000023_integer_payload_keys::Migration),
             Box::new(m20260908_000024_policy_evaluations::Migration),
             Box::new(m20260909_000025_guardrails_hourly::Migration),
+            Box::new(m20260921_000026_typesafe_request_metrics::Migration),
         ]
     }
 }

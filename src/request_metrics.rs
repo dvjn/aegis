@@ -2,6 +2,8 @@ use crate::{payload_parts, telemetry::timestamp};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 const COMPONENT_SQL: &str = "CASE
+    WHEN k.path = 'state' THEN 'evidence'
+    WHEN k.path LIKE 'questions/%' THEN 'judgment'
     WHEN k.path = 'tools' OR k.kind = 'additional_tools' THEN 'tool_definition'
     WHEN k.path IN ('system', 'instructions') THEN 'system'
     WHEN k.kind IN ('thinking', 'redacted_thinking', 'reasoning') THEN 'thinking'
@@ -30,8 +32,10 @@ const FACT_COUNT_SQL: &str = "(SELECT COUNT(*) FROM gateway_payload_parts p
 
 const ROLLUP_SQL: &str = "INSERT OR IGNORE INTO gateway_request_metrics (
     request_id, tool_definition_bytes, system_bytes, user_text_bytes, assistant_text_bytes,
-    thinking_bytes, tool_use_bytes, tool_result_bytes, other_bytes, total_bytes,
-    tools_offered, tools_invoked, tool_result_errors, cache_breakpoints, created_at)
+    thinking_bytes, tool_use_bytes, tool_result_bytes, evidence_bytes, judgment_bytes,
+    other_bytes, total_bytes,
+    tools_offered, tools_invoked, tool_result_errors, cache_breakpoints, questions_asked,
+    created_at)
 SELECT ?1,
     SUM(CASE WHEN component = 'tool_definition' THEN bytes ELSE 0 END),
     SUM(CASE WHEN component = 'system' THEN bytes ELSE 0 END),
@@ -40,12 +44,15 @@ SELECT ?1,
     SUM(CASE WHEN component = 'thinking' THEN bytes ELSE 0 END),
     SUM(CASE WHEN component = 'tool_use' THEN bytes ELSE 0 END),
     SUM(CASE WHEN component = 'tool_result' THEN bytes ELSE 0 END),
+    SUM(CASE WHEN component = 'evidence' THEN bytes ELSE 0 END),
+    SUM(CASE WHEN component = 'judgment' THEN bytes ELSE 0 END),
     SUM(CASE WHEN component = 'other' THEN bytes ELSE 0 END),
     SUM(bytes),
     {count:f.block_type = 'tool_definition'},
     {count:f.block_type = 'tool_use'},
     {count:f.block_type = 'tool_result' AND f.is_error = 1},
     {count:f.cache_ttl IS NOT NULL},
+    SUM(CASE WHEN component = 'judgment' THEN 1 ELSE 0 END),
     ?2
 FROM (SELECT b.original_bytes bytes, {component} component
       FROM gateway_payload_parts p
@@ -113,12 +120,15 @@ pub(crate) mod tests {
         pub thinking_bytes: i64,
         pub tool_use_bytes: i64,
         pub tool_result_bytes: i64,
+        pub evidence_bytes: i64,
+        pub judgment_bytes: i64,
         pub other_bytes: i64,
         pub total_bytes: i64,
         pub tools_offered: i64,
         pub tools_invoked: i64,
         pub tool_result_errors: i64,
         pub cache_breakpoints: i64,
+        pub questions_asked: i64,
     }
 
     pub(crate) async fn metrics(
@@ -215,6 +225,7 @@ pub(crate) mod tests {
             tools_invoked: 1,
             tool_result_errors: 1,
             cache_breakpoints: 2,
+            ..Metrics::default()
         };
         let expected = Metrics {
             total_bytes: expected.tool_definition_bytes
@@ -232,6 +243,37 @@ pub(crate) mod tests {
         assert!(
             !rollup(&database, &request_id).await.unwrap(),
             "a second pass leaves the existing row alone"
+        );
+    }
+
+    const TYPESAFE_BODY: &str = r#"{"model":"jev-latest",
+        "state":"the sky at noon",
+        "questions":{
+            "blue":{"type":"noul","instructions":"Is it blue?"},
+            "mood":{"type":"choice","instructions":"Pick one","criteria":{"calm":null,"stormy":null}}}}"#;
+
+    #[tokio::test]
+    async fn a_typesafe_request_is_rolled_up_as_evidence_and_judgment() {
+        let database = database().await;
+        let request_id = started(&database, Provider::TypeSafe, TYPESAFE_BODY.as_bytes()).await;
+
+        assert!(rollup(&database, &request_id).await.unwrap());
+        let json = |text: &str| json_len(serde_json::from_str(text).unwrap());
+        let evidence_bytes = json(r#""the sky at noon""#);
+        let judgment_bytes = json(r#"{"type":"noul","instructions":"Is it blue?"}"#)
+            + json(
+                r#"{"type":"choice","instructions":"Pick one","criteria":{"calm":null,"stormy":null}}"#,
+            );
+        assert_eq!(
+            metrics(&database, &request_id).await,
+            Some(Metrics {
+                evidence_bytes,
+                judgment_bytes,
+                questions_asked: 2,
+                total_bytes: evidence_bytes + judgment_bytes,
+                ..Metrics::default()
+            }),
+            "a System One request spends nothing on chat components and nothing falls to other"
         );
     }
 

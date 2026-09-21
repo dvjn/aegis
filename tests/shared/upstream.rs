@@ -370,6 +370,7 @@ async fn handle(
         tokio::time::sleep(knobs.release_delay).await;
     }
     let openai = uri.path().contains("codex");
+    let typesafe = uri.path().contains("systemone");
     let echoed = if knobs.echo {
         String::from_utf8_lossy(&body).into_owned()
     } else {
@@ -388,17 +389,17 @@ async fn handle(
             .into_response();
     }
     if knobs.mode == "json" {
-        return json_response(&knobs, openai, &echoed);
+        return json_response(&knobs, openai, typesafe, &echoed);
     }
     upstream.stream_sse(knobs, openai, echoed)
 }
 
-fn json_response(knobs: &Knobs, openai: bool, echoed: &str) -> Response {
+fn json_response(knobs: &Knobs, openai: bool, typesafe: bool, echoed: &str) -> Response {
     let document = json!({
         "id":"resp_fake",
         "model":"fake-model",
         "content":"x".repeat(knobs.bytes) + echoed,
-        "usage":usage(openai),
+        "usage":if typesafe { typesafe_usage() } else { usage(openai) },
     })
     .to_string();
     Response::builder()
@@ -411,6 +412,13 @@ fn json_response(knobs: &Knobs, openai: bool, echoed: &str) -> Response {
 
 fn event_frame(event: &str, payload: &Value) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {payload}\n\n"))
+}
+
+fn typesafe_usage() -> Value {
+    json!({
+        "input_tokens":1000,
+        "output_tokens":500,
+    })
 }
 
 fn usage(openai: bool) -> Value {

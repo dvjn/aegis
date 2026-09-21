@@ -227,12 +227,15 @@ pub struct ContextTotals {
     pub thinking_bytes: i64,
     pub tool_use_bytes: i64,
     pub tool_result_bytes: i64,
+    pub evidence_bytes: i64,
+    pub judgment_bytes: i64,
     pub other_bytes: i64,
     pub total_bytes: i64,
     pub tools_offered: i64,
     pub tools_invoked: i64,
     pub tool_result_errors: i64,
     pub cache_breakpoints: i64,
+    pub questions_asked: i64,
     pub tool_definition_cost_nanodollars: i64,
     pub system_cost_nanodollars: i64,
     pub user_text_cost_nanodollars: i64,
@@ -240,6 +243,8 @@ pub struct ContextTotals {
     pub thinking_cost_nanodollars: i64,
     pub tool_use_cost_nanodollars: i64,
     pub tool_result_cost_nanodollars: i64,
+    pub evidence_cost_nanodollars: i64,
+    pub judgment_cost_nanodollars: i64,
     pub other_cost_nanodollars: i64,
 }
 
@@ -497,12 +502,15 @@ const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
      COALESCE(SUM(m.thinking_bytes), 0) thinking_bytes, \
      COALESCE(SUM(m.tool_use_bytes), 0) tool_use_bytes, \
      COALESCE(SUM(m.tool_result_bytes), 0) tool_result_bytes, \
+     COALESCE(SUM(m.evidence_bytes), 0) evidence_bytes, \
+     COALESCE(SUM(m.judgment_bytes), 0) judgment_bytes, \
      COALESCE(SUM(m.other_bytes), 0) other_bytes, \
      COALESCE(SUM(m.total_bytes), 0) total_bytes, \
      COALESCE(SUM(m.tools_offered), 0) tools_offered, \
      COALESCE(SUM(m.tools_invoked), 0) tools_invoked, \
      COALESCE(SUM(m.tool_result_errors), 0) tool_result_errors, \
      COALESCE(SUM(m.cache_breakpoints), 0) cache_breakpoints, \
+     COALESCE(SUM(m.questions_asked), 0) questions_asked, \
      {part_cost:tool_definition_bytes} tool_definition_cost_nanodollars, \
      {part_cost:system_bytes} system_cost_nanodollars, \
      {part_cost:user_text_bytes} user_text_cost_nanodollars, \
@@ -510,6 +518,8 @@ const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
      {part_cost:thinking_bytes} thinking_cost_nanodollars, \
      {part_cost:tool_use_bytes} tool_use_cost_nanodollars, \
      {part_cost:tool_result_bytes} tool_result_cost_nanodollars, \
+     {part_cost:evidence_bytes} evidence_cost_nanodollars, \
+     {part_cost:judgment_bytes} judgment_cost_nanodollars, \
      {part_cost:other_bytes} other_cost_nanodollars \
      FROM gateway_requests r \
      JOIN gateway_keys k ON k.id = r.key_id \
@@ -520,7 +530,7 @@ const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
 const PART_COST_SQL: &str = "COALESCE(CAST(SUM(CASE WHEN m.total_bytes > 0 \
      THEN u.cost_nanodollars * 1.0 * m.{part} / m.total_bytes ELSE 0 END) AS INTEGER), 0)";
 
-const CONTEXT_PARTS: [&str; 8] = [
+const CONTEXT_PARTS: [&str; 10] = [
     "tool_definition_bytes",
     "system_bytes",
     "user_text_bytes",
@@ -528,6 +538,8 @@ const CONTEXT_PARTS: [&str; 8] = [
     "thinking_bytes",
     "tool_use_bytes",
     "tool_result_bytes",
+    "evidence_bytes",
+    "judgment_bytes",
     "other_bytes",
 ];
 
@@ -2175,6 +2187,7 @@ mod tests {
                 tool_use_cost_nanodollars: 10_000,
                 tool_result_cost_nanodollars: 60_000,
                 other_cost_nanodollars: 1_000,
+                ..ContextTotals::default()
             },
             "the priced request's cost is split by each part's share of its bytes; the unpriced one adds nothing"
         );

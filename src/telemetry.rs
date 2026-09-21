@@ -135,12 +135,27 @@ fn split_paths(protocol: &str) -> Option<&'static [&'static str]> {
     match protocol {
         "anthropic_messages" => Some(&["system", "messages", "tools"]),
         "openai_responses" => Some(&["instructions", "input", "tools"]),
+        "typesafe_systemone" => Some(&["state", "questions"]),
         _ => None,
     }
 }
 
+const TYPESAFE: &str = "typesafe_systemone";
+const QUESTIONS: &str = "questions";
+
 fn content_block_path(position: usize) -> String {
     format!("messages/{position}/content")
+}
+
+fn question_path(id: &str) -> String {
+    format!("{QUESTIONS}/{id}")
+}
+
+fn take_members(value: &mut serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    match value {
+        serde_json::Value::Object(members) => std::mem::take(members).into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn take_elements(value: &mut serde_json::Value) -> Vec<serde_json::Value> {
@@ -193,6 +208,12 @@ pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPaylo
         let Some(value) = object.get_mut(*path) else {
             continue;
         };
+        if protocol == TYPESAFE && *path == QUESTIONS {
+            for (id, question) in take_members(value) {
+                parts.push(part(question_path(&id), 0, None, QUESTIONS, &question)?);
+            }
+            continue;
+        }
         for (position, mut value) in take_elements(value).into_iter().enumerate() {
             let role = value
                 .get("role")
@@ -264,6 +285,27 @@ pub(crate) fn reassemble_request(
                     *slot = value;
                 }
             }
+        }
+    }
+    if protocol == TYPESAFE
+        && let Some(serde_json::Value::Object(questions)) = object.get_mut(QUESTIONS)
+    {
+        let paths = grouped
+            .keys()
+            .filter(|path| path.starts_with(&question_path("")))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            let Some(value) = ordered(grouped.remove(&path).unwrap_or_default())
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let id = path
+                .strip_prefix(&question_path(""))
+                .expect("the path was selected by that prefix");
+            questions.insert(id.to_owned(), value);
         }
     }
     if let Some(serde_json::Value::Array(messages)) = object.get_mut("messages") {
@@ -846,6 +888,53 @@ mod tests {
         let body = br#"{"model":"gpt-x","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
         let payload = split_request(body, "openai_responses").expect("the body must parse");
         assert_eq!(indexed(&payload), [("input", 0, "message", Some("user"))]);
+    }
+
+    const TYPESAFE_BODY: &[u8] = br#"{"model":"jev-latest","state":"the sky at noon",
+        "questions":{
+            "blue":{"type":"noul","instructions":"Is it blue?"},
+            "mood":{"type":"choice","instructions":"Pick one","criteria":{"calm":null,"stormy":null}}}}"#;
+
+    #[test]
+    fn typesafe_questions_are_split_one_per_id_and_keep_their_type() {
+        let payload = split_request(TYPESAFE_BODY, "typesafe_systemone").expect("the body parses");
+        assert_eq!(
+            indexed(&payload),
+            [
+                ("state", 0, "state", None),
+                ("questions/blue", 0, "noul", None),
+                ("questions/mood", 0, "choice", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typesafe_body_reassembles_into_the_original_body() {
+        assert_round_trips(TYPESAFE_BODY, "typesafe_systemone");
+        assert_round_trips(
+            br#"{"model":"jev-latest","state":[{"speaker":"a","text":"hi"},{"speaker":"b","text":"ho"}],"questions":{"q":{"type":"score","instructions":"How warm?","criteria":["cold","warm"]}}}"#,
+            "typesafe_systemone",
+        );
+    }
+
+    #[test]
+    fn a_typesafe_state_array_is_split_per_element() {
+        let body =
+            br#"{"model":"jev-latest","state":[{"text":"one"},{"text":"two"}],"questions":{}}"#;
+        let payload = split_request(body, "typesafe_systemone").expect("the body parses");
+        assert_eq!(
+            indexed(&payload),
+            [("state", 0, "state", None), ("state", 1, "state", None)]
+        );
+    }
+
+    #[test]
+    fn a_typesafe_question_is_not_mistaken_for_a_tool_definition() {
+        let payload = split_request(TYPESAFE_BODY, "typesafe_systemone").expect("the body parses");
+        assert!(
+            payload.parts.iter().all(|part| part.facts.is_empty()),
+            "a question carries no schema, so it must produce no tool facts"
+        );
     }
 
     fn assert_round_trips(body: &[u8], protocol: &str) {

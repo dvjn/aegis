@@ -52,7 +52,7 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # Optional. Add one table per upstream provider.
 # [[providers]]
 # id = "provider-name" # Required. Unique URL segment and API-key permission name. Maximum 64 characters: letters, digits, - or _.
-# type = "claude_subscription" # Required: claude_subscription | codex_subscription.
+# type = "claude_subscription" # Required: claude_subscription | codex_subscription | typesafe.
 # base_url = "https://provider.example/v1" # Optional. The provider type supplies a default.
 
 # Optional. Controls model-price refreshes.

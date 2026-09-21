@@ -931,6 +931,8 @@ a[role="button"].compact {
 .context-user { color: #d4c15f; }
 .context-assistant { color: #d47fd8; }
 .context-thinking { color: #b8a27a; }
+.context-evidence { color: #6fbf8b; }
+.context-judgment { color: #c98a6b; }
 .context-other { color: #9fb0c3; }
 
 /* --- Tables -------------------------------------------------------------- */

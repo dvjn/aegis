@@ -28,6 +28,24 @@ fn secrets_present_in(text: &str) -> Vec<&'static str> {
         .collect()
 }
 
+fn typesafe_body(include_secrets: bool) -> String {
+    let mut state = "review this config".to_owned();
+    if include_secrets {
+        for (_, value) in fake_secrets() {
+            state.push(' ');
+            state.push_str(&value);
+        }
+    }
+    serde_json::json!({
+        "model": "jev-latest",
+        "state": state,
+        "questions": {
+            "leaks": {"type": "noul", "instructions": "Does the config leak a credential?"}
+        }
+    })
+    .to_string()
+}
+
 fn secrets_missing_from(text: &str) -> Vec<&'static str> {
     fake_secrets()
         .into_iter()
@@ -252,6 +270,56 @@ async fn codex_provider_records_its_own_usage_shape() {
     assert!(
         table.is_some(),
         "no codex usage row with normalized input tokens appeared"
+    );
+}
+
+/// The typesafe provider forwards a System One request and stores its two flat
+/// token counters.
+#[tokio::test]
+async fn typesafe_provider_records_its_own_usage_shape() {
+    let aegis = Gateway::started().await;
+    let response = aegis
+        .post_text(
+            &aegis.provider_url("typesafe", "/v1/systemone", "mode=json&bytes=256"),
+            typesafe_body(false),
+        )
+        .await;
+    require_ok(&response);
+
+    let table = wait_for_usage_row(
+        &aegis.database_path(),
+        &[
+            ("input_tokens", 1000),
+            ("output_tokens", 500),
+            ("cache_read_tokens", 0),
+            ("reasoning_tokens", 0),
+        ],
+    )
+    .await;
+    assert!(table.is_some(), "no typesafe usage row appeared");
+}
+
+/// Guardrails read the state a System One request judges, not just chat messages.
+#[tokio::test]
+async fn masking_scrubs_secrets_out_of_typesafe_state() {
+    let aegis = Gateway::started_with(GuardrailsMode::Mask).await;
+    let response = aegis
+        .post_text(
+            &aegis.provider_url("typesafe", "/v1/systemone", "mode=json&bytes=256"),
+            typesafe_body(true),
+        )
+        .await;
+    require_ok(&response);
+
+    let forwarded = aegis.upstream.last_body();
+    assert!(
+        secrets_present_in(&forwarded).is_empty(),
+        "raw secrets reached the upstream: {:?}",
+        secrets_present_in(&forwarded)
+    );
+    assert!(
+        forwarded.contains(PLACEHOLDER_MARKER),
+        "no {PLACEHOLDER_MARKER} placeholder in the forwarded body"
     );
 }
 
