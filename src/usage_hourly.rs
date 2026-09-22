@@ -18,7 +18,8 @@ const AGGREGATE_SQL: &str = "INSERT INTO gateway_usage_hourly \
      (user_id, hour, provider, requested_model, key_id, requests, succeeded, failed, \
      input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, \
      cost_nanodollars, unpriced) \
-     SELECT k.user_id, strftime('{hour}', r.started_at), r.provider, COALESCE(r.requested_model, ''), r.key_id, \
+     SELECT k.user_id, strftime('{hour}', r.started_at), r.provider, \
+     COALESCE(r.resolved_model, r.requested_model, ''), r.key_id, \
      COUNT(*), \
      SUM(CASE WHEN r.http_status < 400 AND r.error_message IS NULL THEN 1 ELSE 0 END), \
      SUM(CASE WHEN r.http_status >= 400 OR r.error_message IS NOT NULL THEN 1 ELSE 0 END), \
@@ -182,6 +183,39 @@ mod tests {
                 cost_nanodollars: 5,
                 unpriced: 0,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn buckets_are_keyed_by_the_model_that_answered() {
+        let db = database().await;
+        // Both rode the same alias; the upstream resolved them differently.
+        for (id, resolved) in [
+            ("a", Some("opus-4-5")),
+            ("b", Some("opus-4-6")),
+            ("c", None),
+        ] {
+            request(&db, id, "2026-03-01T10:15:00.000Z", Some("opus-latest")).await;
+            if let Some(resolved) = resolved {
+                db.execute_unprepared(&format!(
+                    "UPDATE gateway_requests SET resolved_model = '{resolved}' WHERE id = '{id}'"
+                ))
+                .await
+                .unwrap();
+            }
+            finish(&db, id, 200, 10, Some(1)).await;
+        }
+        aggregate(&db, None).await.unwrap();
+
+        let labels: Vec<String> = rows(&db)
+            .await
+            .into_iter()
+            .map(|row| row.requested_model)
+            .collect();
+        assert_eq!(
+            labels,
+            ["opus-4-5", "opus-4-6", "opus-latest"],
+            "each resolved model gets its own bucket, and a request with none falls back to the alias"
         );
     }
 

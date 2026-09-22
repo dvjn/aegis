@@ -7,7 +7,7 @@ use crate::{
         Decision, Pipeline, PolicyError, PolicyFailure, RequestContext, restore::StreamRestorer,
     },
     pricing::cost,
-    providers::{Provider, extract_usage, requested_model},
+    providers::{Provider, extract_completion, requested_model},
     request_id::RequestId,
     telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
 };
@@ -329,8 +329,12 @@ impl Gateway {
             drop(stream);
             drop(sender);
 
-            let usage = extract_usage(provider, &capture);
-            let cost = cost(model.as_deref(), &usage);
+            let completion = extract_completion(provider, &capture);
+            let usage = completion.usage;
+            // Price what actually ran: an alias resolves to a dated or versioned
+            // id, and only the response knows which one.
+            let priced_model = completion.model.as_deref().or(model.as_deref());
+            let cost = cost(priced_model, &usage);
             for (field, value) in [
                 ("input_tokens", usage.input_tokens),
                 ("output_tokens", usage.output_tokens),
@@ -360,6 +364,7 @@ impl Gateway {
                     response_truncated: truncated,
                     client_disconnected: disconnected,
                     usage: &usage,
+                    resolved_model: completion.model.as_deref(),
                     cost,
                     error_message: stream_error.as_deref(),
                 })

@@ -4,8 +4,9 @@
 use std::time::Duration;
 
 use crate::shared::{
-    gateway::{Gateway, GuardrailsMode, Response, fake_secrets},
-    telemetry::{wait_for_telemetry, wait_for_usage_row},
+    gateway::{CLAUDE_MODEL, Gateway, GuardrailsMode, Response, fake_secrets},
+    telemetry::{wait_for_request_value, wait_for_telemetry, wait_for_usage_row},
+    upstream::RESOLVED_MODEL,
 };
 
 const PLACEHOLDER_MARKER: &str = "AEGIS_MASKED";
@@ -320,6 +321,28 @@ async fn masking_scrubs_secrets_out_of_typesafe_state() {
     assert!(
         forwarded.contains(PLACEHOLDER_MARKER),
         "no {PLACEHOLDER_MARKER} placeholder in the forwarded body"
+    );
+}
+
+/// Metrics follow the model the upstream reported, not the alias asked for.
+#[tokio::test]
+async fn the_model_the_upstream_ran_is_recorded() {
+    let aegis = Gateway::started().await;
+    let response = aegis
+        .post_text(
+            &aegis.claude_url("mode=sse&bytes=1024&chunks=2"),
+            aegis.text_body(false),
+        )
+        .await;
+    require_ok(&response);
+
+    assert!(
+        wait_for_request_value(&aegis.database_path(), "resolved_model", RESOLVED_MODEL).await,
+        "the model from the response was not recorded"
+    );
+    assert!(
+        wait_for_request_value(&aegis.database_path(), "requested_model", CLAUDE_MODEL).await,
+        "what the client asked for is still recorded beside it"
     );
 }
 

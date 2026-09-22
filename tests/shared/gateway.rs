@@ -17,7 +17,7 @@ pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_CAPTURE_BYTES: usize = 16 * MIB;
 
 const API_KEY_HEADER: &str = "x-aegis-api-key";
-const CLAUDE_MODEL: &str = "claude-sonnet-4-5-20250929";
+pub const CLAUDE_MODEL: &str = "claude-sonnet-4-5-20250929";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
