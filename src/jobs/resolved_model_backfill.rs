@@ -31,6 +31,7 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
         if updates.is_empty() {
             continue;
         }
+        let updated_before = updated;
         let transaction = begin_immediate(database).await?;
         for (request_id, model) in updates {
             let result = transaction
@@ -42,6 +43,11 @@ pub async fn run(database: &DatabaseConnection) -> Result<u64, DbErr> {
                 ))
                 .await?;
             updated += result.rows_affected();
+        }
+        if updated > updated_before {
+            // Buckets already written hold the alias these rows were labelled
+            // with, and nothing else would ever revisit them.
+            crate::jobs::hourly_buckets::invalidate(&transaction).await?;
         }
         transaction.commit().await?;
         tracing::debug!(job = NAME, after = %after, "background job batch committed");
@@ -135,6 +141,53 @@ mod tests {
             .unwrap()
             .try_get("", "resolved_model")
             .unwrap()
+    }
+
+    async fn generation_marked(database: &DatabaseConnection) -> bool {
+        database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) matches FROM background_jobs
+                 WHERE name = 'hourly_buckets_generation_v2'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "matches")
+            .unwrap()
+            > 0
+    }
+
+    async fn mark_generation(database: &DatabaseConnection) {
+        database
+            .execute_unprepared(
+                "INSERT OR REPLACE INTO background_jobs (name, completed_at)
+                 VALUES ('hourly_buckets_generation_v2', '2026-09-22T00:00:00Z')",
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relabelled_requests_send_the_hourly_buckets_back_for_a_rebuild() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&database, None).await.unwrap();
+        insert_request(&database, "a", None, Some(RESPONSE)).await;
+        mark_generation(&database).await;
+
+        assert_eq!(run(&database).await.unwrap(), 1);
+        assert!(
+            !generation_marked(&database).await,
+            "buckets written under the alias must be rebuilt"
+        );
+
+        mark_generation(&database).await;
+        assert_eq!(run(&database).await.unwrap(), 0);
+        assert!(
+            generation_marked(&database).await,
+            "a pass that changes nothing leaves the buckets alone"
+        );
     }
 
     #[tokio::test]
