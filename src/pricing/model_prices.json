@@ -151,6 +151,12 @@
     "input": 0.000005,
     "output": 0.000025
   },
+  "claude-opus-5-5": {
+    "cache_read": 2E-7,
+    "cache_write": 0.000005,
+    "input": 0.000004,
+    "output": 0.00002
+  },
   "claude-sonnet-4-20250514": {
     "cache_read": 3E-7,
     "cache_write": 0.00000375,
@@ -688,6 +694,18 @@
     "cache_write": 0.0000125,
     "input": 0.00001,
     "output": 0.00005
+  },
+  "gpt-6-luna": {
+    "cache_read": 1E-8,
+    "cache_write": 1.25E-7,
+    "input": 1E-7,
+    "output": 5E-7
+  },
+  "gpt-6-sol": {
+    "cache_read": 2E-7,
+    "cache_write": 0.0000025,
+    "input": 0.000002,
+    "output": 0.00001
   },
   "gpt-audio": {
     "input": 0.0000025,
