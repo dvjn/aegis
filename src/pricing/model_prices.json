@@ -129,6 +129,12 @@
     "input": 0.000002,
     "output": 0.00001
   },
+  "claude-sonnet-5-5": {
+    "cache_read": 2E-7,
+    "cache_write": 0.0000025,
+    "input": 0.000002,
+    "output": 0.00001
+  },
   "computer-use-preview": {
     "input": 0.000003,
     "output": 0.000012
@@ -330,6 +336,10 @@
     "output": 0.000005
   },
   "gpt-4o-mini-tts": {
+    "input": 6E-7,
+    "output": 0.00001
+  },
+  "gpt-4o-mini-tts-2025-03-20": {
     "input": 6E-7,
     "output": 0.00001
   },
@@ -586,6 +596,12 @@
   },
   "gpt-6-sol": {
     "cache_read": 2E-7,
+    "cache_write": 0.0000025,
+    "input": 0.000002,
+    "output": 0.00001
+  },
+  "gpt-6.1-sol": {
+    "cache_read": 1E-7,
     "cache_write": 0.0000025,
     "input": 0.000002,
     "output": 0.00001
