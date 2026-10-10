@@ -33,6 +33,12 @@
     "input": 0.000001,
     "output": 0.000005
   },
+  "claude-haiku-5-5": {
+    "cache_read": 1E-8,
+    "cache_write": 1.25E-7,
+    "input": 1E-7,
+    "output": 5E-7
+  },
   "claude-mythos-5": {
     "cache_read": 0.000001,
     "cache_write": 0.0000125,
@@ -125,6 +131,12 @@
   },
   "claude-sonnet-5": {
     "cache_read": 2E-7,
+    "cache_write": 0.0000025,
+    "input": 0.000002,
+    "output": 0.00001
+  },
+  "claude-sonnet-5-5": {
+    "cache_read": 1E-7,
     "cache_write": 0.0000025,
     "input": 0.000002,
     "output": 0.00001
@@ -330,6 +342,10 @@
     "output": 0.000005
   },
   "gpt-4o-mini-tts": {
+    "input": 6E-7,
+    "output": 0.00001
+  },
+  "gpt-4o-mini-tts-2025-03-20": {
     "input": 6E-7,
     "output": 0.00001
   },
@@ -590,6 +606,12 @@
     "input": 0.000002,
     "output": 0.00001
   },
+  "gpt-6.1-sol": {
+    "cache_read": 1E-7,
+    "cache_write": 0.0000025,
+    "input": 0.000002,
+    "output": 0.00001
+  },
   "gpt-audio": {
     "input": 0.0000025,
     "output": 0.00001
@@ -711,6 +733,11 @@
     "cache_read": 6E-8,
     "input": 6E-7,
     "output": 0.0000024
+  },
+  "gpt-rosalind-discovery": {
+    "cache_read": 5E-7,
+    "input": 0.000005,
+    "output": 0.000025
   },
   "gpt-rosalind-research": {
     "cache_read": 5E-7,
