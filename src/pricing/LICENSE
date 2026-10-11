@@ -3,9 +3,9 @@ Copyright (c) 2023 Berri AI
 model_prices.json is derived from model_prices_and_context_window.json in the
 LiteLLM project (https://github.com/BerriAI/litellm).
 
-Upstream commit: f4308bc124eebc783dfc51790ce8db27ed21ae00
-Upstream sha256: fbb16319dc9b1e1ced94cd532ee7a8cb8edbdb22e311b12514872633067f7537
-Retrieved:       2026-09-27
+Upstream commit: 2a01fe6e5ca2ed67472ca0ed2909e66811ff8d35
+Upstream sha256: 7afbb51846ce77428b70fbc604f1b8dfd5d62c7bb12715258c8537dfe10b8a4d
+Retrieved:       2026-10-11
 
 The LiteLLM project is licensed under the MIT License, copied below.
 
