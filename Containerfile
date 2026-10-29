@@ -1,7 +1,7 @@
 # scratch has no shell, so the binary and data directory are installed in a
 # stage that has one. The stage is pinned to the build platform, because its
 # own architecture never reaches the runtime image.
-FROM --platform=$BUILDPLATFORM docker.io/library/busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e AS layout
+FROM --platform=$BUILDPLATFORM docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 AS layout
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/aegis /tmp/aegis
 RUN install -Dm0555 /tmp/aegis /out/usr/local/bin/aegis \
