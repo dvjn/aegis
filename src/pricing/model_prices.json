@@ -145,6 +145,10 @@
     "input": 0.000003,
     "output": 0.000012
   },
+  "computer-use-preview-2025-03-11": {
+    "input": 0.000003,
+    "output": 0.000012
+  },
   "daybreak-blue-latest": {
     "cache_read": 4E-7,
     "cache_write": 0.000005,
@@ -329,6 +333,11 @@
     "input": 1.5E-7,
     "output": 6E-7
   },
+  "gpt-4o-mini-search-preview-2025-03-11": {
+    "cache_read": 7.5E-8,
+    "input": 1.5E-7,
+    "output": 6E-7
+  },
   "gpt-4o-mini-transcribe": {
     "input": 0.00000125,
     "output": 0.000005
@@ -354,6 +363,11 @@
     "output": 0.00001
   },
   "gpt-4o-search-preview": {
+    "cache_read": 0.00000125,
+    "input": 0.0000025,
+    "output": 0.00001
+  },
+  "gpt-4o-search-preview-2025-03-11": {
     "cache_read": 0.00000125,
     "input": 0.0000025,
     "output": 0.00001
@@ -550,6 +564,11 @@
     "input": 0.0000125,
     "output": 0.000075
   },
+  "gpt-5.5-cyber-preview": {
+    "cache_read": 0.00000125,
+    "input": 0.0000125,
+    "output": 0.000075
+  },
   "gpt-5.5-pro": {
     "input": 0.00003,
     "output": 0.00018
@@ -612,6 +631,12 @@
     "input": 0.000002,
     "output": 0.00001
   },
+  "gpt-6.1-terra": {
+    "cache_read": 5E-8,
+    "cache_write": 0.00000125,
+    "input": 0.000001,
+    "output": 0.000005
+  },
   "gpt-audio": {
     "input": 0.0000025,
     "output": 0.00001
@@ -625,6 +650,10 @@
     "output": 0.00001
   },
   "gpt-audio-mini": {
+    "input": 6E-7,
+    "output": 0.0000024
+  },
+  "gpt-audio-mini-2025-10-06": {
     "input": 6E-7,
     "output": 0.0000024
   },
@@ -748,6 +777,10 @@
     "input": 4.2E-8,
     "output": 0.0
   },
+  "jev-1.14.0": {
+    "input": 4.2E-8,
+    "output": 0.0
+  },
   "jev-latest": {
     "input": 4.2E-8,
     "output": 0.0
@@ -789,6 +822,11 @@
     "input": 0.00001,
     "output": 0.00004
   },
+  "o3-deep-research-2025-06-26": {
+    "cache_read": 0.0000025,
+    "input": 0.00001,
+    "output": 0.00004
+  },
   "o3-mini": {
     "cache_read": 5.5E-7,
     "input": 0.0000011,
@@ -818,6 +856,11 @@
     "output": 0.0000044
   },
   "o4-mini-deep-research": {
+    "cache_read": 5E-7,
+    "input": 0.000002,
+    "output": 0.000008
+  },
+  "o4-mini-deep-research-2025-06-26": {
     "cache_read": 5E-7,
     "input": 0.000002,
     "output": 0.000008
