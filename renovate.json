@@ -38,6 +38,23 @@
       "matchUpdateTypes": ["minor", "patch"],
       "matchPackageNames": ["!rust"],
       "groupName": "mise tools"
+    },
+    {
+      "description": "What ships in the binary gets the deps type, which release-please lists under Dependencies",
+      "matchManagers": ["cargo"],
+      "semanticCommitType": "deps",
+      "semanticCommitScope": null
+    },
+    {
+      "matchManagers": ["mise"],
+      "matchPackageNames": ["rust"],
+      "semanticCommitType": "deps",
+      "semanticCommitScope": null
     }
-  ]
+  ],
+  "vulnerabilityAlerts": {
+    "description": "Security updates are listed under Bug Fixes",
+    "semanticCommitType": "fix",
+    "semanticCommitScope": "deps"
+  }
 }
