@@ -4,7 +4,8 @@
     "config:recommended",
     "docker:pinDigests",
     "helpers:pinGitHubActionDigests",
-    ":disableRateLimiting"
+    ":disableRateLimiting",
+    "customManagers:githubActionsVersions"
   ],
   "dependencyDashboard": true,
   "osvVulnerabilityAlerts": true,
@@ -45,6 +46,11 @@
       "matchManagers": ["mise"],
       "matchUpdateTypes": ["minor", "patch"],
       "matchPackageNames": ["!rust"],
+      "groupName": "mise tools"
+    },
+    {
+      "description": "The mise version pinned in CI updates with the other dev tools",
+      "matchPackageNames": ["jdx/mise"],
       "groupName": "mise tools"
     },
     {
