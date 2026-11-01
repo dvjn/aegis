@@ -8,25 +8,31 @@
   ],
   "dependencyDashboard": true,
   "osvVulnerabilityAlerts": true,
-  "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["at any time"],
-    "semanticCommitType": "deps",
-    "semanticCommitScope": null
-  },
   "packageRules": [
     {
-      "description": "Crate patches share one PR",
+      "description": "Crate patches share one PR, which also runs cargo update so indirect crates get refreshed",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["patch"],
-      "groupName": "rust crates"
+      "groupName": "rust crates",
+      "postUpgradeTasks": {
+        "commands": ["cargo update"],
+        "fileFilters": ["Cargo.lock"],
+        "executionMode": "branch",
+        "installTools": { "rust": {} }
+      }
     },
     {
       "description": "So do minor bumps of 1.x+ crates; 0.x minors are breaking in Cargo semver and stay separate",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor"],
       "matchCurrentVersion": "!/^0\\./",
-      "groupName": "rust crates"
+      "groupName": "rust crates",
+      "postUpgradeTasks": {
+        "commands": ["cargo update"],
+        "fileFilters": ["Cargo.lock"],
+        "executionMode": "branch",
+        "installTools": { "rust": {} }
+      }
     },
     {
       "description": "Actions and container digests share one PR",
