@@ -12,6 +12,10 @@ concurrency:
   group: refresh-model-prices
   cancel-in-progress: false
 
+env:
+  # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
+  MISE_VERSION: 2026.10.25
+
 jobs:
   refresh:
     name: 💰 Refresh Model Prices
@@ -31,6 +35,8 @@ jobs:
 
       - name: 🧰 Install Tools
         uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+        with:
+          version: ${{ env.MISE_VERSION }}
 
       - name: 🔄 Refresh Prices
         run: mise run pricing:update
