@@ -6,5 +6,38 @@
     "helpers:pinGitHubActionDigests",
     ":disableRateLimiting"
   ],
-  "dependencyDashboard": true
+  "dependencyDashboard": true,
+  "osvVulnerabilityAlerts": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["at any time"]
+  },
+  "packageRules": [
+    {
+      "description": "Crate patches share one PR",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "rust crates"
+    },
+    {
+      "description": "So do minor bumps of 1.x+ crates; 0.x minors are breaking in Cargo semver and stay separate",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": "!/^0\\./",
+      "groupName": "rust crates"
+    },
+    {
+      "description": "Actions and container digests share one PR",
+      "matchManagers": ["github-actions", "dockerfile"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "Dev tools share one PR; the Rust toolchain stays separate because new releases bring new lints",
+      "matchManagers": ["mise"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchPackageNames": ["!rust"],
+      "groupName": "mise tools"
+    }
+  ]
 }
