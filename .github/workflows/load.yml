@@ -67,6 +67,7 @@ jobs:
         with:
           workspaces: candidate
           key: load
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: 🏋️ Run Load Comparison
         working-directory: candidate
