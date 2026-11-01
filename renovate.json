@@ -10,7 +10,9 @@
   "osvVulnerabilityAlerts": true,
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["at any time"]
+    "schedule": ["at any time"],
+    "semanticCommitType": "deps",
+    "semanticCommitScope": null
   },
   "packageRules": [
     {
