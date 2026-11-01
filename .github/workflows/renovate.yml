@@ -2,7 +2,8 @@ name: 🤖 Renovate
 
 on:
   schedule:
-    - cron: "0 5 * * *"
+    # Fridays at 18:00 IST
+    - cron: "30 12 * * 5"
   workflow_dispatch:
 
 permissions:
