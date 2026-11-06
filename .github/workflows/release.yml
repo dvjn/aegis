@@ -9,7 +9,7 @@ permissions:
 
 env:
   # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
-  MISE_VERSION: 2026.10.25
+  MISE_VERSION: 2026.11.3
   CARGO_TERM_COLOR: always
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/aegis
 
