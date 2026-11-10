@@ -72,14 +72,31 @@ fn journal(home: &Path) -> Result<Journal> {
     Ok(serde_json::from_str(&text)?)
 }
 
+fn launcher() -> Result<String> {
+    let executable = std::env::current_exe()?;
+    // A version-manager install must keep following its active version rather
+    // than pinning every vendor wrapper to a versioned installation path.
+    if let Ok(output) = std::process::Command::new("mise")
+        .args(["which", "ags"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        && output.status.success()
+        && let Ok(path) = std::str::from_utf8(&output.stdout)
+        && Path::new(path.trim()).canonicalize().ok() == Some(executable.canonicalize()?)
+    {
+        return Ok("mise exec -- ags".into());
+    }
+    Ok(quote(
+        executable
+            .to_str()
+            .context("AGS executable path is not UTF-8")?,
+    ))
+}
+
 pub fn wrappers(home: &Path) -> Result<()> {
     state::private_dir(&home.join("shims"))?;
     let mut owned = journal(home)?;
-    let executable = quote(
-        std::env::current_exe()?
-            .to_str()
-            .context("AGS executable path is not UTF-8")?,
-    );
+    let executable = launcher()?;
     let mut wrappers = std::collections::BTreeMap::new();
     for cli in CLIENTS.iter().copied().chain(std::iter::once("ags")) {
         let path = home.join("shims").join(cli);

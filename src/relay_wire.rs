@@ -22,3 +22,10 @@ pub struct Connection {
 pub struct Enrollment {
     pub providers: Vec<String>,
 }
+
+#[derive(Deserialize, Serialize)]
+pub struct Release {
+    pub version: String,
+    pub protocol: u32,
+    pub targets: Vec<String>,
+}

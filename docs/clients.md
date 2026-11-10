@@ -6,9 +6,17 @@ AGS handles Aegis authentication automatically. For manual configuration, create
 
 ## AGS relay
 
-Build the CLI with `cargo build --bin ags`, then run `target/debug/ags setup https://aegis.example.com`. AGS pairs through browser/device-code OAuth and opens an inline wizard to select subscriptions, provider defaults, and CLI overrides. Installed wrappers launch Claude Code, Codex, and pi. Start a new shell after setup.
+Install `ags` from your Aegis server using mise (Linux x86_64 or ARM64):
 
-Each launch starts private loopback proxies and stops them when the CLI exits. pi gets a separate proxy for every enabled subscription. Provider sign-ins stay in the original CLI. The relay sends its Aegis OAuth access token in `x-aegis-access-token`, separately from provider authentication. It refreshes that token before requests when needed, including during long-running CLI sessions. Vendor configuration files are not edited, and Aegis tokens are not exposed in the child environment.
+```sh
+curl -fsSL https://aegis.example.com/install-mise.sh | sh
+```
+
+The server's installer registers mise's built-in `http:ags` backend with that server's version discovery, binary, and checksum URLs. It selects the exact version the server currently serves, then opens the connection wizard. Release binaries are downloaded from your Aegis server. Re-run the installer when changing server versions, or use `mise upgrade http:ags` to check that same server for an update. Installed CLI wrappers follow the version selected by mise. Use mise to manage the executable and `ags disconnect` or `ags uninstall` to revoke the connection or remove wrappers.
+
+Open `/connect` on your Aegis server and run its installation command. AGS pairs through browser/device-code OAuth and opens an inline setup wizard. Select the subscriptions you use with Space, choose the default subscription for each provider type (Claude, Codex, and Antigravity), then optionally override those defaults for particular CLIs. Only selected subscriptions are granted to this machine. AGS installs executable wrappers for `claude`, `codex`, `pi`, and `agy`. Start a new shell after setup.
+
+Each launch starts private loopback proxies and stops them when the CLI exits. pi gets a separate proxy for every enabled subscription. Provider sign-ins stay in the original CLI. The relay sends its Aegis OAuth access token in `x-aegis-access-token`, separately from provider authentication. It refreshes that token before requests when needed, including during long-running CLI sessions. Vendor configuration files are not edited, and Aegis tokens are not exposed in the child environment. Antigravity uses the CLI's existing Google subscription sign-in.
 
 ```sh
 ags setup https://aegis.example.com
@@ -16,11 +24,15 @@ ags configure
 ags run codex --provider work -- exec "Explain this project"
 ags status
 ags doctor
+ags update
+ags update --rollback
 ags disconnect
 ags uninstall
 ```
 
 `ags login` aliases `ags setup`, and `ags config` aliases `ags configure`. `ags setup --no-wrappers` keeps explicit launching only. A wrapped CLI or `ags run` starts the login/provider wizard before launching when setup is missing. Set `AGS_SERVER_URL` for first-run discovery, or enter the server URL when prompted; the selected URL is remembered for future logins. Use repeatable `--provider CLI=ID` options with setup/configure to select defaults without terminal prompts. For example: `ags configure --provider codex=work --provider pi=personal`.
+
+The initial installer supports Linux x86_64 and ARM64. Aegis release containers include both relay builds; other deployments set `AEGIS_RELAY_DIR` to a directory containing `<rust-target>/ags`. The installation script is served at `/install.sh`. The configured `public_url` must be the URL clients use. Downloads are verified using a checksum obtained from that same HTTPS server.
 
 AGS stores only its Aegis OAuth access and refresh tokens, provider defaults, and connection metadata in an owner-only `connection.json` under `${XDG_DATA_HOME:-$HOME/.local/share}/ags`; `AGS_HOME` overrides that directory. No provider credentials are imported. Relays appear under Connected apps in Account, with granted providers and last use. The dashboard combines their usage with API keys in one Clients table. Revoking the app blocks subsequent gateway requests immediately; no secondary API key is issued. Disconnect revokes remotely before removing local state; `ags disconnect --offline` and `ags uninstall --offline` remove local state and tell you to revoke the client separately. Run `ags configure` to change enabled subscriptions, provider defaults, or CLI overrides, including newly added server providers. To re-pair after revocation, disconnect and run setup again.
 

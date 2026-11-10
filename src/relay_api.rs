@@ -1,19 +1,22 @@
-//! AGS enrollment. Provider OAuth never enters this interface.
-use std::sync::Arc;
+//! AGS enrollment and server-hosted distribution. Provider OAuth never enters this interface.
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::State,
+    body::Body,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use sha2::{Digest, Sha256};
+use tokio_util::io::ReaderStream;
 
 use crate::{
     domain::{Domain, Principal, scope_allows},
     gateway::Gateway,
     origin::OriginPolicy,
-    relay_wire::{Connection, Enrollment, RESOURCE_PATH, SCOPE},
+    relay_wire::{Connection, Enrollment, RESOURCE_PATH, Release, SCOPE},
 };
 
 #[derive(Clone)]
@@ -21,6 +24,7 @@ pub struct RelayState {
     pub domain: Arc<Domain>,
     pub gateway: Gateway,
     pub origin: OriginPolicy,
+    pub artifacts: PathBuf,
 }
 
 pub fn router(state: RelayState) -> Router {
@@ -28,6 +32,15 @@ pub fn router(state: RelayState) -> Router {
         .route("/api/relay/connection", get(connection))
         .route("/api/relay/enroll", post(enroll))
         .route("/api/relay/disconnect", post(disconnect))
+        .route("/connect", get(connect_page))
+        .route("/install.sh", get(installer))
+        .route("/install-mise.sh", get(mise_installer))
+        .route("/.well-known/aegis-relay", get(manifest))
+        .route(
+            "/downloads/ags/version",
+            get(|| async { env!("CARGO_PKG_VERSION") }),
+        )
+        .route("/downloads/ags/{version}/{target}/{file}", get(download))
         .layer(axum::middleware::map_response(crate::web::auth_no_store))
         .with_state(state)
 }
@@ -119,6 +132,120 @@ async fn disconnect(State(state): State<RelayState>, headers: HeaderMap) -> Resp
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+const TARGETS: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
+
+async fn manifest(State(state): State<RelayState>) -> Json<Release> {
+    Json(Release {
+        version: env!("CARGO_PKG_VERSION").into(),
+        protocol: crate::relay_wire::PROTOCOL_VERSION,
+        targets: TARGETS
+            .iter()
+            .filter(|target| state.artifacts.join(target).join("ags").is_file())
+            .map(|target| (*target).into())
+            .collect(),
+    })
+}
+
+async fn download(
+    State(state): State<RelayState>,
+    Path((version, target, file)): Path<(String, String, String)>,
+) -> Response {
+    if version != env!("CARGO_PKG_VERSION") || !["ags", "ags.sha256"].contains(&file.as_str()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let target = match target.as_str() {
+        "linux-x64" | "x86_64-unknown-linux-musl" => "x86_64-unknown-linux-musl",
+        "linux-arm64" | "aarch64-unknown-linux-musl" => "aarch64-unknown-linux-musl",
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let path = state.artifacts.join(target).join("ags");
+    if file == "ags.sha256" {
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(path)?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let size = file.read(&mut buffer)?;
+                if size == 0 {
+                    break;
+                }
+                hash.update(&buffer[..size]);
+            }
+            let digest: String = hash
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            Ok(format!("{digest}  ags\n"))
+        })
+        .await;
+        return match result {
+            Ok(Ok(body)) => body.into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    match tokio::fs::File::open(path).await {
+        Ok(file) => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            Body::from_stream(ReaderStream::new(file)),
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn installer(State(state): State<RelayState>, headers: HeaderMap) -> Response {
+    let origin = match state.origin.effective_origin(&headers) {
+        Ok(origin) => origin,
+        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let script = include_str!("relay/install.sh").replace("@SERVER@", &shell_quote(&origin));
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
+    )
+        .into_response()
+}
+
+async fn mise_installer(State(state): State<RelayState>, headers: HeaderMap) -> Response {
+    let origin = match state.origin.effective_origin(&headers) {
+        Ok(origin) => origin,
+        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let script = include_str!("relay/install-mise.sh").replace("@SERVER@", &shell_quote(&origin));
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
+    )
+        .into_response()
+}
+
+async fn connect_page(State(state): State<RelayState>, headers: HeaderMap) -> Response {
+    let origin = match state.origin.effective_origin(&headers) {
+        Ok(origin) => origin,
+        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    use maud::html;
+    crate::web::views::layout("Connect a machine · Aegis", html! {
+        main class="auth-shell" { article class="auth-card" {
+            h1 { "Connect a machine" }
+            p { "Install AGS, approve this machine, and choose default providers for Claude Code, Codex, pi, and Antigravity." }
+            pre { code { "curl -fsSL " (shell_quote(&format!("{origin}/install.sh"))) " | sh" } }
+            p { "Or install this version with mise:" }
+            pre { code {
+                "curl -fsSL " (shell_quote(&format!("{origin}/install-mise.sh"))) " | sh"
+            } }
+            p { "Linux x86_64 and ARM64. Existing provider sign-ins stay with each CLI." }
+            a href="/account" { "Manage connected clients" }
+        } }
+    }).into_response()
 }
 
 #[cfg(test)]

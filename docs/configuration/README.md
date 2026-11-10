@@ -92,6 +92,7 @@ Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header.
 | `PUBLIC_URL` | no | config file | `public_url` (canonical external origin for OAuth and cookie security) |
 | `DATABASE_URL` | no | config file | `database_url` |
 | `MAX_CAPTURE_BYTES` | no | config file | `max_capture_bytes` |
+| `AEGIS_RELAY_DIR` | no | `/usr/share/aegis/relay` | directory of server-hosted AGS binaries, laid out as `<rust-target>/ags` |
 
 ### Guardrail overrides
 

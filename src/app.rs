@@ -28,6 +28,9 @@ pub fn router(
         domain: domain.clone(),
         gateway: gateway.clone(),
         origin: origin.clone(),
+        artifacts: std::env::var_os("AEGIS_RELAY_DIR")
+            .map(Into::into)
+            .unwrap_or_else(|| "/usr/share/aegis/relay".into()),
     };
     let web_state = web::AppState::new(session.clone(), gateway.clone(), keys, usage);
     let oauth_state = oauth::State::new(session);

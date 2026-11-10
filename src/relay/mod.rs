@@ -5,6 +5,7 @@ mod instance;
 mod pi;
 mod profiles;
 mod state;
+mod update;
 mod wizard;
 
 use anyhow::{Context, Result, bail};
@@ -53,6 +54,11 @@ enum Command {
     },
     Status,
     Doctor,
+    /// Install the server's compatible release, retaining the previous executable.
+    Update {
+        #[arg(long)]
+        rollback: bool,
+    },
     Disconnect {
         /// Forget local credentials when the server is unreachable; revoke separately in Aegis.
         #[arg(long)]
@@ -140,6 +146,7 @@ pub async fn main() -> Result<i32> {
                 disconnect(&home).await?;
             }
         }
+        Command::Update { rollback } => update::update(&home, rollback).await?,
         Command::Uninstall { offline } => {
             if home.join("connection.json").exists() {
                 if offline {

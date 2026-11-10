@@ -2,6 +2,16 @@
 
 A personal LLM gateway. Aegis authenticates clients, forwards provider requests, and records usage for its web dashboard.
 
+## Install ags with mise
+
+Install the version served by your Aegis server:
+
+```sh
+curl -fsSL https://your-aegis-server.example.com/install-mise.sh | sh
+```
+
+Linux x86_64 and ARM64 are supported. See [client setup](docs/clients.md) for wrappers and upgrades.
+
 ## Development
 
 ```sh

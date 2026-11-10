@@ -135,6 +135,7 @@ async fn oauth_gateway_preserves_provider_auth_records_app_usage_and_checks_gran
         domain: domain.clone(),
         gateway,
         origin: OriginPolicy::new(Some(issuer.into())),
+        artifacts: "/nonexistent".into(),
     };
     let app = crate::app::router(
         domain.clone(),
@@ -154,6 +155,27 @@ async fn oauth_gateway_preserves_provider_auth_records_app_usage_and_checks_gran
             .body(Body::from(value.to_string()))
             .unwrap()
     };
+    let installer = app
+        .clone()
+        .oneshot(
+            Request::get("/install-mise.sh")
+                .header(header::HOST, "aegis.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(installer.status(), StatusCode::OK);
+    let script = String::from_utf8(
+        to_bytes(installer.into_body(), 16384)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(script.contains("server='https://aegis.example'"));
+    assert!(script.contains("http:ags["));
+    assert!(!script.contains("github"));
     let anonymous = app
         .clone()
         .oneshot(

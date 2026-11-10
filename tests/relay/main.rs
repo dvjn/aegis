@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use tokio::{net::TcpListener, process::Command, sync::mpsc};
@@ -22,6 +22,7 @@ struct Fixture {
     requests: mpsc::Receiver<Value>,
     refreshes: Arc<AtomicUsize>,
     registrations: Arc<AtomicUsize>,
+    artifacts_available: Arc<AtomicBool>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -58,6 +59,16 @@ impl Fixture {
         }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = format!("http://{}", listener.local_addr().unwrap());
+        let installer =
+            include_str!("../../src/relay/install.sh").replace("@SERVER@", &format!("'{server}'"));
+        let mise_installer = include_str!("../../src/relay/install-mise.sh")
+            .replace("@SERVER@", &format!("'{server}'"));
+        let artifact = axum::body::Bytes::from(std::fs::read(env!("CARGO_BIN_EXE_ags")).unwrap());
+        use sha2::{Digest, Sha256};
+        let checksum: String = Sha256::digest(&artifact)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let device_url = format!("{server}/approve?user_code=TEST-CODE");
         let (tx, requests) = mpsc::channel(20);
         let refreshes = Arc::new(AtomicUsize::new(0));
@@ -69,7 +80,22 @@ impl Fixture {
         } else {
             json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"},{"id":"personal","kind":"codex_subscription"},{"id":"work","kind":"codex_subscription"},{"id":"google-personal","kind":"antigravity_subscription"}]})
         };
+        let artifacts_available = Arc::new(AtomicBool::new(true));
+        let available = artifacts_available.clone();
         let app = Router::new()
+            .route("/install.sh",get(move || { let script = installer.clone(); async move { script } }))
+            .route("/install-mise.sh",get(move || { let script = mise_installer.clone(); async move { script } }))
+            .route("/downloads/ags/version",get(|| async { env!("CARGO_PKG_VERSION") }))
+            .route("/.well-known/aegis-relay",get(|| async { Json(json!({"version":env!("CARGO_PKG_VERSION"),"protocol":1,"targets":["x86_64-unknown-linux-musl","aarch64-unknown-linux-musl"]})) }))
+            .route("/downloads/ags/{version}/{target}/{file}",get(move |axum::extract::Path((version,_target,file)):axum::extract::Path<(String,String,String)>| {
+                let artifact = artifact.clone(); let checksum = checksum.clone(); let available = available.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    if !available.load(Ordering::SeqCst) || version != env!("CARGO_PKG_VERSION") { return axum::http::StatusCode::NOT_FOUND.into_response(); }
+                    if file == "ags.sha256" { return format!("{checksum}  ags\n").into_response(); }
+                    artifact.into_response()
+                }
+            }))
             .route("/oauth/register",post(move || {let registered=registered.clone();async move {registered.fetch_add(1,Ordering::SeqCst);Json(json!({"client_id":"ags-test"}))}}))
             .route("/oauth/device_authorization",post(move || { let url = device_url.clone(); async move { Json(json!({"device_code":"test-device","user_code":"TEST-CODE","verification_uri_complete":url,"expires_in":30,"interval":1})) } }))
             .route("/oauth/token",post(move |body: String| { let counter = counter.clone(); async move {
@@ -100,6 +126,7 @@ impl Fixture {
             requests,
             refreshes,
             registrations,
+            artifacts_available,
         }
     }
 
@@ -251,6 +278,98 @@ async fn wrappers_have_private_lifetimes_and_preserve_args_auth_and_provider_def
 }
 
 #[tokio::test]
+async fn mise_managed_wrappers_follow_the_active_ags_executable() {
+    let mut f = Fixture::new().await;
+    let binary = env!("CARGO_BIN_EXE_ags");
+    let mise = f.root.join("vendor/mise");
+    let script = format!(
+        r#"#!/bin/sh
+case "$1" in
+  which) printf '%s\n' '{}' ;;
+  exec)
+    shift
+    test "$1" = -- && shift
+    test "$1" = ags && shift
+    printf '%s\n' "$AGS_MISE_BINARY" > "$AGS_MISE_MARKER"
+    exec "$AGS_MISE_BINARY" "$@"
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        binary
+    );
+    std::fs::write(&mise, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o700)).unwrap();
+    f.setup(true).await;
+    let wrapper = std::fs::read_to_string(f.root.join("ags/shims/claude")).unwrap();
+    assert!(wrapper.contains("mise exec -- ags run claude"));
+    let next = f.root.join("ags-next");
+    std::fs::copy(binary, &next).unwrap();
+    let marker = f.root.join("mise-launched");
+    let mut command = Command::new(f.root.join("ags/shims/claude"));
+    f.environment(&mut command);
+    let output = command
+        .env("AGS_MISE_BINARY", &next)
+        .env("AGS_MISE_MARKER", &marker)
+        .arg("--version")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        next.to_str().unwrap()
+    );
+    assert_eq!(
+        f.requests.recv().await.unwrap()["path"],
+        "/providers/claude-main/responses?trial=true"
+    );
+}
+
+#[tokio::test]
+async fn agy_wrapper_preserves_google_auth_arguments_and_private_proxy_lifetime() {
+    let mut f = Fixture::new().await;
+    f.setup(true).await;
+    let mut command = Command::new(f.root.join("ags/shims/agy"));
+    f.environment(&mut command);
+    let output = command
+        .args([
+            "--model",
+            "gemini-3.8-flash-low",
+            "--print",
+            "argument with spaces",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["args"][3], "argument with spaces");
+    assert_eq!(data["aegis_auth_in_environment"], false);
+    assert_eq!(
+        f.requests.recv().await.unwrap()["path"],
+        "/providers/google-personal/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert!(
+        reqwest::get(format!(
+            "{}/v1internal:loadCodeAssist",
+            data["endpoint"].as_str().unwrap()
+        ))
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn setup_repairs_revoked_login_without_requiring_manual_state_deletion() {
     let f = Fixture::new().await;
     f.setup(false).await;
@@ -368,6 +487,160 @@ async fn concurrent_launches_rotate_oauth_once_and_uninstall_preserves_edited_wr
 }
 
 #[tokio::test]
+async fn server_mise_installer_reports_missing_artifacts_before_installing() {
+    let f = Fixture::new().await;
+    f.artifacts_available.store(false, Ordering::SeqCst);
+    let mise = f.root.join("vendor/mise");
+    std::fs::write(&mise, "#!/bin/sh\nexit 99\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(mise, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = include_str!("../../src/relay/install-mise.sh")
+        .replace("@SERVER@", &format!("'{}'", f.server));
+    let path = f.root.join("install-mise.sh");
+    std::fs::write(&path, script).unwrap();
+    let mut command = Command::new("/bin/sh");
+    f.environment(&mut command);
+    let result = command.arg(path).output().await.unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("ags download unavailable"), "{error}");
+    assert!(error.contains("mise run relay:stage"), "{error}");
+    assert!(!error.contains("Invalid server checksum"), "{error}");
+}
+
+#[tokio::test]
+async fn server_mise_installer_configures_its_own_downloads_and_exact_version() {
+    let f = Fixture::new().await;
+    let log = f.root.join("mise-use");
+    let mise = f.root.join("vendor/mise");
+    let binary = env!("CARGO_BIN_EXE_ags");
+    let mock = format!(
+        r#"#!/bin/sh
+case "$1" in
+  install|use) shift; printf '%s\n' "$@" >> '{}' ;;
+  which) printf '%s\n' '{}' ;;
+  exec)
+    shift
+    while test "$1" != --; do shift; done
+    shift
+    test "$1" = ags && shift
+    exec '{}' "$@"
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        log.display(),
+        binary,
+        binary
+    );
+    std::fs::write(&mise, mock).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(mise, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = reqwest::get(format!("{}/install-mise.sh", f.server))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let path = f.root.join("install-mise.sh");
+    std::fs::write(&path, script).unwrap();
+    let mut command = Command::new("/bin/sh");
+    f.environment(&mut command);
+    let result = command
+        .arg(path)
+        .args([
+            "--no-wrappers",
+            "--no-browser",
+            "--provider",
+            "codex=personal",
+            "--provider",
+            "pi=work",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let arguments = std::fs::read_to_string(log).unwrap();
+    assert!(arguments.contains("--force"));
+    assert!(arguments.contains(&format!("url={}/downloads/ags/", f.server)));
+    assert!(arguments.contains(&format!(
+        "version_list_url={}/downloads/ags/version",
+        f.server
+    )));
+    assert!(arguments.contains("checksum_url="));
+    assert!(arguments.contains(&format!("@{}", env!("CARGO_PKG_VERSION"))));
+    assert!(!arguments.contains("github"));
+    assert!(f.root.join("ags/connection.json").is_file());
+    assert!(!f.root.join("ags/.installed").exists());
+}
+
+#[tokio::test]
+async fn server_installer_update_and_rollback_need_no_manually_copied_credentials() {
+    let f = Fixture::new().await;
+    let script = reqwest::get(format!("{}/install.sh", f.server))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut command = Command::new("/bin/sh");
+    f.environment(&mut command);
+    command
+        .args([
+            "-s",
+            "--",
+            "--no-browser",
+            "--provider",
+            "codex=personal",
+            "--provider",
+            "pi=work",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    use tokio::io::AsyncWriteExt;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .await
+        .unwrap();
+    let result = child.wait_with_output().await.unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(f.root.join("ags/.installed").exists());
+    let installed = f.root.join("ags/bin/ags");
+    for args in [vec!["update"], vec!["update", "--rollback"]] {
+        let mut command = Command::new(&installed);
+        f.environment(&mut command);
+        let result = command.args(args).output().await.unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let mut command = Command::new(installed);
+    f.environment(&mut command);
+    let result = command.arg("uninstall").output().await.unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!f.root.join("ags/bin/ags").exists());
+}
+
+#[tokio::test]
 async fn first_launch_runs_one_wizard_then_opens_each_cli() {
     let mut f = Fixture::with_single_provider(true).await;
     let mut a = f.command();
@@ -418,42 +691,4 @@ async fn an_open_cli_refreshes_oauth_before_its_next_request() {
     assert_eq!(first["aegis_token"], "mock-access");
     assert_eq!(second["aegis_token"], "mock-access-1");
     assert_eq!(f.refreshes.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn agy_wrapper_preserves_google_auth_arguments_and_private_proxy_lifetime() {
-    let mut f = Fixture::new().await;
-    f.setup(true).await;
-    let mut command = Command::new(f.root.join("ags/shims/agy"));
-    f.environment(&mut command);
-    let output = command
-        .args([
-            "--model",
-            "gemini-3.8-flash-low",
-            "--print",
-            "argument with spaces",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(data["args"][3], "argument with spaces");
-    assert_eq!(data["aegis_auth_in_environment"], false);
-    assert_eq!(
-        f.requests.recv().await.unwrap()["path"],
-        "/providers/google-personal/v1internal:streamGenerateContent?alt=sse"
-    );
-    assert!(
-        reqwest::get(format!(
-            "{}/v1internal:loadCodeAssist",
-            data["endpoint"].as_str().unwrap()
-        ))
-        .await
-        .is_err()
-    );
 }
