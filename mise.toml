@@ -46,7 +46,7 @@ if [[ ! -s data/api-key ]]; then
   (umask 077; printf '%s\n' "$api_key" > data/api-key)
 fi
 fi
-printf 'Local server: http://127.0.0.1:8765\nEmail: admin@example.com\nPassword: Correct passw0rd!\nAPI key file: data/api-key\n'
+printf 'Local server: %s\nEmail: admin@example.com\nPassword: Correct passw0rd!\nAPI key file: data/api-key\n' "${PUBLIC_URL:-http://127.0.0.1:8765}"
 '''
 
 [tasks.dev]
@@ -56,7 +56,101 @@ env = { AEGIS_CONFIG = "config.local.toml" }
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css -- cargo run -- serve
+exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css,ts,sh -- mise run dev:serve
+'''
+
+[tasks."dev:serve"]
+description = "Build both binaries and run the development server"
+hide = true
+env = { AEGIS_CONFIG = "config.local.toml" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+cargo build --quiet --bin ags
+mise run relay:stage
+exec cargo run --bin aegis -- serve
+'''
+
+[tasks."relay:build"]
+description = "Build the current AGS relay"
+hide = true
+run = "cargo build --quiet --bin ags"
+
+[tasks."relay:stage"]
+description = "Build and stage the host's downloadable ags binary"
+hide = true
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+case "$(uname -s):$(uname -m)" in
+  Linux:x86_64) target=x86_64-unknown-linux-musl ;;
+  Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-musl ;;
+  *) echo "Downloadable ags builds currently support Linux x86_64 and ARM64." >&2; exit 1 ;;
+esac
+if ! rustup target list --installed | grep -Fxq "$target"; then
+  rustup target add "$target"
+fi
+cargo zigbuild --locked --bin ags --target "$target"
+destination="${AEGIS_RELAY_DIR:-$PWD/dist/relay}/$target"
+mkdir -p "$destination"
+staged="$(mktemp "$destination/.ags.XXXXXX")"
+trap 'rm -f "$staged"' EXIT
+install -m755 "${CARGO_TARGET_DIR:-target}/$target/debug/ags" "$staged"
+mv -f "$staged" "$destination/ags"
+'''
+
+[tasks.ags]
+description = "Run AGS with workspace-local state and the current source build"
+depends = ["relay:build"]
+env = { AGS_HOME = "{{config_root}}/data/ags" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+export AGS_SERVER_URL="${AGS_SERVER_URL:-${PUBLIC_URL:-${AEGIS_DEV_URL:-http://127.0.0.1:8765}}}"
+exec "${CARGO_TARGET_DIR:-target}/debug/ags" "$@"
+'''
+
+[tasks."relay:setup"]
+description = "Pair the workspace relay and choose providers without installing shell wrappers"
+depends = ["relay:build"]
+env = { AGS_HOME = "{{config_root}}/data/ags" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+server="${PUBLIC_URL:-${AEGIS_DEV_URL:-http://127.0.0.1:8765}}"
+curl --fail --silent --show-error --connect-timeout 3 --max-time 10 "$server/healthz" >/dev/null || {
+  echo "Start the server in another terminal with: mise run dev" >&2
+  exit 1
+}
+exec "${CARGO_TARGET_DIR:-target}/debug/ags" setup "$server" --no-wrappers "$@"
+'''
+
+[tasks.relay]
+description = "Run a CLI through the workspace relay, with first-use setup when needed"
+depends = ["relay:build"]
+env = { AGS_HOME = "{{config_root}}/data/ags" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+test $# -gt 0 || { echo "usage: mise run relay -- <claude|codex|pi|agy> [CLI arguments...]" >&2; exit 2; }
+client="$1"
+shift
+case "$client" in
+  claude|codex|pi|agy) ;;
+  *) echo "unsupported CLI: $client (supported: claude, codex, pi, agy)" >&2; exit 2 ;;
+esac
+server="${PUBLIC_URL:-${AEGIS_DEV_URL:-http://127.0.0.1:8765}}"
+curl --fail --silent --show-error --connect-timeout 3 --max-time 10 "$server/healthz" >/dev/null || {
+  echo "Start the server in another terminal with: mise run dev" >&2
+  exit 1
+}
+ags="${CARGO_TARGET_DIR:-target}/debug/ags"
+if [[ -s "$AGS_HOME/connection.json" ]] && [[ "$(jq -r '.server' "$AGS_HOME/connection.json")" != "${server%/}" ]]; then
+  echo "The workspace relay is paired to a different server. Run mise run ags -- disconnect, then mise run relay:setup." >&2
+  exit 1
+fi
+export AGS_SERVER_URL="$server"
+exec "$ags" run "$client" -- "$@"
 '''
 
 [tasks.serve]
@@ -394,11 +488,13 @@ for entry in $TARGETS; do
   target="${entry%%:*}"
   arch="${entry##*:}"
   rustup target add "$target"
-  cargo zigbuild --release --locked --target "$target"
+  cargo zigbuild --release --locked --bins --target "$target"
   install -Dm755 "target/$target/release/aegis" "dist/$arch/aegis"
+  install -Dm755 "target/$target/release/ags" "dist/$arch/ags"
+  install -Dm755 "target/$target/release/ags" "dist/relay/$target/ags"
 done
 """
-sources = ["src/**/*.rs", "build.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["src/**/*.rs", "src/**/*.sh", "src/**/*.ts", "build.rs", "Cargo.toml", "Cargo.lock"]
 
 [tasks.package]
 description = "Make the release tarballs and checksums from dist/"
@@ -413,10 +509,12 @@ for entry in $TARGETS; do
   name="aegis-${version}-${target}"
   mkdir -p "dist/${name}"
   cp "dist/${arch}/aegis" "dist/${name}/aegis"
+  cp "dist/${arch}/ags" "dist/${name}/ags"
   cp README.md "dist/${name}/"
   tar -czf "dist/${name}.tar.gz" -C dist "${name}"
   rm -rf "dist/${name}"
   (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
 done
 """
 

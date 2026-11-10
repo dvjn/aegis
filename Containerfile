@@ -4,6 +4,7 @@
 FROM --platform=$BUILDPLATFORM docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 AS layout
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/aegis /tmp/aegis
+COPY dist/relay/ /out/usr/share/aegis/relay/
 RUN install -Dm0555 /tmp/aegis /out/usr/local/bin/aegis \
     && install -d -o 65532 -g 65532 -m 0700 /out/data
 
