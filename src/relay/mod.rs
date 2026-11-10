@@ -1,3 +1,4 @@
+mod agy;
 mod auth;
 mod install;
 mod instance;
@@ -43,7 +44,7 @@ enum Command {
     },
     /// Run one CLI instance with its own private relay.
     Run {
-        #[arg(value_parser=["claude", "codex", "pi"])]
+        #[arg(value_parser=["claude", "codex", "pi", "agy"])]
         client: String,
         #[arg(long)]
         provider: Option<String>,
@@ -228,7 +229,7 @@ async fn setup(
     }
     if !first_launch {
         println!(
-            "Connected. Run claude, codex, or pi through the wrappers, or use ags run <cli> -- <args>."
+            "Connected. Run claude, codex, pi, or agy through the wrappers, or use ags run <cli> -- <args>."
         );
     }
     Ok(())

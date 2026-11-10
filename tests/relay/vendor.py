@@ -12,6 +12,9 @@ name = pathlib.Path(sys.argv[0]).name
 extension = None
 if name == "claude":
     endpoint = os.environ["ANTHROPIC_BASE_URL"]
+elif name == "agy":
+    endpoint = os.environ["CLOUD_CODE_URL"]
+    assert "AGY_LLM_GATEWAY_URL" not in os.environ
 elif name == "codex":
     config = [args[i+1] for i, a in enumerate(args[:-1]) if a == "--config"]
     endpoint = json.loads(next(c.split("=", 1)[1] for c in config if c.startswith("model_providers.ags.base_url=")))
@@ -26,7 +29,7 @@ else:
     endpoint = next(route["endpoint"] for route in config["routes"] if route["id"] == selected)
     assert 'transport: "sse"' in source
     assert "getProvider" in source
-request_path = "/responses?trial=true"
+request_path = "/v1internal:streamGenerateContent?alt=sse" if name == "agy" else "/responses?trial=true"
 request = urllib.request.Request(endpoint + request_path, b"prompt", {"Authorization": "Bearer vendor-credential"})
 if name == "pi" and "--all-providers" in args:
     import concurrent.futures

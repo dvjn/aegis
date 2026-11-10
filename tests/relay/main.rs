@@ -41,7 +41,7 @@ impl Fixture {
         std::fs::create_dir_all(root.join("vendor")).unwrap();
         std::fs::write(root.join(".bashrc"), "# existing shell settings\n").unwrap();
         let script = include_str!("vendor.py");
-        for name in ["claude", "codex", "pi"] {
+        for name in ["claude", "codex", "pi", "agy"] {
             let path = root.join("vendor").join(name);
             std::fs::write(&path, script).unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -67,7 +67,7 @@ impl Fixture {
         let catalog = if single {
             json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"}]})
         } else {
-            json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"},{"id":"personal","kind":"codex_subscription"},{"id":"work","kind":"codex_subscription"}]})
+            json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"},{"id":"personal","kind":"codex_subscription"},{"id":"work","kind":"codex_subscription"},{"id":"google-personal","kind":"antigravity_subscription"}]})
         };
         let app = Router::new()
             .route("/oauth/register",post(move || {let registered=registered.clone();async move {registered.fetch_add(1,Ordering::SeqCst);Json(json!({"client_id":"ags-test"}))}}))
@@ -418,4 +418,42 @@ async fn an_open_cli_refreshes_oauth_before_its_next_request() {
     assert_eq!(first["aegis_token"], "mock-access");
     assert_eq!(second["aegis_token"], "mock-access-1");
     assert_eq!(f.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn agy_wrapper_preserves_google_auth_arguments_and_private_proxy_lifetime() {
+    let mut f = Fixture::new().await;
+    f.setup(true).await;
+    let mut command = Command::new(f.root.join("ags/shims/agy"));
+    f.environment(&mut command);
+    let output = command
+        .args([
+            "--model",
+            "gemini-3.8-flash-low",
+            "--print",
+            "argument with spaces",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["args"][3], "argument with spaces");
+    assert_eq!(data["aegis_auth_in_environment"], false);
+    assert_eq!(
+        f.requests.recv().await.unwrap()["path"],
+        "/providers/google-personal/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert!(
+        reqwest::get(format!(
+            "{}/v1internal:loadCodeAssist",
+            data["endpoint"].as_str().unwrap()
+        ))
+        .await
+        .is_err()
+    );
 }

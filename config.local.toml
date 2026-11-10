@@ -25,3 +25,7 @@ type = "codex_subscription"
 [[providers]]
 id = "typesafe"
 type = "typesafe"
+
+[[providers]]
+id = "antigravity"
+type = "antigravity_subscription"

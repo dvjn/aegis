@@ -52,6 +52,11 @@ pub fn init_theme() {
 pub const KINDS: &[(&str, &str, &str)] = &[
     ("claude_subscription", "Claude", "anthropic"),
     ("codex_subscription", "Codex", "openai-codex"),
+    (
+        "antigravity_subscription",
+        "Antigravity",
+        "google-antigravity",
+    ),
 ];
 
 pub fn configure(config: &mut Config, available: &[Provider], flags: &[String]) -> Result<()> {

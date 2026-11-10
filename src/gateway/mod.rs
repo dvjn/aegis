@@ -12,6 +12,8 @@ use crate::{
     telemetry::{ClientStart, CompletionRecord, RequestIdentity, SqliteSink, timestamp},
 };
 
+#[cfg(test)]
+mod antigravity_tests;
 mod http;
 
 use axum::{
@@ -126,6 +128,9 @@ impl Gateway {
                         (Provider::Anthropic, base_url)
                     }
                     ProviderKind::CodexSubscription { base_url } => (Provider::Codex, base_url),
+                    ProviderKind::AntigravitySubscription { base_url } => {
+                        (Provider::Antigravity, base_url)
+                    }
                     ProviderKind::TypeSafe { base_url } => (Provider::TypeSafe, base_url),
                 };
                 let parsed = url::Url::parse(&base_url)
@@ -232,6 +237,7 @@ impl Gateway {
                 let kind = match self.providers[&id].kind {
                     Provider::Anthropic => "claude_subscription",
                     Provider::Codex => "codex_subscription",
+                    Provider::Antigravity => "antigravity_subscription",
                     Provider::TypeSafe => "typesafe",
                 };
                 crate::relay_wire::Provider {
@@ -285,6 +291,34 @@ impl Gateway {
             Ok(key) => key,
             Err(error) => return Ok(error.into_response()),
         };
+        let endpoint = parts
+            .uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or(parts.uri.path());
+        let route_prefix = format!("/providers/{provider_id}");
+        let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
+        // Quota/account/bootstrap calls contain private account metadata and are
+        // not model requests. They still require the same authenticated grant.
+        if !provider.is_inference(upstream_path) {
+            let mut outbound = self
+                .client
+                .request(parts.method, target.upstream_url(upstream_path));
+            for (name, value) in &parts.headers {
+                if !is_hop_by_hop(name) && name != header::HOST && name != header::ACCEPT_ENCODING {
+                    outbound = outbound.header(name, value);
+                }
+            }
+            let response = outbound
+                .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+                .send()
+                .await?;
+            let status = response.status();
+            let headers = filtered_headers(response.headers());
+            return Ok(
+                (status, headers, Body::from_stream(response.bytes_stream())).into_response(),
+            );
+        }
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
         let model = requested_model(&body);
         let context = RequestContext {
@@ -305,8 +339,13 @@ impl Gateway {
             evaluations,
             restore,
         } = decision;
-        let mut restorer =
-            (!restore.replacements.is_empty()).then(|| StreamRestorer::new(restore.replacements));
+        let mut restorer = (!restore.replacements.is_empty()).then(|| {
+            if matches!(provider, Provider::Antigravity) {
+                StreamRestorer::gemini(restore.replacements)
+            } else {
+                StreamRestorer::new(restore.replacements)
+            }
+        });
         if transformed {
             parts.headers.remove(header::CONTENT_ENCODING);
             parts.headers.remove(header::CONTENT_LENGTH);

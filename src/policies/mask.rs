@@ -20,7 +20,7 @@ pub const PLACEHOLDER_PREFIX: &str = "AEGIS_MASKED_";
 pub const PLACEHOLDER_SUFFIX: &str = "_END";
 const PLACEHOLDER_DIGEST_BYTES: usize = 11;
 
-const SCANNED_FIELDS: [&str; 7] = [
+const SCANNED_FIELDS: [&str; 9] = [
     "system",
     "messages",
     "tools",
@@ -28,9 +28,11 @@ const SCANNED_FIELDS: [&str; 7] = [
     "input",
     "state",
     "questions",
+    "contents",
+    "systemInstruction",
 ];
 const TOOL_CREDENTIAL_FIELDS: [&str; 2] = ["headers", "authorization_token"];
-const SIGNED_ITEM_CONTAINERS: [&str; 2] = ["messages", "input"];
+const SIGNED_ITEM_CONTAINERS: [&str; 3] = ["messages", "input", "contents"];
 const ATTACHMENT_DATA_FIELD: &str = "data";
 
 const SEVERITY: &str = "high";
@@ -167,6 +169,7 @@ impl MaskingPolicy {
                     return;
                 }
                 let is_attachment_source = fields.contains_key("media_type")
+                    || fields.contains_key("mimeType")
                     || fields
                         .get("type")
                         .and_then(Value::as_str)
@@ -197,6 +200,13 @@ impl MaskingPolicy {
             if let Some(value) = fields.get_mut(name) {
                 self.mask_value(value, &mut scan, skip, skip_signed_items);
             }
+        }
+        if let Some(Value::Object(request)) = fields.get_mut("request") {
+            let nested = self.mask_body(request);
+            for (detector, count) in nested.detector_counts {
+                *scan.detector_counts.entry(detector).or_default() += count;
+            }
+            scan.replacements.extend(nested.replacements);
         }
         scan
     }

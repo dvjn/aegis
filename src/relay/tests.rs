@@ -1,6 +1,46 @@
 use super::*;
 use crate::relay_wire::Provider;
 
+#[test]
+fn agy_uses_subscription_proxy_and_rejects_direct_api_settings() {
+    let provider = Provider {
+        id: "google-personal".into(),
+        kind: "antigravity_subscription".into(),
+    };
+    let args = vec![
+        "--model".into(),
+        "gemini-3.8-flash-low".into(),
+        "--print".into(),
+        "prompt with spaces".into(),
+    ];
+    let plan = profiles::plan(
+        "agy",
+        &provider,
+        "http://127.0.0.1:1234/private",
+        args.clone(),
+        Path::new("/unused"),
+    )
+    .unwrap();
+    assert_eq!(plan.args, args);
+    assert_eq!(
+        plan.env,
+        vec![(
+            "CLOUD_CODE_URL".into(),
+            "http://127.0.0.1:1234/private".into()
+        )]
+    );
+    assert!(
+        profiles::plan(
+            "agy",
+            &provider,
+            "http://localhost",
+            vec!["--settings".into(), r#"{"modelProvider":"gemini"}"#.into()],
+            Path::new("/unused")
+        )
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn reading_a_legacy_connection_removes_the_unused_key_without_repairing() {
     let home = std::env::temp_dir().join(format!("ags-legacy-state-{}", uuid::Uuid::new_v4()));
@@ -92,7 +132,7 @@ fn codex_launch_overrides_are_temporary_and_keep_vendor_sign_in() {
     assert!(plan.env.is_empty());
     assert!(
         profiles::plan(
-            "claude",
+            "agy",
             &provider,
             "http://localhost",
             vec![],

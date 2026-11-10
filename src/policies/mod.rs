@@ -19,6 +19,9 @@ pub const EVALUATION_METADATA_SCOPE: &str = "payloads:read";
 const PROVIDER_SIGNED_ITEM_TYPES: [&str; 3] = ["reasoning", "thinking", "redacted_thinking"];
 
 fn is_provider_signed_item(fields: &Map<String, Value>) -> bool {
+    if fields.contains_key("thoughtSignature") || fields.contains_key("thought_signature") {
+        return true;
+    }
     fields
         .get("type")
         .and_then(Value::as_str)

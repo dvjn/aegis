@@ -34,6 +34,24 @@ Existing `models.json` gateway endpoint overrides are redirected at the final st
 
 The remaining sections describe manual configuration without AGS.
 
+## Antigravity CLI
+
+Add an Antigravity subscription provider to the server configuration:
+
+```toml
+[[providers]]
+id = "antigravity"
+type = "antigravity_subscription"
+```
+
+After restarting the server, run `ags configure`, enable this provider, and choose the default subscription. Then run `agy` through its installed wrapper, or `ags run agy -- --model gemini-3.8-flash-low`. In development, use `mise run ags -- config` and `mise run relay -- agy`.
+
+AGS sets `CLOUD_CODE_URL` only in the launched process, starts its private proxy, and authenticates to Aegis with the connected app's OAuth token. Google's authorization stays in the original CLI. Account, model-catalog, and quota endpoints are proxied but excluded from captured model-request history. Generate-content requests record the requested/resolved model and cached, output, and thinking token usage. Cached input is counted once; output includes thinking, with thinking also recorded as its subset. Token counts describe model usage; subscription quotas and charges are not derived from token prices. Unpriced models retain token counts and an unknown cost.
+
+This subscription override was verified with `agy` 1.5.3 and is an internal CLI interface. `AGY_LLM_GATEWAY_URL`/`AGY_LLM_GATEWAY_API_KEY`, a nonempty `modelProvider`, and explicit `auth.type` settings conflict with this mode. Session settings can be reset with `--settings '{"modelProvider":"","auth":{"type":""}}'`. Remote agents execute outside the local relay and are unsupported.
+
+Guardrails scan nested Gemini prompts, system instructions, and tool declarations. Signed parts and inline attachment bytes are preserved. Normal requests and observe mode stream immediately. When mask mode finds a secret, response restoration buffers up to 8 MiB so late thought signatures can be recognized; signed candidates remain unchanged. Larger responses pass through with placeholders intact. Unsigned text split across SSE frames and function arguments are restored after the response completes.
+
 ## Claude Code
 
 Set the gateway URL and Aegis header, then run Claude Code with its existing provider authentication:

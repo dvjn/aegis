@@ -4,8 +4,8 @@ use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 const COMPONENT_SQL: &str = "CASE
     WHEN k.path = 'state' THEN 'evidence'
     WHEN k.path LIKE 'questions/%' THEN 'judgment'
-    WHEN k.path = 'tools' OR k.kind = 'additional_tools' THEN 'tool_definition'
-    WHEN k.path IN ('system', 'instructions') THEN 'system'
+    WHEN k.path IN ('tools', '/request/tools') OR k.kind = 'additional_tools' THEN 'tool_definition'
+    WHEN k.path IN ('system', 'instructions', '/request/systemInstruction') THEN 'system'
     WHEN k.kind IN ('thinking', 'redacted_thinking', 'reasoning') THEN 'thinking'
     WHEN k.kind IN ('tool_use', 'server_tool_use', 'function_call', 'custom_tool_call') THEN 'tool_use'
     WHEN k.kind IN ('tool_result', 'web_search_tool_result', 'function_call_output', 'custom_tool_call_output') THEN 'tool_result'
@@ -18,6 +18,7 @@ const COMPONENT_SQL: &str = "CASE
     THEN CASE k.role
         WHEN 'user' THEN 'user_text'
         WHEN 'assistant' THEN 'assistant_text'
+        WHEN 'model' THEN 'assistant_text'
         WHEN 'system' THEN 'system'
         WHEN 'developer' THEN 'system'
         ELSE 'other'
@@ -175,6 +176,37 @@ pub(crate) mod tests {
 
     fn json_len(value: serde_json::Value) -> i64 {
         serde_json::to_vec(&value).unwrap().len() as i64
+    }
+
+    #[tokio::test]
+    async fn antigravity_nested_parts_and_functions_are_counted() {
+        let database = database().await;
+        let body = serde_json::json!({"model":"gemini-3.8-flash-low","request":{
+            "systemInstruction":{"parts":[{"text":"be brief"}]},
+            "tools":[{"functionDeclarations":[{"name":"Read","parameters":{"type":"OBJECT"}},{"name":"Write","parameters":{"type":"OBJECT"}}]}],
+            "contents":[{"role":"user","parts":[{"text":"hello"}]},{"role":"model","parts":[{"text":"thinking","thought":true,"thoughtSignature":"signed"},{"text":"answer"},{"functionCall":{"id":"call1","name":"Read","args":{"path":"a"}}}]},{"role":"user","parts":[{"functionResponse":{"id":"call1","name":"Read","response":{"error":"no file"}}}]}]
+        }});
+        let id = started(
+            &database,
+            Provider::Antigravity,
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+        assert!(rollup(&database, &id).await.unwrap());
+        let actual = metrics(&database, &id).await.unwrap();
+        assert_eq!(actual.tools_offered, 2);
+        assert_eq!(actual.tools_invoked, 1);
+        assert_eq!(actual.tool_result_errors, 1);
+        for size in [
+            actual.system_bytes,
+            actual.user_text_bytes,
+            actual.assistant_text_bytes,
+            actual.thinking_bytes,
+            actual.tool_use_bytes,
+            actual.tool_result_bytes,
+        ] {
+            assert!(size > 0, "missing component in {actual:?}");
+        }
     }
 
     pub(crate) const ANTHROPIC_BODY: &str = r#"{"model":"claude-x",

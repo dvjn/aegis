@@ -33,6 +33,36 @@ pub(crate) fn extract(value: &Value) -> Vec<BlobFact> {
         return Vec::new();
     };
     let plain = |block_type| plain(block_type, value);
+    for (field, block_type) in [
+        ("functionCall", TOOL_USE),
+        ("functionResponse", TOOL_RESULT),
+    ] {
+        if let Some(call) = object.get(field) {
+            return vec![BlobFact {
+                tool_name: string(call, "name"),
+                tool_use_id: string(call, "id"),
+                skill_name: if field == "functionCall" {
+                    skill_name(call, || call.get("args").cloned())
+                } else {
+                    None
+                },
+                is_error: call
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .map(|v| !v.is_null() && v != false),
+                ..plain(block_type)
+            }];
+        }
+    }
+    if object.get("thought").is_some_and(|v| v == true) {
+        return vec![plain(THINKING)];
+    }
+    if object.contains_key("text") && !object.contains_key("type") {
+        return vec![plain(TEXT)];
+    }
+    if object.contains_key("inlineData") || object.contains_key("fileData") {
+        return vec![plain(IMAGE)];
+    }
     let facts = match object.get("type").and_then(Value::as_str) {
         Some("tool_use") => vec![BlobFact {
             tool_name: string(value, "name"),
@@ -87,6 +117,9 @@ pub(crate) fn extract(value: &Value) -> Vec<BlobFact> {
 /// An element of a request's `tools` array is a definition whatever its shape:
 /// hosted tools carry no schema.
 pub(crate) fn tool_definition(value: &Value) -> Vec<BlobFact> {
+    if let Some(declarations) = value.get("functionDeclarations").and_then(Value::as_array) {
+        return declarations.iter().flat_map(tool_definition).collect();
+    }
     if !value.is_object() {
         return Vec::new();
     }

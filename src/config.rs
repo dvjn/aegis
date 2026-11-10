@@ -140,6 +140,10 @@ pub enum ProviderKind {
         #[serde(default = "default_codex_base_url")]
         base_url: String,
     },
+    AntigravitySubscription {
+        #[serde(default = "default_antigravity_base_url")]
+        base_url: String,
+    },
     #[serde(rename = "typesafe")]
     TypeSafe {
         #[serde(default = "default_typesafe_base_url")]
@@ -152,6 +156,7 @@ impl ProviderKind {
         match self {
             Self::ClaudeSubscription { base_url }
             | Self::CodexSubscription { base_url }
+            | Self::AntigravitySubscription { base_url }
             | Self::TypeSafe { base_url } => base_url,
         }
     }
@@ -416,6 +421,10 @@ fn default_codex_base_url() -> String {
     "https://chatgpt.com/backend-api/codex".into()
 }
 
+fn default_antigravity_base_url() -> String {
+    "https://daily-cloudcode-pa.googleapis.com".into()
+}
+
 fn default_typesafe_base_url() -> String {
     "https://api.typesafe.ai".into()
 }
@@ -524,6 +533,17 @@ fn is_snake_case_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_subscription_uses_the_verified_google_backend() {
+        let config: FileConfig =
+            toml::from_str("[[providers]]\nid='google'\ntype='antigravity_subscription'\n")
+                .unwrap();
+        assert_eq!(
+            config.providers[0].kind.base_url(),
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
+    }
 
     #[test]
     fn parses_multiple_accounts() {

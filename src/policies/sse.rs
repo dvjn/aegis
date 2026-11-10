@@ -27,6 +27,10 @@ impl<'a> Line<'a> {
 }
 
 impl Frame {
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }

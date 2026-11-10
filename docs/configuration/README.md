@@ -52,7 +52,7 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # Optional. Add one table per upstream provider.
 # [[providers]]
 # id = "provider-name" # Required. Unique URL segment and API-key permission name. Maximum 64 characters: letters, digits, - or _.
-# type = "claude_subscription" # Required: claude_subscription | codex_subscription | typesafe.
+# type = "claude_subscription" # Required: claude_subscription | codex_subscription | antigravity_subscription | typesafe.
 # base_url = "https://provider.example/v1" # Optional. The provider type supplies a default.
 
 # Optional. Controls model-price refreshes.
@@ -69,6 +69,8 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # cache_read_per_mtok = 0.1 # Optional. Default: unset.
 # cache_write_per_mtok = 1.25 # Optional. Default: unset.
 ```
+
+`antigravity_subscription` defaults to `https://daily-cloudcode-pa.googleapis.com`, the subscription backend verified with `agy` 1.5.3. Set `base_url` to override it. AGS uses the CLI's existing Google sign-in through `CLOUD_CODE_URL`; enterprise gateway and direct Gemini API-key modes use separate protocols.
 
 Aegis creates `data/root.key` on first start. The file must contain 32 bytes and must not be accessible by group or other users.
 

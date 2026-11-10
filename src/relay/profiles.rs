@@ -5,12 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CLIENTS: &[&str] = &["claude", "codex", "pi"];
+pub const CLIENTS: &[&str] = &["claude", "codex", "pi", "agy"];
 
 pub fn kind(client: &str) -> Option<&'static str> {
     match client {
         "claude" => Some("claude_subscription"),
         "codex" => Some("codex_subscription"),
+        "agy" => Some("antigravity_subscription"),
         _ => None,
     }
 }
@@ -27,7 +28,7 @@ pub fn compatible(client: &str, provider: &Provider) -> bool {
 
 pub fn resolve(client: &str, home: &Path) -> Result<PathBuf> {
     if !CLIENTS.contains(&client) {
-        bail!("unsupported CLI {client}; supported: claude, codex, pi");
+        bail!("unsupported CLI {client}; supported: claude, codex, pi, agy");
     }
     let shims = home.join("shims");
     let own = std::env::current_exe()?.canonicalize()?;
@@ -95,6 +96,10 @@ pub fn plan(
         "claude" => result
             .env
             .push(("ANTHROPIC_BASE_URL".into(), endpoint.into())),
+        "agy" => {
+            super::agy::validate(&result.args)?;
+            result.env.push(("CLOUD_CODE_URL".into(), endpoint.into()));
+        }
         "codex" => {
             let config = [
                 "model_provider=\"ags\"".into(),

@@ -2,6 +2,8 @@ use super::sse::{Frame, FrameParser};
 use super::{Replacement, is_provider_signed_item};
 use serde_json::Value;
 
+mod gemini;
+
 /// Rewrites masking placeholders back to their originals in a streamed
 /// response, holding back text that could still be the start of a placeholder
 /// split across frames.
@@ -9,6 +11,7 @@ pub struct StreamRestorer {
     parser: FrameParser,
     replacements: Vec<Replacement>,
     blocks: Vec<Block>,
+    gemini: Option<gemini::GeminiRestorer>,
 }
 
 struct Block {
@@ -49,10 +52,20 @@ impl StreamRestorer {
             parser: FrameParser::default(),
             replacements,
             blocks: Vec::new(),
+            gemini: None,
         }
     }
 
+    pub fn gemini(replacements: Vec<Replacement>) -> Self {
+        let mut restorer = Self::new(Vec::new());
+        restorer.gemini = Some(gemini::GeminiRestorer::new(replacements));
+        restorer
+    }
+
     pub fn rewrite_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if let Some(gemini) = &mut self.gemini {
+            return gemini.push(chunk);
+        }
         if self.replacements.is_empty() {
             return chunk.to_vec();
         }
@@ -64,6 +77,9 @@ impl StreamRestorer {
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
+        if let Some(gemini) = &mut self.gemini {
+            return gemini.finish();
+        }
         let mut output = Vec::new();
         for block in std::mem::take(&mut self.blocks) {
             self.flush_block(block, &mut output);

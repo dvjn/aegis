@@ -153,6 +153,11 @@ fn split_paths(protocol: &str) -> Option<&'static [&'static str]> {
         "anthropic_messages" => Some(&["system", "messages", "tools"]),
         "openai_responses" => Some(&["instructions", "input", "tools"]),
         "typesafe_systemone" => Some(&["state", "questions"]),
+        "google_code_assist" => Some(&[
+            "/request/systemInstruction",
+            "/request/contents",
+            "/request/tools",
+        ]),
         _ => None,
     }
 }
@@ -183,8 +188,11 @@ fn take_elements(value: &mut serde_json::Value) -> Vec<serde_json::Value> {
     }
 }
 
-fn take_content_blocks(message: &mut serde_json::Value) -> Option<Vec<serde_json::Value>> {
-    match message.get_mut("content") {
+fn take_content_blocks(
+    message: &mut serde_json::Value,
+    field: &str,
+) -> Option<Vec<serde_json::Value>> {
+    match message.get_mut(field) {
         Some(serde_json::Value::Array(blocks)) => Some(std::mem::take(blocks)),
         _ => None,
     }
@@ -200,9 +208,26 @@ fn part(
     let kind = value
         .get("type")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or(fallback_kind)
+        .unwrap_or_else(|| {
+            if !path.starts_with("/request/") {
+                return fallback_kind;
+            }
+            if value.get("functionCall").is_some() {
+                "tool_use"
+            } else if value.get("functionResponse").is_some() {
+                "tool_result"
+            } else if value.get("thought").is_some_and(|v| v == true) {
+                "thinking"
+            } else if value.get("text").is_some() {
+                "text"
+            } else if value.get("inlineData").is_some() || value.get("fileData").is_some() {
+                "image"
+            } else {
+                fallback_kind
+            }
+        })
         .to_owned();
-    let facts = if path == "tools" {
+    let facts = if path == "tools" || path == "/request/tools" {
         payload_facts::tool_definition(value)
     } else {
         payload_facts::extract(value)
@@ -219,10 +244,10 @@ fn part(
 
 pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPayload> {
     let mut root = parse_body(body)?;
-    let object = root.as_object_mut()?;
+    root.as_object()?;
     let mut parts = Vec::new();
     for path in split_paths(protocol)? {
-        let Some(value) = object.get_mut(*path) else {
+        let Some(value) = semantic_slot(&mut root, path) else {
             continue;
         };
         if protocol == TYPESAFE && *path == QUESTIONS {
@@ -236,8 +261,9 @@ pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPaylo
                 .get("role")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
-            let blocks = (protocol == "anthropic_messages" && *path == "messages")
-                .then(|| take_content_blocks(&mut value))
+            let gemini = protocol == "google_code_assist" && *path == "/request/contents";
+            let blocks = (gemini || protocol == "anthropic_messages" && *path == "messages")
+                .then(|| take_content_blocks(&mut value, if gemini { "parts" } else { "content" }))
                 .flatten();
             parts.push(part(
                 (*path).to_owned(),
@@ -248,7 +274,11 @@ pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPaylo
             )?);
             for (block_position, block) in blocks.into_iter().flatten().enumerate() {
                 parts.push(part(
-                    content_block_path(position),
+                    if gemini {
+                        format!("/request/contents/{position}/parts")
+                    } else {
+                        content_block_path(position)
+                    },
                     block_position,
                     role.clone(),
                     "content",
@@ -264,6 +294,17 @@ pub(crate) fn split_request(body: &[u8], protocol: &str) -> Option<SemanticPaylo
         envelope: StoredPayload::new(&serde_json::to_vec(&root).ok()?)?,
         parts,
     })
+}
+
+fn semantic_slot<'a>(
+    root: &'a mut serde_json::Value,
+    path: &str,
+) -> Option<&'a mut serde_json::Value> {
+    if path.starts_with('/') {
+        root.pointer_mut(path)
+    } else {
+        root.get_mut(path)
+    }
 }
 
 pub(crate) fn reassemble_request(
@@ -289,9 +330,9 @@ pub(crate) fn reassemble_request(
     };
 
     let mut root: serde_json::Value = serde_json::from_slice(envelope).ok()?;
-    let object = root.as_object_mut()?;
+    root.as_object()?;
     for path in split_paths(protocol)? {
-        let Some(slot) = object.get_mut(*path) else {
+        let Some(slot) = semantic_slot(&mut root, path) else {
             continue;
         };
         let values = ordered(grouped.remove(*path).unwrap_or_default());
@@ -304,6 +345,7 @@ pub(crate) fn reassemble_request(
             }
         }
     }
+    let object = root.as_object_mut()?;
     if protocol == TYPESAFE
         && let Some(serde_json::Value::Object(questions)) = object.get_mut(QUESTIONS)
     {
@@ -332,6 +374,17 @@ pub(crate) fn reassemble_request(
             };
             if let Some(serde_json::Value::Array(content)) = message.get_mut("content") {
                 *content = ordered(blocks);
+            }
+        }
+    }
+    if protocol == "google_code_assist"
+        && let Some(serde_json::Value::Array(contents)) = root.pointer_mut("/request/contents")
+    {
+        for (position, content) in contents.iter_mut().enumerate() {
+            if let Some(blocks) = grouped.remove(&format!("/request/contents/{position}/parts"))
+                && let Some(serde_json::Value::Array(parts)) = content.get_mut("parts")
+            {
+                *parts = ordered(blocks);
             }
         }
     }
@@ -613,6 +666,34 @@ pub fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_payload_round_trips_nested_tools_and_signed_history() {
+        let body = serde_json::json!({"model":"gemini-3.8-flash-low","project":"private-project","request":{
+            "systemInstruction":{"parts":[{"text":"instructions"}]},
+            "contents":[{"role":"user","parts":[{"text":"question"}]},{"role":"model","parts":[{"text":"signed thought","thought":true,"thoughtSignature":"opaque-signature"},{"functionCall":{"name":"Read","args":{"path":"a"}}}]}],
+            "tools":[{"functionDeclarations":[{"name":"Read","parameters":{"type":"OBJECT"}}]}],
+            "generationConfig":{"thinkingConfig":{"thinkingLevel":"LOW"}},"sessionId":"session"
+        }});
+        let payload =
+            split_request(&serde_json::to_vec(&body).unwrap(), "google_code_assist").unwrap();
+        assert!(
+            payload
+                .parts
+                .iter()
+                .any(|p| p.path == "/request/contents/1/parts" && p.kind == "thinking")
+        );
+        let rebuilt = reassemble_request(
+            &decode_body(&payload.envelope.body),
+            stored_parts(&payload),
+            "google_code_assist",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rebuilt).unwrap(),
+            body
+        );
+    }
     use crate::migration::Migrator;
     use chrono::DateTime;
     use sea_orm::Database;
