@@ -25,10 +25,27 @@ pub struct SqliteSink {
     database: DatabaseConnection,
 }
 
+#[cfg(test)]
 pub struct StartRecord<'a> {
     pub request_id: &'a str,
     pub key_id: &'a str,
     pub key_version_id: &'a str,
+    pub provider_id: &'a str,
+    pub provider: Provider,
+    pub method: &'a str,
+    pub endpoint: &'a str,
+    pub requested_model: Option<&'a str>,
+    pub request_body: &'a [u8],
+}
+
+pub enum RequestIdentity<'a> {
+    ApiKey { id: &'a str, version_id: &'a str },
+    ConnectedApp { id: &'a str },
+}
+
+pub struct ClientStart<'a> {
+    pub request_id: &'a str,
+    pub identity: RequestIdentity<'a>,
     pub provider_id: &'a str,
     pub provider: Provider,
     pub method: &'a str,
@@ -341,7 +358,29 @@ impl SqliteSink {
         Self { database }
     }
 
+    #[cfg(test)]
     pub async fn start(&self, record: StartRecord<'_>) -> Result<Uuid, sea_orm::DbErr> {
+        self.start_client(ClientStart {
+            request_id: record.request_id,
+            identity: RequestIdentity::ApiKey {
+                id: record.key_id,
+                version_id: record.key_version_id,
+            },
+            provider_id: record.provider_id,
+            provider: record.provider,
+            method: record.method,
+            endpoint: record.endpoint,
+            requested_model: record.requested_model,
+            request_body: record.request_body,
+        })
+        .await
+    }
+
+    pub async fn start_client(&self, record: ClientStart<'_>) -> Result<Uuid, sea_orm::DbErr> {
+        let (client_id, key_id, key_version_id) = match record.identity {
+            RequestIdentity::ApiKey { id, version_id } => (id, Some(id), Some(version_id)),
+            RequestIdentity::ConnectedApp { id } => (id, None, None),
+        };
         let id = Uuid::now_v7();
         let protocol = record.provider.protocol();
         let semantic_payload = split_request(record.request_body, protocol);
@@ -351,12 +390,13 @@ impl SqliteSink {
         let inserted = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+                "INSERT INTO gateway_requests (id, request_id, client_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
                 [
                     id.to_string().into(),
                     record.request_id.to_owned().into(),
-                    record.key_id.to_owned().into(),
-                    record.key_version_id.to_owned().into(),
+                    client_id.to_owned().into(),
+                    key_id.map(str::to_owned).into(),
+                    key_version_id.map(str::to_owned).into(),
                     record.provider_id.to_owned().into(),
                     record.provider.protocol().into(),
                     record.method.to_owned().into(),

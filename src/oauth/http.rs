@@ -248,8 +248,14 @@ pub async fn device_authorization(
     let (Some(client_id), Some(resource)) = (input.one("client_id"), input.one("resource")) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    if resource != format!("{issuer}/mcp") {
+    let relay_resource = format!("{issuer}{}", crate::relay_wire::RESOURCE_PATH);
+    if resource != format!("{issuer}/mcp") && resource != relay_resource {
         return error(StatusCode::BAD_REQUEST, "invalid_target");
+    }
+    if resource == relay_resource
+        && input.optional_one("scope") != Some("relay:manage offline_access")
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_scope");
     }
     match state
         .domain
@@ -876,7 +882,10 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
     let Some(resource) = input.one("resource") else {
         return error(StatusCode::BAD_REQUEST, "invalid_target");
     };
-    if resource != expected_resource {
+    if resource != expected_resource
+        && !(grant_type == "refresh_token"
+            && resource == format!("{issuer}{}", crate::relay_wire::RESOURCE_PATH))
+    {
         return error(StatusCode::BAD_REQUEST, "invalid_target");
     }
     let result = match grant_type {

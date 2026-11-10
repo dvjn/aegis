@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set,
-    sea_query::Expr,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait,
+    QueryFilter, Set, Statement, sea_query::Expr,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -26,6 +26,7 @@ pub struct ConnectedClient {
     pub scope: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+    pub allowed_providers: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +142,7 @@ impl OAuthService {
                         scope: scope.clone(),
                         created_at,
                         last_used_at: None,
+                        allowed_providers: Vec::new(),
                     });
                 if created_at < entry.created_at {
                     entry.created_at = created_at;
@@ -202,6 +204,23 @@ impl OAuthService {
         for client in names {
             if let Some(entry) = connected.get_mut(&client.id) {
                 entry.client_name = client.client_name;
+            }
+        }
+        let relays = self.db.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT oauth_client_id,allowed_providers,last_used_at FROM gateway_clients WHERE kind='oauth' AND user_id=? AND oauth_issuer=?",
+            [principal.user_id().to_string().into(),issuer.to_owned().into()])).await?;
+        for relay in relays {
+            let id: String = relay.try_get("", "oauth_client_id")?;
+            if let Some(entry) = connected.get_mut(&id) {
+                let providers: String = relay.try_get("", "allowed_providers")?;
+                entry.allowed_providers = serde_json::from_str(&providers)
+                    .map_err(|_| DomainError::InvalidInput("invalid stored provider grants"))?;
+                if let Some(used) = relay.try_get::<Option<String>>("", "last_used_at")? {
+                    let used = parse_stored_date(&used)?;
+                    if entry.last_used_at.is_none_or(|prior| prior < used) {
+                        entry.last_used_at = Some(used);
+                    }
+                }
             }
         }
         Ok(connected.into_values().collect())

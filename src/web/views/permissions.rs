@@ -7,7 +7,11 @@ struct Permission {
     label: &'static str,
 }
 
-const REGISTRY: [Permission; 5] = [
+const REGISTRY: [Permission; 6] = [
+    Permission {
+        scope: crate::relay_wire::SCOPE,
+        label: "Connect CLI relays and manage this device's provider access",
+    },
     Permission {
         scope: "usage:read",
         label: "Read usage totals",

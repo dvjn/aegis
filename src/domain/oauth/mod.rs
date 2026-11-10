@@ -3,6 +3,7 @@ mod codes;
 mod device;
 mod grants;
 mod refresh;
+mod relay;
 mod tokens;
 
 pub use clients::ClientRegistration;
@@ -36,7 +37,8 @@ use super::{Clock, error::DomainError};
 
 pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-pub const SCOPES: [&str; 5] = [
+pub const SCOPES: [&str; 6] = [
+    crate::relay_wire::SCOPE,
     "usage:read",
     "requests:read",
     "payloads:read",
@@ -53,13 +55,14 @@ pub const OFFLINE_ACCESS: &str = "offline_access";
 pub fn resource_scopes() -> Vec<&'static str> {
     SCOPES
         .into_iter()
-        .filter(|scope| *scope != OFFLINE_ACCESS)
+        .filter(|scope| *scope != OFFLINE_ACCESS && *scope != crate::relay_wire::SCOPE)
         .collect()
 }
 
 pub fn default_registration_scope(refresh_token_grant: bool) -> String {
     SCOPES
         .into_iter()
+        .filter(|scope| *scope != crate::relay_wire::SCOPE)
         .filter(|scope| refresh_token_grant || *scope != OFFLINE_ACCESS)
         .collect::<Vec<_>>()
         .join(" ")
@@ -600,7 +603,11 @@ pub(super) mod tests {
         assert!(validate_scope(&SCOPES.join(" ")).is_ok());
         assert!(validate_scope(&resource_scopes().join(" ")).is_ok());
         assert!(!resource_scopes().contains(&OFFLINE_ACCESS));
-        assert_eq!(default_registration_scope(true), SCOPES.join(" "));
+        assert_eq!(
+            default_registration_scope(true),
+            format!("{} offline_access", resource_scopes().join(" "))
+        );
+        assert!(!default_registration_scope(true).contains(crate::relay_wire::SCOPE));
         assert_eq!(
             default_registration_scope(false),
             resource_scopes().join(" ")

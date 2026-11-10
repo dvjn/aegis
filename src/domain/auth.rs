@@ -95,7 +95,6 @@ impl Principal {
             PrincipalTransport::OAuthAccessToken { .. } => None,
         }
     }
-    #[cfg(test)]
     pub fn oauth(&self) -> Option<&OAuthPrincipal> {
         match &self.transport {
             PrincipalTransport::OAuthAccessToken { context, .. } => Some(context),

@@ -9,7 +9,7 @@ use crate::{
     pricing::cost,
     providers::{Provider, extract_completion, requested_model},
     request_id::RequestId,
-    telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
+    telemetry::{ClientStart, CompletionRecord, RequestIdentity, SqliteSink, timestamp},
 };
 
 mod http;
@@ -55,6 +55,31 @@ pub struct Gateway {
     policies: Pipeline,
     providers: Arc<HashMap<String, ProviderTarget>>,
     max_capture_bytes: usize,
+    oauth: Option<(Arc<crate::domain::Domain>, crate::origin::OriginPolicy)>,
+}
+
+struct AuthenticatedClient {
+    id: String,
+    user_id: String,
+    key: Option<(String, String)>,
+}
+
+enum AuthenticationFailure {
+    Key(AuthenticationError),
+    Status(StatusCode),
+}
+impl From<StatusCode> for AuthenticationFailure {
+    fn from(status: StatusCode) -> Self {
+        Self::Status(status)
+    }
+}
+impl IntoResponse for AuthenticationFailure {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Key(error) => authentication_error(error),
+            Self::Status(status) => status.into_response(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -122,13 +147,99 @@ impl Gateway {
             policies,
             providers: Arc::new(providers),
             max_capture_bytes,
+            oauth: None,
         })
+    }
+
+    pub fn with_oauth(
+        mut self,
+        domain: Arc<crate::domain::Domain>,
+        origin: crate::origin::OriginPolicy,
+    ) -> Self {
+        self.oauth = Some((domain, origin));
+        self
+    }
+
+    async fn authenticate(
+        &self,
+        headers: &mut HeaderMap,
+        provider: &str,
+    ) -> Result<AuthenticatedClient, AuthenticationFailure> {
+        if let Some(token) = headers.remove(crate::relay_wire::ACCESS_TOKEN_HEADER) {
+            if headers.remove("x-aegis-api-key").is_some() {
+                return Err(StatusCode::BAD_REQUEST.into());
+            }
+            let Some((domain, origin)) = &self.oauth else {
+                return Err(StatusCode::UNAUTHORIZED.into());
+            };
+            let issuer = origin
+                .effective_origin(headers)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let token = token.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let principal = domain
+                .oauth()
+                .authenticate_access_token(
+                    token,
+                    &issuer,
+                    &format!("{issuer}{}", crate::relay_wire::RESOURCE_PATH),
+                )
+                .await
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            if !principal
+                .oauth()
+                .is_some_and(|p| crate::domain::scope_allows(&p.scope, crate::relay_wire::SCOPE))
+            {
+                return Err(StatusCode::FORBIDDEN.into());
+            }
+            let id = domain
+                .oauth()
+                .relay_identity(&principal, provider)
+                .await
+                .map_err(|error| match error {
+                    crate::domain::DomainError::InvalidCredentials
+                    | crate::domain::DomainError::InvalidInput(_) => StatusCode::FORBIDDEN,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                })?;
+            Ok(AuthenticatedClient {
+                id,
+                user_id: principal.user_id().to_string(),
+                key: None,
+            })
+        } else {
+            let key = self
+                .keys
+                .authenticate(headers, provider)
+                .await
+                .map_err(AuthenticationFailure::Key)?;
+            Ok(AuthenticatedClient {
+                id: key.id.clone(),
+                user_id: key.user_id,
+                key: Some((key.id, key.version_id)),
+            })
+        }
     }
 
     pub fn provider_ids(&self) -> Vec<String> {
         let mut ids = self.providers.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         ids
+    }
+
+    pub fn provider_catalog(&self) -> Vec<crate::relay_wire::Provider> {
+        self.provider_ids()
+            .into_iter()
+            .map(|id| {
+                let kind = match self.providers[&id].kind {
+                    Provider::Anthropic => "claude_subscription",
+                    Provider::Codex => "codex_subscription",
+                    Provider::TypeSafe => "typesafe",
+                };
+                crate::relay_wire::Provider {
+                    id,
+                    kind: kind.into(),
+                }
+            })
+            .collect()
     }
 
     pub async fn forward(&self, provider_id: &str, request: Request) -> Response {
@@ -170,13 +281,9 @@ impl Gateway {
             .unwrap_or("unknown")
             .to_owned();
         let (mut parts, body) = request.into_parts();
-        let authenticated = match self
-            .keys
-            .authenticate(&mut parts.headers, provider_id)
-            .await
-        {
+        let authenticated = match self.authenticate(&mut parts.headers, provider_id).await {
             Ok(key) => key,
-            Err(error) => return Ok(authentication_error(error)),
+            Err(error) => return Ok(error.into_response()),
         };
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
         let model = requested_model(&body);
@@ -214,17 +321,24 @@ impl Gateway {
         let upstream_url = target.upstream_url(upstream_path);
         let span = tracing::Span::current();
         span.record("user_id", tracing::field::display(&authenticated.user_id));
-        span.record("key_id", tracing::field::display(&authenticated.id));
+        span.record("client_id", tracing::field::display(&authenticated.id));
+        if let Some((id, _)) = &authenticated.key {
+            span.record("key_id", tracing::field::display(id));
+        }
         span.record("provider_id", tracing::field::display(provider_id));
         if let Some(model) = model.as_deref() {
             span.record("model", tracing::field::display(model));
         }
         let capture_id = self
             .sink
-            .start(StartRecord {
+            .start_client(ClientStart {
                 request_id: &request_id,
-                key_id: &authenticated.id,
-                key_version_id: &authenticated.version_id,
+                identity: match &authenticated.key {
+                    Some((id, version_id)) => RequestIdentity::ApiKey { id, version_id },
+                    None => RequestIdentity::ConnectedApp {
+                        id: &authenticated.id,
+                    },
+                },
                 provider_id,
                 provider,
                 method: parts.method.as_str(),

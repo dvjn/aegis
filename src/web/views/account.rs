@@ -259,7 +259,12 @@ fn apps_card(csrf: &str, apps: &[ConnectedClient]) -> Markup {
                                     (app.client_name.as_deref().unwrap_or("Unnamed application"))
                                     code class="cell-subtitle" { (app.client_id) }
                                 }
-                                td { (super::permissions::scope_chips(&app.scope)) }
+                                td {
+                                    (super::permissions::scope_chips(&app.scope))
+                                    @if !app.allowed_providers.is_empty() {
+                                        span class="cell-subtitle" { "Providers: " (app.allowed_providers.join(", ")) }
+                                    }
+                                }
                                 td class="cell-moment" { (moment(app.created_at)) }
                                 td class="cell-moment" {
                                     @match app.last_used_at {

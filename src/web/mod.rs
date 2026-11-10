@@ -1556,6 +1556,7 @@ mod tests {
         assert_eq!(
             metadata["scopes_supported"],
             serde_json::json!([
+                "relay:manage",
                 "usage:read",
                 "requests:read",
                 "payloads:read",

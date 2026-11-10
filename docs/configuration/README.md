@@ -87,6 +87,7 @@ Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header.
 | Variable | Required | Default | Overrides |
 | --- | --- | --- | --- |
 | `HTTP_ADDR` | no | config file | `http_addr` |
+| `PUBLIC_URL` | no | config file | `public_url` (canonical external origin for OAuth and cookie security) |
 | `DATABASE_URL` | no | config file | `database_url` |
 | `MAX_CAPTURE_BYTES` | no | config file | `max_capture_bytes` |
 

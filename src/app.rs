@@ -5,7 +5,7 @@ use crate::{
     gateway::{self, Gateway},
     health, mcp, oauth,
     origin::OriginPolicy,
-    request_id,
+    relay_api, request_id,
     usage::UsageStore,
     web,
 };
@@ -22,15 +22,23 @@ pub fn router(
     origin: OriginPolicy,
     cancellation: CancellationToken,
 ) -> Router {
+    let gateway = gateway.with_oauth(domain.clone(), origin.clone());
     let session = web::SessionState::new(domain.clone(), origin.clone());
+    let relay_state = relay_api::RelayState {
+        domain: domain.clone(),
+        gateway: gateway.clone(),
+        origin: origin.clone(),
+    };
     let web_state = web::AppState::new(session.clone(), gateway.clone(), keys, usage);
     let oauth_state = oauth::State::new(session);
     let mcp_state = mcp::State::new(domain.oauth().clone(), origin);
     let web_and_gateway = Router::new()
+        .merge(relay_api::router(relay_state))
         .merge(gateway::router(gateway).layer(access_log::layer!(
             access_log::GATEWAY,
             user_id,
             key_id,
+            client_id,
             provider_id,
             model,
             input_tokens,

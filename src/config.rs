@@ -264,7 +264,7 @@ impl Config {
             database_url,
             max_capture_bytes,
             providers,
-            public_url: file.public_url,
+            public_url: optional_var("PUBLIC_URL")?.or(file.public_url),
             registration_enabled: file.registration_enabled,
             smtp,
             auth: AuthConfig {
