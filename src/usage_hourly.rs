@@ -15,11 +15,11 @@ use crate::telemetry::timestamp;
 pub const HOUR_FORMAT: &str = "%Y-%m-%dT%H:00:00.000Z";
 
 const AGGREGATE_SQL: &str = "INSERT INTO gateway_usage_hourly \
-     (user_id, hour, provider, requested_model, key_id, requests, succeeded, failed, \
+     (user_id, hour, provider, requested_model, client_id, requests, succeeded, failed, \
      input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, \
      cost_nanodollars, unpriced) \
      SELECT k.user_id, strftime('{hour}', r.started_at), r.provider, \
-     COALESCE(r.resolved_model, r.requested_model, ''), r.key_id, \
+     COALESCE(r.resolved_model, r.requested_model, ''), r.client_id, \
      COUNT(*), \
      SUM(CASE WHEN r.http_status < 400 AND r.error_message IS NULL THEN 1 ELSE 0 END), \
      SUM(CASE WHEN r.http_status >= 400 OR r.error_message IS NOT NULL THEN 1 ELSE 0 END), \
@@ -31,11 +31,11 @@ const AGGREGATE_SQL: &str = "INSERT INTO gateway_usage_hourly \
      COALESCE(SUM(u.cost_nanodollars), 0), \
      SUM(CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END) \
      FROM gateway_requests r \
-     JOIN gateway_keys k ON k.id = r.key_id \
+     JOIN gateway_clients k ON k.id = r.client_id \
      LEFT JOIN gateway_usage u ON u.request_id = r.id \
      WHERE r.aggregated_at IS NULL AND r.completed_at IS NOT NULL {filter} \
      GROUP BY 1, 2, 3, 4, 5 \
-     ON CONFLICT (user_id, hour, provider, requested_model, key_id) DO UPDATE SET \
+     ON CONFLICT (user_id, hour, provider, requested_model, client_id) DO UPDATE SET \
      requests = requests + excluded.requests, \
      succeeded = succeeded + excluded.succeeded, \
      failed = failed + excluded.failed, \

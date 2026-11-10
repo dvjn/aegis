@@ -16,27 +16,27 @@ use crate::usage_hourly::HOUR_FORMAT;
 
 /// The finished requests to count, with the user and hour they belong to.
 const REQUESTS_SQL: &str = "request AS ( \
-     SELECT r.id, k.user_id, strftime('{hour}', r.started_at) hour, r.provider, r.key_id \
+     SELECT r.id, k.user_id, strftime('{hour}', r.started_at) hour, r.provider, r.client_id \
      FROM gateway_requests r \
-     JOIN gateway_keys k ON k.id = r.key_id \
+     JOIN gateway_clients k ON k.id = r.client_id \
      WHERE r.completed_at IS NOT NULL {unstamped} {filter})";
 
 const EVALUATIONS_SQL: &str = "evaluation AS ( \
-     SELECT q.user_id, q.hour, q.provider, q.key_id, e.request_id, e.outcome, e.match_count, e.metadata \
+     SELECT q.user_id, q.hour, q.provider, q.client_id, e.request_id, e.outcome, e.match_count, e.metadata \
      FROM request q \
      JOIN policy_evaluations e ON e.request_id = q.id AND e.policy IN ('secrets', 'regex'))";
 
 const REQUEST_COUNTS_SQL: &str = "INSERT INTO gateway_guardrails_hourly \
-     (user_id, hour, provider, key_id, scanned, masked, matches) \
+     (user_id, hour, provider, client_id, scanned, masked, matches) \
      WITH {requests}, {evaluations}, \
      per_request AS ( \
-     SELECT user_id, hour, provider, key_id, \
+     SELECT user_id, hour, provider, client_id, \
      MAX(CASE WHEN outcome = 'transform' THEN 1 ELSE 0 END) masked, \
      SUM(match_count) matches \
-     FROM evaluation GROUP BY user_id, hour, provider, key_id, request_id) \
-     SELECT user_id, hour, provider, key_id, COUNT(*), SUM(masked), SUM(matches) \
+     FROM evaluation GROUP BY user_id, hour, provider, client_id, request_id) \
+     SELECT user_id, hour, provider, client_id, COUNT(*), SUM(masked), SUM(matches) \
      FROM per_request GROUP BY 1, 2, 3, 4 \
-     ON CONFLICT (user_id, hour, provider, key_id) DO UPDATE SET \
+     ON CONFLICT (user_id, hour, provider, client_id) DO UPDATE SET \
      scanned = scanned + excluded.scanned, \
      masked = masked + excluded.masked, \
      matches = matches + excluded.matches";

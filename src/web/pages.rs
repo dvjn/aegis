@@ -41,10 +41,10 @@ pub(super) async fn root(
         series,
         models,
         providers,
-        keys,
+        clients,
         model_series,
         provider_series,
-        key_series,
+        client_series,
         guardrails,
     ) = tokio::join!(
         usage.totals(user, window),
@@ -53,10 +53,10 @@ pub(super) async fn root(
         usage.totals_series(user, window),
         usage.by_model(user, window),
         usage.by_provider(user, window),
-        usage.by_key(user, window),
+        usage.by_client(user, window),
         usage.series_by_model(user, window),
         usage.series_by_provider(user, window),
-        usage.series_by_key(user, window),
+        usage.series_by_client(user, window),
         usage.guardrails(user, window),
     );
     let elapsed_ms = query_started.elapsed().as_millis() as u64;
@@ -76,10 +76,10 @@ pub(super) async fn root(
         series: &series.map_err(DomainError::from)?,
         models: &models.map_err(DomainError::from)?,
         providers: &providers.map_err(DomainError::from)?,
-        keys: &keys.map_err(DomainError::from)?,
+        clients: &clients.map_err(DomainError::from)?,
         model_series: &model_series.map_err(DomainError::from)?,
         provider_series: &provider_series.map_err(DomainError::from)?,
-        key_series: &key_series.map_err(DomainError::from)?,
+        client_series: &client_series.map_err(DomainError::from)?,
         guardrails: &guardrails,
     };
     Ok(views::home::page(&overview).into_response())

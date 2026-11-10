@@ -7,8 +7,8 @@ use super::charts::{
 use super::format::{count_text, money_text, percent_text, token_text};
 use super::{layout_with_nav, signed_in_nav, tools};
 use crate::usage::{
-    ContextTotals, GuardrailsSummary, LabeledSeries, Range, ToolUsage, TotalsSeries, UsageGroup,
-    UsageTotals,
+    ClientUsage, ContextTotals, GuardrailsSummary, LabeledSeries, Range, ToolUsage, TotalsSeries,
+    UsageGroup, UsageTotals,
 };
 
 /// Everything the overview needs, gathered by the handler in one place.
@@ -20,10 +20,10 @@ pub struct Overview<'a> {
     pub series: &'a TotalsSeries,
     pub models: &'a [UsageGroup],
     pub providers: &'a [UsageGroup],
-    pub keys: &'a [UsageGroup],
+    pub clients: &'a [ClientUsage],
     pub model_series: &'a [LabeledSeries],
     pub provider_series: &'a [LabeledSeries],
-    pub key_series: &'a [LabeledSeries],
+    pub client_series: &'a [LabeledSeries],
     pub guardrails: &'a GuardrailsSummary,
 }
 
@@ -65,9 +65,9 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                         cost_by_model_bar(overview.models),
                     ))
                     (masked_tile(overview.guardrails))
-                    (breakdown_card("Models", "Requests, tokens, and cost by the model that answered.", "Model", "grid-half rows-3", overview.models, overview.model_series))
-                    (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", "grid-half rows-2", overview.providers, overview.provider_series))
-                    (breakdown_card("Keys", "Requests, tokens, and cost by the key that sent them.", "Key", "grid-half rows-2", overview.keys, overview.key_series))
+                    (breakdown_card("Models", "Requests, tokens, and cost by the model that answered.", "Model", "grid-half rows-3", overview.models, overview.model_series, None))
+                    (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", "grid-half rows-2", overview.providers, overview.provider_series, None))
+                    (clients_card(overview.clients, overview.client_series))
                     (context_card(overview.context))
                     (tools::mcp_card(overview.tools))
                     (tools::skills_card(overview.tools))
@@ -292,6 +292,27 @@ fn chart_series(series: &[LabeledSeries]) -> Vec<Series> {
         .collect()
 }
 
+fn clients_card(clients: &[ClientUsage], series: &[LabeledSeries]) -> Markup {
+    let rows: Vec<_> = clients
+        .iter()
+        .map(|client| UsageGroup {
+            label: Some(client.id.clone()),
+            requests: client.requests,
+            tokens: client.tokens,
+            cost_nanodollars: client.cost_nanodollars,
+        })
+        .collect();
+    breakdown_card(
+        "Clients",
+        "Requests, tokens, and cost from API keys and connected apps.",
+        "Client",
+        "grid-half rows-2",
+        &rows,
+        series,
+        Some(clients),
+    )
+}
+
 /// `placement` is the card's span classes in the overview grid.
 fn breakdown_card(
     title: &str,
@@ -300,6 +321,7 @@ fn breakdown_card(
     placement: &str,
     rows: &[UsageGroup],
     series: &[LabeledSeries],
+    clients: Option<&[ClientUsage]>,
 ) -> Markup {
     // A row is matched to its line by label, not by position, so a tie broken
     // differently by the two queries cannot swap colours.
@@ -309,11 +331,27 @@ fn breakdown_card(
             .position(|line| line.label.as_deref() == label)
             .map(|index| (row_series_class(index, series.len()), &series[index].tokens))
     };
+    let client_for = |label: Option<&str>| {
+        clients.and_then(|clients| {
+            clients
+                .iter()
+                .find(|client| Some(client.id.as_str()) == label)
+        })
+    };
+    let display_label = |label: Option<&str>| {
+        client_for(label)
+            .map(|client| client.name.clone())
+            .unwrap_or_else(|| series_label(label))
+    };
+    let mut chart = chart_series(series);
+    for (line, source) in chart.iter_mut().zip(series) {
+        line.label = display_label(source.label.as_deref());
+    }
     html! {
         article class=(format!("auth-card account-card {placement}")) {
             h2 { (title) }
             p { (blurb) }
-            (line_chart(&chart_series(series), &|value| token_text(value as i64)))
+            (line_chart(&chart, &|value| token_text(value as i64)))
             div class="table-wrap" {
                 table class="data-table" {
                     thead {
@@ -332,12 +370,12 @@ fn breakdown_card(
                         @for row in rows {
                             @let line = row_line(row.label.as_deref());
                             tr {
-                                th scope="row" class="cell-title" title=(series_label(row.label.as_deref())) {
+                                th scope="row" class="cell-title" title=(display_label(row.label.as_deref())) {
                                     @if let Some((class, _)) = &line {
                                         span class=(format!("row-swatch {class}")) aria-hidden="true" {}
                                     }
                                     @match row.label.as_deref() {
-                                        Some(label) => (label),
+                                        Some(label) => (display_label(Some(label))),
                                         None => span class="cell-absent" { "unspecified" },
                                     }
                                 }
@@ -505,10 +543,10 @@ mod tests {
             series: &series,
             models: &models,
             providers: &[],
-            keys: &[],
+            clients: &[],
             model_series: &model_series,
             provider_series: &[],
-            key_series: &[],
+            client_series: &[],
             guardrails: &GuardrailsSummary::default(),
         })
         .into_string();
@@ -559,17 +597,35 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_card_names_the_key_and_nothing_about_its_versions() {
-        let keys = vec![UsageGroup {
-            label: Some("agent".to_owned()),
-            requests: 4,
-            tokens: 120,
-            cost_nanodollars: 2_000_000,
-        }];
-        let key_series = vec![LabeledSeries {
-            label: Some("agent".to_owned()),
-            tokens: vec![20, 100, 0, 0, 0, 0, 0, 0],
-        }];
+    fn the_clients_card_names_the_key_and_nothing_about_its_versions() {
+        let clients = vec![
+            ClientUsage {
+                id: "client-id".into(),
+                name: "agent".into(),
+                kind: "api_key".into(),
+                requests: 4,
+                tokens: 120,
+                cost_nanodollars: 2_000_000,
+            },
+            ClientUsage {
+                id: "oauth-client".into(),
+                name: "ags · tungsten".into(),
+                kind: "oauth".into(),
+                requests: 2,
+                tokens: 300,
+                cost_nanodollars: 1_000_000,
+            },
+        ];
+        let client_series = vec![
+            LabeledSeries {
+                label: Some("client-id".to_owned()),
+                tokens: vec![20, 100, 0, 0, 0, 0, 0, 0],
+            },
+            LabeledSeries {
+                label: Some("oauth-client".into()),
+                tokens: vec![100, 200, 0, 0, 0, 0, 0, 0],
+            },
+        ];
         let page = page(&Overview {
             range: Range::Week,
             totals: &UsageTotals::default(),
@@ -582,15 +638,19 @@ mod tests {
             },
             models: &[],
             providers: &[],
-            keys: &keys,
+            clients: &clients,
             model_series: &[],
             provider_series: &[],
-            key_series: &key_series,
+            client_series: &client_series,
             guardrails: &GuardrailsSummary::default(),
         })
         .into_string();
-        assert!(page.contains(r#"<h2>Keys</h2>"#), "{page}");
-        assert!(page.contains(r#"<th scope="col">Key</th>"#));
+        assert_eq!(page.matches("<h2>Clients</h2>").count(), 1);
+        assert!(!page.contains("<h2>Keys</h2>"));
+        assert!(!page.contains("<h2>Connected apps</h2>"));
+        assert!(!page.contains(r#"<th scope="col">Type</th>"#));
+        assert!(page.contains("ags · tungsten"));
+        assert!(page.contains(r#"<th scope="col">Client</th>"#));
         assert!(
             page.contains(r#"<th scope="row" class="cell-title" title="agent">"#),
             "the row names the key"
@@ -600,9 +660,9 @@ mod tests {
         }
         assert!(
             page.contains(
-                r#"<article class="auth-card account-card grid-half rows-2"><h2>Keys</h2>"#
+                r#"<article class="auth-card account-card grid-half rows-2"><h2>Clients</h2>"#
             ),
-            "Keys takes half the columns and two row units"
+            "Clients takes half the columns and two row units"
         );
     }
 
@@ -645,7 +705,7 @@ mod tests {
         let order: Vec<usize> = [
             r#"grid-half rows-3"><h2>Models</h2>"#,
             r#"grid-half rows-2"><h2>Providers</h2>"#,
-            r#"grid-half rows-2"><h2>Keys</h2>"#,
+            r#"grid-half rows-2"><h2>Clients</h2>"#,
             r#"grid-half rows-2"><h2>Context</h2>"#,
             r#"grid-half rows-2"><h2>MCPs</h2>"#,
             r#"grid-half rows-2"><h2>Skills</h2>"#,
@@ -809,7 +869,7 @@ mod tests {
 
         let page = page_without_traffic().into_string();
         assert!(
-            page.contains(r#"<h2>Keys</h2>"#) && page.contains(r#"<h2>Context</h2>"#),
+            page.contains(r#"<h2>Clients</h2>"#) && page.contains(r#"<h2>Context</h2>"#),
             "{page}"
         );
         assert!(
@@ -859,10 +919,10 @@ mod tests {
             },
             models: &[],
             providers: &[],
-            keys: &[],
+            clients: &[],
             model_series: &[],
             provider_series: &[],
-            key_series: &[],
+            client_series: &[],
             guardrails: &guardrails,
         })
         .into_string();
@@ -939,10 +999,10 @@ mod tests {
             },
             models: &[],
             providers: &[],
-            keys: &[],
+            clients: &[],
             model_series: &[],
             provider_series: &[],
-            key_series: &[],
+            client_series: &[],
             guardrails: &GuardrailsSummary::default(),
         })
     }
