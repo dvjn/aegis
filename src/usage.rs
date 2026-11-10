@@ -353,6 +353,16 @@ pub struct UsageGroup {
     pub cost_nanodollars: i64,
 }
 
+#[derive(Debug, FromQueryResult, Serialize)]
+pub struct ClientUsage {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost_nanodollars: i64,
+}
+
 /// One value per bucket of the window, for each of the three overview tiles.
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TotalsSeries {
@@ -457,7 +467,7 @@ pub struct UsageStore {
 /// hour end, window end, user, first whole hour, last whole hour end.
 const WINDOW_ROWS_SQL: &str = "WITH r AS ( \
      SELECT q.started_at moment, q.provider, \
-     COALESCE(q.resolved_model, q.requested_model) requested_model, k.name key_name, \
+     COALESCE(q.resolved_model, q.requested_model) requested_model, k.id client_id, \
      1 requests, \
      CASE WHEN q.http_status < 400 AND q.error_message IS NULL THEN 1 ELSE 0 END succeeded, \
      CASE WHEN q.http_status >= 400 OR q.error_message IS NOT NULL THEN 1 ELSE 0 END failed, \
@@ -468,17 +478,17 @@ const WINDOW_ROWS_SQL: &str = "WITH r AS ( \
      COALESCE(u.cost_nanodollars, 0) cost_nanodollars, \
      CASE WHEN u.cost_nanodollars IS NULL THEN 1 ELSE 0 END unpriced \
      FROM gateway_requests q \
-     JOIN gateway_keys k ON k.id = q.key_id \
+     JOIN gateway_clients k ON k.id = q.client_id \
      LEFT JOIN gateway_usage u ON u.request_id = q.id \
      WHERE k.user_id = ? \
      AND ((q.started_at >= ? AND q.started_at < ?) OR (q.started_at >= ? AND q.started_at <= ?)) \
      UNION ALL \
-     SELECT h.hour, h.provider, NULLIF(h.requested_model, ''), k.name, \
+     SELECT h.hour, h.provider, NULLIF(h.requested_model, ''), k.id, \
      h.requests, h.succeeded, h.failed, \
      h.input_tokens, h.cache_read_tokens, h.cache_write_tokens, h.output_tokens, \
      h.cost_nanodollars, h.unpriced \
      FROM gateway_usage_hourly h \
-     JOIN gateway_keys k ON k.id = h.key_id \
+     JOIN gateway_clients k ON k.id = h.client_id \
      WHERE h.user_id = ? AND h.hour >= ? AND h.hour < ?)";
 
 const TOKENS_SQL: &str = "COALESCE(SUM(r.input_tokens + r.cache_read_tokens + \
@@ -523,7 +533,7 @@ const CONTEXT_SQL: &str = "SELECT COUNT(m.request_id) requests, \
      {part_cost:judgment_bytes} judgment_cost_nanodollars, \
      {part_cost:other_bytes} other_cost_nanodollars \
      FROM gateway_requests r \
-     JOIN gateway_keys k ON k.id = r.key_id \
+     JOIN gateway_clients k ON k.id = r.client_id \
      JOIN gateway_request_metrics m ON m.request_id = r.id \
      LEFT JOIN gateway_usage u ON u.request_id = r.id \
      WHERE k.user_id = ? AND r.started_at >= ? AND r.started_at <= ?";
@@ -589,7 +599,7 @@ const LABELED_SERIES_SQL: &str = "{rows} SELECT {column} label, {bucket} bucket,
 const EDGE_EVALUATIONS_SQL: &str = "SELECT q.started_at moment, e.request_id, e.outcome, e.match_count, e.metadata \
      FROM policy_evaluations e \
      JOIN gateway_requests q ON q.id = e.request_id \
-     JOIN gateway_keys k ON k.id = q.key_id \
+     JOIN gateway_clients k ON k.id = q.client_id \
      WHERE e.policy IN ('secrets', 'regex') AND k.user_id = ? \
      AND ((q.started_at >= ? AND q.started_at < ?) OR (q.started_at >= ? AND q.started_at <= ?))";
 
@@ -801,12 +811,18 @@ impl UsageStore {
         self.breakdown("r.provider", user_id, window).await
     }
 
-    pub async fn by_key(
+    pub async fn by_client(
         &self,
         user_id: Uuid,
         window: Window,
-    ) -> Result<Vec<UsageGroup>, sea_orm::DbErr> {
-        self.breakdown("r.key_name", user_id, window).await
+    ) -> Result<Vec<ClientUsage>, sea_orm::DbErr> {
+        let sql = format!("{WINDOW_ROWS_SQL} SELECT r.client_id id, c.name, c.kind,
+            SUM(r.requests) requests, {TOKENS_SQL} tokens, SUM(r.cost_nanodollars) cost_nanodollars
+            FROM r JOIN gateway_clients c ON c.id=r.client_id
+            GROUP BY r.client_id,c.name,c.kind ORDER BY tokens DESC,requests DESC,c.name,r.client_id");
+        ClientUsage::find_by_statement(self.window_statement(&sql, user_id, window))
+            .all(&self.database)
+            .await
     }
 
     pub async fn totals_series(
@@ -852,12 +868,12 @@ impl UsageStore {
         self.labeled_series("r.provider", user_id, window).await
     }
 
-    pub async fn series_by_key(
+    pub async fn series_by_client(
         &self,
         user_id: Uuid,
         window: Window,
     ) -> Result<Vec<LabeledSeries>, sea_orm::DbErr> {
-        self.labeled_series("r.key_name", user_id, window).await
+        self.labeled_series("r.client_id", user_id, window).await
     }
 
     pub async fn guardrails(
@@ -1403,6 +1419,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clients_with_the_same_name_remain_separate_across_keys_and_oauth() {
+        let (store, user) = fixture().await;
+        let db = &store.database;
+        db.execute_unprepared(&format!("INSERT INTO gateway_clients(id,user_id,kind,name,oauth_client_id,oauth_issuer,allowed_providers,created_at) VALUES('connected-client','{user}','oauth','agent','oauth-id','https://example.com','[\"claude\"]','2026-01-01T00:00:00Z')")).await.unwrap();
+        db.execute_unprepared(&format!("INSERT INTO gateway_clients(id,user_id,kind,name,oauth_client_id,oauth_issuer,allowed_providers,created_at) VALUES('second-client','{user}','oauth','agent','second-oauth-id','https://example.com','[]','2026-01-01T00:00:00Z')")).await.unwrap();
+        db.execute_unprepared("UPDATE gateway_requests SET client_id='second-client',key_id=NULL,key_version_id=NULL WHERE id='r-weeks'")
+            .await
+            .unwrap();
+        db.execute_unprepared("UPDATE gateway_requests SET client_id='connected-client',key_id=NULL,key_version_id=NULL WHERE id='r-days'").await.unwrap();
+        recount(&store).await;
+        let clients = store.by_client(user, last(Range::Month)).await.unwrap();
+        assert_eq!(clients.len(), 3);
+        assert!(clients.iter().all(|client| client.name == "agent"));
+        assert_eq!(
+            clients
+                .iter()
+                .filter(|client| client.kind == "oauth")
+                .count(),
+            2
+        );
+        assert_eq!(clients.iter().map(|client| client.requests).sum::<i64>(), 3);
+        let series = store
+            .series_by_client(user, last(Range::Month))
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 3);
+        for client in clients {
+            assert_eq!(
+                series
+                    .iter()
+                    .find(|line| line.label.as_deref() == Some(&client.id))
+                    .unwrap()
+                    .total(),
+                client.tokens
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_key_breakdown_rolls_every_version_of_a_key_into_one_row() {
         let (store, user) = fixture().await;
         let db = &store.database;
@@ -1426,26 +1481,26 @@ mod tests {
         .unwrap();
         recount(&store).await;
 
-        let keys = store.by_key(user, last(Range::Month)).await.unwrap();
+        let keys = store.by_client(user, last(Range::Month)).await.unwrap();
         assert_eq!(
             keys.iter()
-                .map(|row| (row.label.clone(), row.requests, row.tokens))
+                .map(|row| (row.name.clone(), row.requests, row.tokens))
                 .collect::<Vec<_>>(),
-            vec![
-                (Some("agent".to_owned()), 2, 1530),
-                (Some("batch".to_owned()), 1, 440),
-            ]
+            vec![("agent".to_owned(), 2, 1530), ("batch".to_owned(), 1, 440),]
         );
 
-        let series = store.series_by_key(user, last(Range::Month)).await.unwrap();
+        let series = store
+            .series_by_client(user, last(Range::Month))
+            .await
+            .unwrap();
         assert_eq!(
             series
                 .iter()
                 .map(|line| (line.label.clone(), line.total()))
                 .collect::<Vec<_>>(),
             vec![
-                (Some("agent".to_owned()), 1530),
-                (Some("batch".to_owned()), 440)
+                (Some(KEY.to_owned()), 1530),
+                (Some("key-2".to_owned()), 440)
             ]
         );
     }

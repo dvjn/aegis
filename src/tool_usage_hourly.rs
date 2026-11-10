@@ -27,7 +27,7 @@ const REQUESTS_SQL: &str = "request AS ( \
      SELECT r.id, r.seq, k.user_id, strftime('{hour}', r.started_at) hour, r.started_at, \
      COALESCE(u.cost_nanodollars * 1.0 / m.total_bytes, 0) cost_per_byte \
      FROM gateway_requests r \
-     JOIN gateway_keys k ON k.id = r.key_id \
+     JOIN gateway_clients k ON k.id = r.client_id \
      LEFT JOIN gateway_request_metrics m ON m.request_id = r.id AND m.total_bytes > 0 \
      LEFT JOIN gateway_usage u ON u.request_id = r.id \
      WHERE r.tools_aggregated_at IS NULL AND r.completed_at IS NOT NULL {filter})";

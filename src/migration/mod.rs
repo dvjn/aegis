@@ -24,6 +24,8 @@ mod m20260908_000024_policy_evaluations;
 mod m20260909_000025_guardrails_hourly;
 mod m20260921_000026_typesafe_request_metrics;
 mod m20260922_000027_resolved_model;
+mod m20261109_000028_relay_keys;
+mod m20261110_000029_gateway_clients;
 
 pub struct Migrator;
 
@@ -55,6 +57,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260909_000025_guardrails_hourly::Migration),
             Box::new(m20260921_000026_typesafe_request_metrics::Migration),
             Box::new(m20260922_000027_resolved_model::Migration),
+            Box::new(m20261109_000028_relay_keys::Migration),
+            Box::new(m20261110_000029_gateway_clients::Migration),
         ]
     }
 }
