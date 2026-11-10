@@ -21,6 +21,12 @@
     "input": 0.00001,
     "output": 0.00005
   },
+  "claude-fable-5-2": {
+    "cache_read": 2E-7,
+    "cache_write": 0.00001,
+    "input": 0.000008,
+    "output": 0.00004
+  },
   "claude-haiku-4-5": {
     "cache_read": 1E-7,
     "cache_write": 0.00000125,
@@ -50,6 +56,12 @@
     "cache_write": 0.0000125,
     "input": 0.00001,
     "output": 0.00005
+  },
+  "claude-mythos-5-2": {
+    "cache_read": 2E-7,
+    "cache_write": 0.00001,
+    "input": 0.000008,
+    "output": 0.00004
   },
   "claude-mythos-preview": {
     "cache_read": 0.000001,
@@ -161,6 +173,18 @@
     "input": 0.0000125,
     "output": 0.000075
   },
+  "deep-research-max-preview-04-2026": {
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "deep-research-preview-04-2026": {
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "deep-research-pro-preview-12-2025": {
+    "input": 0.000002,
+    "output": 0.000012
+  },
   "ft:gpt-3.5-turbo": {
     "input": 0.000003,
     "output": 0.000006
@@ -215,6 +239,249 @@
     "cache_read": 0.000001,
     "input": 0.000004,
     "output": 0.000016
+  },
+  "gemini-2.5-computer-use-preview-10-2025": {
+    "input": 0.00000125,
+    "output": 0.00001
+  },
+  "gemini-2.5-flash": {
+    "cache_read": 3E-8,
+    "input": 3E-7,
+    "output": 0.0000025
+  },
+  "gemini-2.5-flash-image": {
+    "cache_read": 3E-8,
+    "input": 3E-7,
+    "output": 0.0000025
+  },
+  "gemini-2.5-flash-lite": {
+    "cache_read": 1E-8,
+    "input": 1E-7,
+    "output": 4E-7
+  },
+  "gemini-2.5-flash-native-audio-latest": {
+    "input": 5E-7,
+    "output": 0.000002
+  },
+  "gemini-2.5-flash-native-audio-preview-09-2025": {
+    "input": 5E-7,
+    "output": 0.000002
+  },
+  "gemini-2.5-flash-native-audio-preview-12-2025": {
+    "input": 5E-7,
+    "output": 0.000002
+  },
+  "gemini-2.5-flash-preview-tts": {
+    "input": 5E-7,
+    "output": 0.00001
+  },
+  "gemini-2.5-pro": {
+    "cache_read": 1.25E-7,
+    "input": 0.00000125,
+    "output": 0.00001
+  },
+  "gemini-2.5-pro-preview-tts": {
+    "cache_read": 1.25E-7,
+    "input": 0.000001,
+    "output": 0.00002
+  },
+  "gemini-3-flash-preview": {
+    "cache_read": 5E-8,
+    "input": 5E-7,
+    "output": 0.000003
+  },
+  "gemini-3-pro-image": {
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "gemini-3-pro-image-preview": {
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "gemini-3.1-flash-image": {
+    "input": 5E-7,
+    "output": 0.000003
+  },
+  "gemini-3.1-flash-image-preview": {
+    "input": 5E-7,
+    "output": 0.000003
+  },
+  "gemini-3.1-flash-lite": {
+    "cache_read": 2.5E-8,
+    "input": 2.5E-7,
+    "output": 0.0000015
+  },
+  "gemini-3.1-flash-lite-image": {
+    "input": 2.5E-7,
+    "output": 0.0000015
+  },
+  "gemini-3.1-flash-lite-preview": {
+    "cache_read": 2.5E-8,
+    "input": 2.5E-7,
+    "output": 0.0000015
+  },
+  "gemini-3.1-flash-live-preview": {
+    "input": 7.5E-7,
+    "output": 0.0000045
+  },
+  "gemini-3.1-flash-tts-preview": {
+    "input": 0.000001,
+    "output": 0.00002
+  },
+  "gemini-3.1-pro-preview": {
+    "cache_read": 2E-7,
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "gemini-3.1-pro-preview-customtools": {
+    "cache_read": 2E-7,
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "gemini-3.5-flash": {
+    "cache_read": 1.5E-7,
+    "input": 0.0000015,
+    "output": 0.000009
+  },
+  "gemini-3.5-flash-lite": {
+    "cache_read": 3E-8,
+    "input": 3E-7,
+    "output": 0.0000025
+  },
+  "gemini-3.5-live-translate-preview": {
+    "input": 0.0000035,
+    "output": 0.000021
+  },
+  "gemini-3.5-transcribe": {
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "gemini-3.5-transcribe-live": {
+    "input": 0.0000035,
+    "output": 0.000021
+  },
+  "gemini-3.6-flash": {
+    "cache_read": 7.5E-8,
+    "input": 7.5E-7,
+    "output": 0.00000375
+  },
+  "gemini-3.7-flash": {
+    "cache_read": 7.5E-8,
+    "input": 7.5E-7,
+    "output": 0.00000375
+  },
+  "gemini-3.8-flash": {
+    "cache_read": 7.5E-8,
+    "input": 7.5E-7,
+    "output": 0.00000375
+  },
+  "gemini-3.8-flash-lite-tts": {
+    "cache_read": 1.25E-7,
+    "input": 5E-7,
+    "output": 0.000006
+  },
+  "gemini-3.8-flash-tts": {
+    "cache_read": 1.25E-7,
+    "input": 5E-7,
+    "output": 0.000009
+  },
+  "gemini-3.8-live": {
+    "input": 7.5E-7,
+    "output": 0.0000045
+  },
+  "gemini-3.8-live-extended-thinking": {
+    "input": 7.5E-7,
+    "output": 0.0000045
+  },
+  "gemini-4-argon": {
+    "cache_read": 1E-7,
+    "input": 0.000002,
+    "output": 0.00001
+  },
+  "gemini-embedding-001": {
+    "input": 1.5E-7,
+    "output": 0
+  },
+  "gemini-embedding-2": {
+    "input": 2E-7,
+    "output": 0
+  },
+  "gemini-embedding-2-preview": {
+    "input": 2E-7,
+    "output": 0
+  },
+  "gemini-exp-1114": {
+    "input": 0,
+    "output": 0
+  },
+  "gemini-exp-1206": {
+    "cache_read": 3E-8,
+    "input": 3E-7,
+    "output": 0.0000025
+  },
+  "gemini-flash-latest": {
+    "cache_read": 7.5E-8,
+    "input": 7.5E-7,
+    "output": 0.00000375
+  },
+  "gemini-flash-lite-latest": {
+    "cache_read": 3E-8,
+    "input": 3E-7,
+    "output": 0.0000025
+  },
+  "gemini-gemma-2-27b-it": {
+    "input": 3.5E-7,
+    "output": 0.00000105
+  },
+  "gemini-gemma-2-9b-it": {
+    "input": 3.5E-7,
+    "output": 0.00000105
+  },
+  "gemini-live-2.5-flash-preview-native-audio-09-2025": {
+    "input": 5E-7,
+    "output": 0.000002
+  },
+  "gemini-nano-banana-2.1": {
+    "input": 0.0000015,
+    "output": 0.0000075
+  },
+  "gemini-omni-1.1-flash": {
+    "input": 0.0000015,
+    "output": 0.000009
+  },
+  "gemini-omni-1.2-flash": {
+    "input": 0.0000015,
+    "output": 0.000009
+  },
+  "gemini-omni-flash-preview": {
+    "input": 0.0000015,
+    "output": 0.000009
+  },
+  "gemini-pro-latest": {
+    "cache_read": 2E-7,
+    "input": 0.000002,
+    "output": 0.000012
+  },
+  "gemini-robotics-er-2-preview": {
+    "cache_read": 1E-7,
+    "input": 0.000001,
+    "output": 0.000005
+  },
+  "gemini-robotics-er-2-streaming-preview": {
+    "input": 0.000001,
+    "output": 0.000005
+  },
+  "gemma-3-27b-it": {
+    "input": 0,
+    "output": 0
+  },
+  "gemma-4-26b-a4b-it": {
+    "input": 0.0,
+    "output": 0.0
+  },
+  "gemma-4-31b-it": {
+    "input": 0.0,
+    "output": 0.0
   },
   "gpt-3.5-turbo": {
     "input": 5E-7,
@@ -618,6 +885,12 @@
     "input": 0.00001,
     "output": 0.00005
   },
+  "gpt-6-cyber": {
+    "cache_read": 0.000002,
+    "cache_write": 0.000025,
+    "input": 0.00002,
+    "output": 0.0001
+  },
   "gpt-6-luna": {
     "cache_read": 1E-8,
     "cache_write": 1.25E-7,
@@ -734,6 +1007,16 @@
     "input": 0.000005,
     "output": 0
   },
+  "gpt-image-2.6-flare": {
+    "cache_read": 0.00000125,
+    "input": 0.000005,
+    "output": 0
+  },
+  "gpt-image-2.6-sunburst": {
+    "cache_read": 0.00000125,
+    "input": 0.000005,
+    "output": 0
+  },
   "gpt-realtime": {
     "cache_read": 4E-7,
     "input": 0.000004,
@@ -799,6 +1082,38 @@
   "jev-preview": {
     "input": 4.2E-8,
     "output": 0.0
+  },
+  "learnlm-1.5-pro-experimental": {
+    "input": 0,
+    "output": 0
+  },
+  "lyria-3-clip-preview": {
+    "input": 0,
+    "output": 0
+  },
+  "lyria-3-pro-preview": {
+    "input": 0,
+    "output": 0
+  },
+  "lyria-3.5": {
+    "input": 0,
+    "output": 0
+  },
+  "lyria-3.5-clip-preview": {
+    "input": 0,
+    "output": 0
+  },
+  "lyria-3.5-pro-preview": {
+    "input": 0,
+    "output": 0
+  },
+  "lyria-realtime-exp": {
+    "input": 0,
+    "output": 0
+  },
+  "nano-banana-pro-preview": {
+    "input": 0.000002,
+    "output": 0.000012
   },
   "o1": {
     "cache_read": 0.0000075,
