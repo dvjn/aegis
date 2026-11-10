@@ -117,6 +117,16 @@ Without `SMTP_HOST`, Aegis writes password-reset links to the log.
 | `PRICING_REFRESH_HOURS` | no | config file | `pricing.refresh_hours` |
 | `PRICING_URL` | no | config file | `pricing.url` |
 
+### Refreshing prices and backfilling costs
+
+For local development:
+
+```sh
+mise run pricing:update
+```
+
+This task refreshes the bundled model catalog. The running server automatically backfills unknown costs on startup and after adopting refreshed prices. Already calculated costs are preserved; updated dashboard totals are queued for rebuilding. Models with no matching price remain unknown.
+
 ### Logs
 
 `RUST_LOG` is optional and controls log filtering:

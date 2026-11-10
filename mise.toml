@@ -160,12 +160,13 @@ jq -S '
       (.value | type == "object")
       and (.value.litellm_provider == "anthropic"
            or .value.litellm_provider == "openai"
+           or .value.litellm_provider == "gemini"
            or .value.litellm_provider == "typesafe")
       and (.value.input_cost_per_token != null)
     ))
   | map({
-      key: (if .value.litellm_provider == "typesafe"
-            then (.key | sub("^typesafe/"; "")) else .key end),
+      key: (if .value.litellm_provider == "typesafe" or .value.litellm_provider == "gemini"
+            then (.key | sub("^(typesafe|gemini)/"; "")) else .key end),
       value: (
         { input: .value.input_cost_per_token,
           output: (.value.output_cost_per_token // 0) }
