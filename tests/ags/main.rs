@@ -60,8 +60,8 @@ impl Fixture {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = format!("http://{}", listener.local_addr().unwrap());
         let installer =
-            include_str!("../../src/relay/install.sh").replace("@SERVER@", &format!("'{server}'"));
-        let mise_installer = include_str!("../../src/relay/install-mise.sh")
+            include_str!("../../src/ags/install.sh").replace("@SERVER@", &format!("'{server}'"));
+        let mise_installer = include_str!("../../src/ags/install-mise.sh")
             .replace("@SERVER@", &format!("'{server}'"));
         let artifact = axum::body::Bytes::from(std::fs::read(env!("CARGO_BIN_EXE_ags")).unwrap());
         use sha2::{Digest, Sha256};
@@ -494,7 +494,7 @@ async fn server_mise_installer_reports_missing_artifacts_before_installing() {
     std::fs::write(&mise, "#!/bin/sh\nexit 99\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(mise, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let script = include_str!("../../src/relay/install-mise.sh")
+    let script = include_str!("../../src/ags/install-mise.sh")
         .replace("@SERVER@", &format!("'{}'", f.server));
     let path = f.root.join("install-mise.sh");
     std::fs::write(&path, script).unwrap();
@@ -504,7 +504,7 @@ async fn server_mise_installer_reports_missing_artifacts_before_installing() {
     assert_eq!(result.status.code(), Some(1));
     let error = String::from_utf8_lossy(&result.stderr);
     assert!(error.contains("ags download unavailable"), "{error}");
-    assert!(error.contains("mise run relay:stage"), "{error}");
+    assert!(error.contains("mise run ags:stage"), "{error}");
     assert!(!error.contains("Invalid server checksum"), "{error}");
 }
 

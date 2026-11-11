@@ -27,7 +27,7 @@ async fn oauth_gateway_preserves_provider_auth_records_app_usage_and_checks_gran
         axum::serve(listener,Router::new().fallback(axum::routing::any(move |request:Request<Body>| {
             let sent=sent.clone(); async move {
                 assert_eq!(request.headers()[header::AUTHORIZATION],"Bearer provider-oauth");
-                assert!(!request.headers().contains_key(crate::relay_wire::ACCESS_TOKEN_HEADER));
+                assert!(!request.headers().contains_key(crate::ags_wire::ACCESS_TOKEN_HEADER));
                 assert!(!request.headers().contains_key("x-aegis-api-key"));
                 sent.send(()).await.unwrap();
                 Json(serde_json::json!({"model":"test-model","usage":{"input_tokens":8,"output_tokens":2}}))
@@ -323,7 +323,7 @@ async fn oauth_gateway_preserves_provider_auth_records_app_usage_and_checks_gran
             .header(header::CONTENT_TYPE, "application/json");
         request = request.header(
             if oauth {
-                crate::relay_wire::ACCESS_TOKEN_HEADER
+                crate::ags_wire::ACCESS_TOKEN_HEADER
             } else {
                 "x-aegis-api-key"
             },

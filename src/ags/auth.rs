@@ -1,5 +1,5 @@
 use super::state::{self, Config};
-use crate::relay_wire::{Connection, Enrollment, RESOURCE_PATH, SCOPE};
+use crate::ags_wire::{Connection, Enrollment, RESOURCE_PATH, SCOPE};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
@@ -208,7 +208,7 @@ pub async fn catalog(config: &Config) -> Result<Connection> {
         return Err(LoginRequired.into());
     }
     let value: Connection = response.error_for_status()?.json().await?;
-    if value.version != crate::relay_wire::PROTOCOL_VERSION {
+    if value.version != crate::ags_wire::PROTOCOL_VERSION {
         bail!("server requires a different AGS protocol version");
     }
     Ok(value)

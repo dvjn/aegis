@@ -1,5 +1,5 @@
 use super::*;
-use crate::relay_wire::Provider;
+use crate::ags_wire::Provider;
 
 #[test]
 fn agy_uses_subscription_proxy_and_rejects_direct_api_settings() {

@@ -1,4 +1,4 @@
-use crate::relay_wire::Provider;
+use crate::ags_wire::Provider;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{

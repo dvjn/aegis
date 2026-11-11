@@ -1,4 +1,4 @@
-use crate::relay_wire::Provider;
+use crate::ags_wire::Provider;
 use anyhow::{Result, bail};
 use std::{
     ffi::OsString,

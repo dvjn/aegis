@@ -4,7 +4,7 @@ Aegis is bring your own credentials. Provider credentials stay in the client and
 
 AGS handles Aegis authentication automatically. For manual configuration, create an Aegis API key in the web interface and grant it access to the provider ID used in the gateway URL.
 
-## AGS relay
+## AGS
 
 Install `ags` from your Aegis server using mise (Linux x86_64 or ARM64):
 
@@ -56,7 +56,7 @@ id = "antigravity"
 type = "antigravity_subscription"
 ```
 
-After restarting the server, run `ags configure`, enable this provider, and choose the default subscription. Then run `agy` through its installed wrapper, or `ags run agy -- --model gemini-3.8-flash-low`. In development, use `mise run ags -- config` and `mise run relay -- agy`.
+After restarting the server, run `ags configure`, enable this provider, and choose the default subscription. Then run `agy` through its installed wrapper, or `ags run agy -- --model gemini-3.8-flash-low`. In development, use `mise run ags -- config` and `mise run ags:run -- agy`.
 
 AGS sets `CLOUD_CODE_URL` only in the launched process, starts its private proxy, and authenticates to Aegis with the connected app's OAuth token. Google's authorization stays in the original CLI. Account, model-catalog, and quota endpoints are proxied but excluded from captured model-request history. Generate-content requests record the requested/resolved model and cached, output, and thinking token usage. Cached input is counted once; output includes thinking, with thinking also recorded as its subset. Token counts describe model usage; subscription quotas and charges are not derived from token prices. Unpriced models retain token counts and an unknown cost.
 

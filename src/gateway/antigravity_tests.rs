@@ -23,7 +23,7 @@ async fn subscription_inference_is_accounted_and_control_plane_is_private() {
             async move {
                 assert_eq!(request.headers()[header::AUTHORIZATION],"Bearer google-subscription");
                 assert!(!request.headers().contains_key("x-aegis-api-key"));
-                assert!(!request.headers().contains_key(crate::relay_wire::ACCESS_TOKEN_HEADER));
+                assert!(!request.headers().contains_key(crate::ags_wire::ACCESS_TOKEN_HEADER));
                 let path = request.uri().to_string();
                 let body = to_bytes(request.into_body(),1024*1024).await.unwrap();
                 let body: Value = serde_json::from_slice(&body).unwrap();

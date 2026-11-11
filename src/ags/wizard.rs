@@ -1,6 +1,6 @@
 //! Inline provider selection. Runtime routing only consumes the saved choices.
 use super::{profiles, state::Config};
-use crate::relay_wire::Provider;
+use crate::ags_wire::Provider;
 use anyhow::{Context, Result, bail};
 use std::{collections::BTreeMap, io::IsTerminal};
 

@@ -133,7 +133,7 @@ async fn forward(State(target): State<Arc<Target>>, request: Request) -> Respons
     let mut outbound = target
         .client
         .request(parts.method, url)
-        .header(crate::relay_wire::ACCESS_TOKEN_HEADER, token);
+        .header(crate::ags_wire::ACCESS_TOKEN_HEADER, token);
     for (name, value) in &parts.headers {
         if allowed(name, &parts.headers) {
             outbound = outbound.header(name, value);

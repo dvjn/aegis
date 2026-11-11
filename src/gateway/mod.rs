@@ -170,7 +170,7 @@ impl Gateway {
         headers: &mut HeaderMap,
         provider: &str,
     ) -> Result<AuthenticatedClient, AuthenticationFailure> {
-        if let Some(token) = headers.remove(crate::relay_wire::ACCESS_TOKEN_HEADER) {
+        if let Some(token) = headers.remove(crate::ags_wire::ACCESS_TOKEN_HEADER) {
             if headers.remove("x-aegis-api-key").is_some() {
                 return Err(StatusCode::BAD_REQUEST.into());
             }
@@ -186,13 +186,13 @@ impl Gateway {
                 .authenticate_access_token(
                     token,
                     &issuer,
-                    &format!("{issuer}{}", crate::relay_wire::RESOURCE_PATH),
+                    &format!("{issuer}{}", crate::ags_wire::RESOURCE_PATH),
                 )
                 .await
                 .map_err(|_| StatusCode::UNAUTHORIZED)?;
             if !principal
                 .oauth()
-                .is_some_and(|p| crate::domain::scope_allows(&p.scope, crate::relay_wire::SCOPE))
+                .is_some_and(|p| crate::domain::scope_allows(&p.scope, crate::ags_wire::SCOPE))
             {
                 return Err(StatusCode::FORBIDDEN.into());
             }
@@ -230,7 +230,7 @@ impl Gateway {
         ids
     }
 
-    pub fn provider_catalog(&self) -> Vec<crate::relay_wire::Provider> {
+    pub fn provider_catalog(&self) -> Vec<crate::ags_wire::Provider> {
         self.provider_ids()
             .into_iter()
             .map(|id| {
@@ -240,7 +240,7 @@ impl Gateway {
                     Provider::Antigravity => "antigravity_subscription",
                     Provider::TypeSafe => "typesafe",
                 };
-                crate::relay_wire::Provider {
+                crate::ags_wire::Provider {
                     id,
                     kind: kind.into(),
                 }

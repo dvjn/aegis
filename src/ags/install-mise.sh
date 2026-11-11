@@ -15,7 +15,7 @@ version=$(curl -fsS --proto '=http,https' "$server/downloads/ags/version")
 case "$version" in ''|*[!0-9a-zA-Z.+-]*) echo 'Invalid server release version.' >&2; exit 1 ;; esac
 base="$server/downloads/ags/{{version}}/{{os()}}-{{arch()}}"
 checksum_file=$(curl -fsS --proto '=http,https' "$server/downloads/ags/$version/$platform/ags.sha256") || {
-  echo "ags download unavailable for $platform (server $version). The server operator must publish the binary; for local development, run mise run relay:stage." >&2
+  echo "ags download unavailable for $platform (server $version). The server operator must publish the binary; for local development, run mise run ags:stage." >&2
   exit 1
 }
 checksum=$(printf '%s\n' "$checksum_file" | awk 'NR == 1 {print $1}')

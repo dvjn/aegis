@@ -20,18 +20,18 @@ mise run dev
 
 The local bootstrap task creates a development account and API key. See the command output for their locations and values.
 
-In another terminal, run a CLI through the source-built relay:
+In another terminal, run a CLI through the source-built `ags`:
 
 ```sh
 mise run ags -- login --no-wrappers
 mise run ags -- config
-mise run relay -- claude
-mise run relay -- codex exec "Explain this project"
-mise run relay -- pi
-mise run relay -- agy
+mise run ags:run -- claude
+mise run ags:run -- codex exec "Explain this project"
+mise run ags:run -- pi
+mise run ags:run -- agy
 ```
 
-Login opens device-code OAuth pairing and asks for default providers. Relay state stays in `data/ags`; `--no-wrappers` leaves global shell configuration unchanged. You can perform these steps manually or run `mise run relay -- claude` directly: missing setup runs the same wizard before launching the CLI. `mise run ags -- run claude --provider work -- <CLI arguments>` selects a route for one launch. Use `mise run ags -- disconnect` before testing a fresh login.
+Login opens device-code OAuth pairing and asks for default providers. ags state stays in `data/ags`; `--no-wrappers` leaves global shell configuration unchanged. You can perform these steps manually or run `mise run ags:run -- claude` directly: missing setup runs the same wizard before launching the CLI. `mise run ags -- run claude --provider work -- <CLI arguments>` selects a route for one launch. Use `mise run ags -- disconnect` before testing a fresh login.
 
 Put machine-specific `HTTP_ADDR`, `PUBLIC_URL`, and optional `AEGIS_RELAY_DIR` values in untracked `mise.local.toml`. The server installer at `/connect` uses release artifacts; `mise run dist` builds them under `dist/relay`. Local relay tasks use the current source binary directly.
 

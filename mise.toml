@@ -67,16 +67,16 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 cargo build --quiet --bin ags
-mise run relay:stage
+mise run ags:stage
 exec cargo run --bin aegis -- serve
 '''
 
-[tasks."relay:build"]
-description = "Build the current AGS relay"
+[tasks."ags:build"]
+description = "Build the current ags"
 hide = true
 run = "cargo build --quiet --bin ags"
 
-[tasks."relay:stage"]
+[tasks."ags:stage"]
 description = "Build and stage the host's downloadable ags binary"
 hide = true
 run = '''
@@ -101,7 +101,7 @@ mv -f "$staged" "$destination/ags"
 
 [tasks.ags]
 description = "Run AGS with workspace-local state and the current source build"
-depends = ["relay:build"]
+depends = ["ags:build"]
 env = { AGS_HOME = "{{config_root}}/data/ags" }
 run = '''
 #!/usr/bin/env bash
@@ -110,9 +110,9 @@ export AGS_SERVER_URL="${AGS_SERVER_URL:-${PUBLIC_URL:-${AEGIS_DEV_URL:-http://1
 exec "${CARGO_TARGET_DIR:-target}/debug/ags" "$@"
 '''
 
-[tasks."relay:setup"]
-description = "Pair the workspace relay and choose providers without installing shell wrappers"
-depends = ["relay:build"]
+[tasks."ags:setup"]
+description = "Pair the workspace ags and run its setup without installing shell wrappers"
+depends = ["ags:build"]
 env = { AGS_HOME = "{{config_root}}/data/ags" }
 run = '''
 #!/usr/bin/env bash
@@ -125,14 +125,15 @@ curl --fail --silent --show-error --connect-timeout 3 --max-time 10 "$server/hea
 exec "${CARGO_TARGET_DIR:-target}/debug/ags" setup "$server" --no-wrappers "$@"
 '''
 
-[tasks.relay]
-description = "Run a CLI through the workspace relay, with first-use setup when needed"
-depends = ["relay:build"]
+[tasks."ags:run"]
+description = "Run a CLI through the workspace ags, with first-use setup when needed"
+alias = "relay"
+depends = ["ags:build"]
 env = { AGS_HOME = "{{config_root}}/data/ags" }
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-test $# -gt 0 || { echo "usage: mise run relay -- <claude|codex|pi|agy> [CLI arguments...]" >&2; exit 2; }
+test $# -gt 0 || { echo "usage: mise run ags:run -- <claude|codex|pi|agy> [CLI arguments...]" >&2; exit 2; }
 client="$1"
 shift
 case "$client" in
@@ -146,7 +147,7 @@ curl --fail --silent --show-error --connect-timeout 3 --max-time 10 "$server/hea
 }
 ags="${CARGO_TARGET_DIR:-target}/debug/ags"
 if [[ -s "$AGS_HOME/connection.json" ]] && [[ "$(jq -r '.server' "$AGS_HOME/connection.json")" != "${server%/}" ]]; then
-  echo "The workspace relay is paired to a different server. Run mise run ags -- disconnect, then mise run relay:setup." >&2
+  echo "The workspace ags is paired to a different server. Run mise run ags -- disconnect, then mise run ags:setup." >&2
   exit 1
 fi
 export AGS_SERVER_URL="$server"

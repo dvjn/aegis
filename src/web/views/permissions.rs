@@ -9,7 +9,7 @@ struct Permission {
 
 const REGISTRY: [Permission; 6] = [
     Permission {
-        scope: crate::relay_wire::SCOPE,
+        scope: crate::ags_wire::SCOPE,
         label: "Connect CLI relays and manage this device's provider access",
     },
     Permission {

@@ -1,7 +1,7 @@
 mod agy;
 mod auth;
 mod install;
-mod instance;
+mod relay;
 mod pi;
 mod profiles;
 mod state;
@@ -300,7 +300,7 @@ async fn run(
                 continue;
             }
             let relay =
-                instance::Relay::start(&config.server, &provider.id, token_source.clone()).await?;
+                relay::Relay::start(&config.server, &provider.id, token_source.clone()).await?;
             endpoints.insert(provider.id.clone(), relay.url.clone());
             relays.push(relay);
         }
@@ -315,7 +315,7 @@ async fn run(
             .iter()
             .find(|p| p.id == id)
             .context("provider is not enabled; run ags configure")?;
-        let relay = instance::Relay::start(&config.server, &provider.id, token_source).await?;
+        let relay = relay::Relay::start(&config.server, &provider.id, token_source).await?;
         let plan = profiles::plan(client, provider, &relay.url, args, home)?;
         relays.push(relay);
         plan

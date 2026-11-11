@@ -1,5 +1,5 @@
 use super::{auth, state};
-use crate::relay_wire::Release;
+use crate::ags_wire::Release;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -30,7 +30,7 @@ pub async fn update(home: &Path, rollback: bool) -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
-    if release.protocol != crate::relay_wire::PROTOCOL_VERSION {
+    if release.protocol != crate::ags_wire::PROTOCOL_VERSION {
         bail!("server release uses an unsupported relay protocol");
     }
     if !release

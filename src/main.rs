@@ -1,4 +1,5 @@
 mod access_log;
+mod ags_wire;
 mod api_keys;
 mod app;
 mod compression;
@@ -19,7 +20,6 @@ mod policies;
 mod pricing;
 mod providers;
 mod relay_api;
-mod relay_wire;
 mod request_id;
 mod request_metrics;
 mod telemetry;

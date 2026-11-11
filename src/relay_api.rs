@@ -16,7 +16,7 @@ use crate::{
     domain::{Domain, Principal, scope_allows},
     gateway::Gateway,
     origin::OriginPolicy,
-    relay_wire::{Connection, Enrollment, RESOURCE_PATH, Release, SCOPE},
+    ags_wire::{Connection, Enrollment, RESOURCE_PATH, Release, SCOPE},
 };
 
 #[derive(Clone)]
@@ -78,7 +78,7 @@ async fn connection(State(state): State<RelayState>, headers: HeaderMap) -> Resp
         return status.into_response();
     }
     Json(Connection {
-        version: crate::relay_wire::PROTOCOL_VERSION,
+        version: crate::ags_wire::PROTOCOL_VERSION,
         providers: state.gateway.provider_catalog(),
     })
     .into_response()
@@ -139,7 +139,7 @@ const TARGETS: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-m
 async fn manifest(State(state): State<RelayState>) -> Json<Release> {
     Json(Release {
         version: env!("CARGO_PKG_VERSION").into(),
-        protocol: crate::relay_wire::PROTOCOL_VERSION,
+        protocol: crate::ags_wire::PROTOCOL_VERSION,
         targets: TARGETS
             .iter()
             .filter(|target| state.artifacts.join(target).join("ags").is_file())
@@ -206,7 +206,7 @@ async fn installer(State(state): State<RelayState>, headers: HeaderMap) -> Respo
         Ok(origin) => origin,
         Err(()) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let script = include_str!("relay/install.sh").replace("@SERVER@", &shell_quote(&origin));
+    let script = include_str!("ags/install.sh").replace("@SERVER@", &shell_quote(&origin));
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
         script,
@@ -219,7 +219,7 @@ async fn mise_installer(State(state): State<RelayState>, headers: HeaderMap) -> 
         Ok(origin) => origin,
         Err(()) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let script = include_str!("relay/install-mise.sh").replace("@SERVER@", &shell_quote(&origin));
+    let script = include_str!("ags/install-mise.sh").replace("@SERVER@", &shell_quote(&origin));
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
         script,

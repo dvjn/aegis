@@ -71,8 +71,8 @@ name = "integration"
 path = "tests/integration/main.rs"
 
 [[test]]
-name = "relay"
-path = "tests/relay/main.rs"
+name = "ags"
+path = "tests/ags/main.rs"
 
 [[test]]
 name = "load"
