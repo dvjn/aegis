@@ -1012,6 +1012,13 @@ a[role="button"].compact {
   color: var(--muted);
 }
 
+.cell-warn {
+  margin-left: 0.4em;
+  font-size: 0.8em;
+  color: var(--warning, #b45309);
+  cursor: help;
+}
+
 /* Qualified by the table, because `.data-table th` would otherwise win on
    specificity and keep these cells left-aligned. */
 .data-table .col-numeric {

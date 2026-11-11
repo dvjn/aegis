@@ -52,6 +52,17 @@ pub struct ClientStart<'a> {
     pub endpoint: &'a str,
     pub requested_model: Option<&'a str>,
     pub request_body: &'a [u8],
+    pub attribution: Attribution<'a>,
+}
+
+/// Who and what a request belongs to beyond its client; all fields are optional.
+#[derive(Default)]
+pub struct Attribution<'a> {
+    pub account_id: Option<&'a str>,
+    pub profile_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub upstream_account: Option<&'a str>,
 }
 
 pub(crate) struct StoredPayload {
@@ -425,6 +436,7 @@ impl SqliteSink {
             endpoint: record.endpoint,
             requested_model: record.requested_model,
             request_body: record.request_body,
+            attribution: Attribution::default(),
         })
         .await
     }
@@ -443,7 +455,7 @@ impl SqliteSink {
         let inserted = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_requests (id, request_id, client_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+                "INSERT INTO gateway_requests (id, request_id, client_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes, account_id, profile_id, run_id, session_id, upstream_account) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
                 [
                     id.to_string().into(),
                     record.request_id.to_owned().into(),
@@ -457,10 +469,33 @@ impl SqliteSink {
                     record.requested_model.map(str::to_owned).into(),
                     timestamp().into(),
                     (record.request_body.len() as i64).into(),
+                    record.attribution.account_id.map(str::to_owned).into(),
+                    record.attribution.profile_id.map(str::to_owned).into(),
+                    record.attribution.run_id.map(str::to_owned).into(),
+                    record.attribution.session_id.map(str::to_owned).into(),
+                    record.attribution.upstream_account.map(str::to_owned).into(),
                 ],
             ))
             .await?
             .ok_or_else(|| sea_orm::DbErr::RecordNotInserted)?;
+        if let (Some(local), Some(account)) = (
+            record.attribution.account_id,
+            record.attribution.upstream_account,
+        ) {
+            // Flag an account whose upstream account differs from the one seen before.
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE relay_accounts SET account_changed_at = CASE WHEN observed_account IS NOT NULL AND observed_account <> ? THEN ? ELSE account_changed_at END, observed_account = ? WHERE id = ?",
+                    [
+                        account.to_owned().into(),
+                        timestamp().into(),
+                        account.to_owned().into(),
+                        local.to_owned().into(),
+                    ],
+                ))
+                .await?;
+        }
         let request_seq: i64 = inserted.try_get("", "seq")?;
         if let Some(payload) = semantic_payload {
             Self::store_semantic_payload(&transaction, request_seq, payload).await?;

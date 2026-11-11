@@ -7,16 +7,19 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    domain::{Domain, Principal, scope_allows},
+    ags_wire::{
+        AccountRegistration, CAPABILITY_ACCOUNTS, Connection, Enrollment, ProfileLabel,
+        RESOURCE_PATH, Release, SCOPE,
+    },
+    domain::{Domain, DomainError, Principal, scope_allows},
     gateway::Gateway,
     origin::OriginPolicy,
-    ags_wire::{Connection, Enrollment, RESOURCE_PATH, Release, SCOPE},
 };
 
 #[derive(Clone)]
@@ -32,6 +35,14 @@ pub fn router(state: RelayState) -> Router {
         .route("/api/relay/connection", get(connection))
         .route("/api/relay/enroll", post(enroll))
         .route("/api/relay/disconnect", post(disconnect))
+        .route(
+            "/api/relay/accounts/{id}",
+            put(register_account).delete(delete_account),
+        )
+        .route(
+            "/api/relay/profiles/{id}",
+            put(register_profile).delete(delete_profile),
+        )
         .route("/connect", get(connect_page))
         .route("/install.sh", get(installer))
         .route("/install-mise.sh", get(mise_installer))
@@ -80,6 +91,7 @@ async fn connection(State(state): State<RelayState>, headers: HeaderMap) -> Resp
     Json(Connection {
         version: crate::ags_wire::PROTOCOL_VERSION,
         providers: state.gateway.provider_catalog(),
+        capabilities: vec![CAPABILITY_ACCOUNTS.into()],
     })
     .into_response()
 }
@@ -112,6 +124,98 @@ async fn enroll(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn register_account(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<AccountRegistration>,
+) -> Response {
+    let (principal, _) = match authenticate(&state, &headers).await {
+        Ok(value) => value,
+        Err(status) => return status.into_response(),
+    };
+    let kind = state
+        .gateway
+        .provider_catalog()
+        .into_iter()
+        .find(|provider| provider.id == input.provider)
+        .map(|provider| provider.kind);
+    match state
+        .domain
+        .oauth()
+        .register_account(&principal, &id, &input, kind.as_deref())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => profile_error(error),
+    }
+}
+
+async fn delete_account(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let (principal, _) = match authenticate(&state, &headers).await {
+        Ok(value) => value,
+        Err(status) => return status.into_response(),
+    };
+    match state.domain.oauth().delete_account(&principal, &id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => profile_error(error),
+    }
+}
+
+async fn register_profile(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ProfileLabel>,
+) -> Response {
+    let (principal, _) = match authenticate(&state, &headers).await {
+        Ok(value) => value,
+        Err(status) => return status.into_response(),
+    };
+    match state
+        .domain
+        .oauth()
+        .register_profile(&principal, &id, &input)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => profile_error(error),
+    }
+}
+
+async fn delete_profile(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let (principal, _) = match authenticate(&state, &headers).await {
+        Ok(value) => value,
+        Err(status) => return status.into_response(),
+    };
+    match state.domain.oauth().delete_profile(&principal, &id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => profile_error(error),
+    }
+}
+
+fn profile_error(error: DomainError) -> Response {
+    match error {
+        DomainError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        DomainError::Forbidden => StatusCode::FORBIDDEN,
+        DomainError::NotFound => StatusCode::NOT_FOUND,
+        DomainError::InvalidCredentials => StatusCode::UNAUTHORIZED,
+        error => {
+            tracing::error!(%error, "relay profile request failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+    .into_response()
 }
 
 async fn disconnect(State(state): State<RelayState>, headers: HeaderMap) -> Response {
@@ -248,5 +352,7 @@ async fn connect_page(State(state): State<RelayState>, headers: HeaderMap) -> Re
     }).into_response()
 }
 
+#[cfg(test)]
+mod account_tests;
 #[cfg(test)]
 mod tests;

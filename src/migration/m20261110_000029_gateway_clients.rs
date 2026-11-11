@@ -81,7 +81,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_relay_secrets_are_removed_without_losing_request_or_bucket_history() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, Some((Migrator::migrations().len() - 1) as u32))
+        Migrator::up(&db, Some((Migrator::migrations().len() - 3) as u32))
             .await
             .unwrap();
         for sql in [

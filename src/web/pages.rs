@@ -46,6 +46,9 @@ pub(super) async fn root(
         provider_series,
         client_series,
         guardrails,
+        accounts,
+        profiles,
+        sessions,
     ) = tokio::join!(
         usage.totals(user, window),
         usage.context(user, window),
@@ -58,6 +61,9 @@ pub(super) async fn root(
         usage.series_by_provider(user, window),
         usage.series_by_client(user, window),
         usage.guardrails(user, window),
+        usage.by_account(user, window),
+        usage.by_profile(user, window),
+        usage.recent_sessions(user, window, 10),
     );
     let elapsed_ms = query_started.elapsed().as_millis() as u64;
     tracing::debug!(elapsed_ms, "dashboard queries completed");
@@ -81,6 +87,9 @@ pub(super) async fn root(
         provider_series: &provider_series.map_err(DomainError::from)?,
         client_series: &client_series.map_err(DomainError::from)?,
         guardrails: &guardrails,
+        accounts: &accounts.map_err(DomainError::from)?,
+        profiles: &profiles.map_err(DomainError::from)?,
+        sessions: &sessions.map_err(DomainError::from)?,
     };
     Ok(views::home::page(&overview).into_response())
 }

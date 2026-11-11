@@ -363,6 +363,38 @@ pub struct ClientUsage {
     pub cost_nanodollars: i64,
 }
 
+/// One row per account ID; the empty ID is traffic with no account.
+#[derive(Debug, FromQueryResult, Serialize)]
+pub struct AccountUsage {
+    pub id: String,
+    pub label: Option<String>,
+    pub vendor: Option<String>,
+    pub account_changed: bool,
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost_nanodollars: i64,
+}
+
+/// One row per profile ID; the empty ID is traffic with no profile.
+#[derive(Debug, FromQueryResult, Serialize)]
+pub struct ProfileUsage {
+    pub id: String,
+    pub label: Option<String>,
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost_nanodollars: i64,
+}
+
+#[derive(Debug, FromQueryResult, Serialize)]
+pub struct SessionUsage {
+    pub id: String,
+    pub profile_label: Option<String>,
+    pub account_label: Option<String>,
+    pub requests: i64,
+    pub tokens: i64,
+    pub last_seen: String,
+}
+
 /// One value per bucket of the window, for each of the three overview tiles.
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TotalsSeries {
@@ -468,6 +500,7 @@ pub struct UsageStore {
 const WINDOW_ROWS_SQL: &str = "WITH r AS ( \
      SELECT q.started_at moment, q.provider, \
      COALESCE(q.resolved_model, q.requested_model) requested_model, k.id client_id, \
+     COALESCE(q.profile_id, '') profile_id, COALESCE(q.account_id, '') account_id, \
      1 requests, \
      CASE WHEN q.http_status < 400 AND q.error_message IS NULL THEN 1 ELSE 0 END succeeded, \
      CASE WHEN q.http_status >= 400 OR q.error_message IS NOT NULL THEN 1 ELSE 0 END failed, \
@@ -483,7 +516,7 @@ const WINDOW_ROWS_SQL: &str = "WITH r AS ( \
      WHERE k.user_id = ? \
      AND ((q.started_at >= ? AND q.started_at < ?) OR (q.started_at >= ? AND q.started_at <= ?)) \
      UNION ALL \
-     SELECT h.hour, h.provider, NULLIF(h.requested_model, ''), k.id, \
+     SELECT h.hour, h.provider, NULLIF(h.requested_model, ''), k.id, h.profile_id, h.account_id, \
      h.requests, h.succeeded, h.failed, \
      h.input_tokens, h.cache_read_tokens, h.cache_write_tokens, h.output_tokens, \
      h.cost_nanodollars, h.unpriced \
@@ -823,6 +856,76 @@ impl UsageStore {
         ClientUsage::find_by_statement(self.window_statement(&sql, user_id, window))
             .all(&self.database)
             .await
+    }
+
+    pub async fn by_account(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<Vec<AccountUsage>, sea_orm::DbErr> {
+        let sql = format!(
+            "{WINDOW_ROWS_SQL} SELECT r.account_id id, a.label, a.vendor,
+            COALESCE(a.account_changed_at IS NOT NULL, 0) account_changed,
+            SUM(r.requests) requests, {TOKENS_SQL} tokens, SUM(r.cost_nanodollars) cost_nanodollars
+            FROM r LEFT JOIN relay_accounts a ON a.id=r.account_id
+            GROUP BY r.account_id,a.label,a.vendor,a.account_changed_at
+            ORDER BY tokens DESC,requests DESC,a.label,r.account_id"
+        );
+        AccountUsage::find_by_statement(self.window_statement(&sql, user_id, window))
+            .all(&self.database)
+            .await
+    }
+
+    pub async fn by_profile(
+        &self,
+        user_id: Uuid,
+        window: Window,
+    ) -> Result<Vec<ProfileUsage>, sea_orm::DbErr> {
+        let sql = format!(
+            "{WINDOW_ROWS_SQL} SELECT r.profile_id id, p.label,
+            SUM(r.requests) requests, {TOKENS_SQL} tokens, SUM(r.cost_nanodollars) cost_nanodollars
+            FROM r LEFT JOIN relay_profiles p ON p.id=r.profile_id
+            GROUP BY r.profile_id,p.label
+            ORDER BY tokens DESC,requests DESC,p.label,r.profile_id"
+        );
+        ProfileUsage::find_by_statement(self.window_statement(&sql, user_id, window))
+            .all(&self.database)
+            .await
+    }
+
+    /// The most recently active sessions that started a request in the window.
+    pub async fn recent_sessions(
+        &self,
+        user_id: Uuid,
+        window: Window,
+        limit: i64,
+    ) -> Result<Vec<SessionUsage>, sea_orm::DbErr> {
+        let [start, end] = window.bounds();
+        SessionUsage::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT s.id, p.label profile_label, a.label account_label, s.requests, s.tokens, s.last_seen FROM ( \
+             SELECT q.session_id id, MAX(q.profile_id) profile_id, MAX(q.account_id) account_id, COUNT(*) requests, \
+             COALESCE(SUM(COALESCE(u.input_tokens, 0) + COALESCE(u.cache_read_tokens, 0) + \
+             COALESCE(u.cache_write_tokens, 0) + COALESCE(u.output_tokens, 0)), 0) tokens, \
+             MAX(q.started_at) last_seen \
+             FROM gateway_requests q \
+             JOIN gateway_clients k ON k.id = q.client_id \
+             LEFT JOIN gateway_usage u ON u.request_id = q.id \
+             WHERE k.user_id = ? AND q.session_id IS NOT NULL \
+             AND q.started_at >= ? AND q.started_at <= ? \
+             GROUP BY q.session_id ORDER BY last_seen DESC LIMIT ?) s \
+             LEFT JOIN relay_profiles p ON p.id = s.profile_id \
+             LEFT JOIN relay_accounts a ON a.id = s.account_id \
+             ORDER BY s.last_seen DESC, s.id",
+            [
+                user_id.to_string().into(),
+                start.into(),
+                end.into(),
+                limit.into(),
+            ],
+        ))
+        .all(&self.database)
+        .await
     }
 
     pub async fn totals_series(

@@ -9,7 +9,9 @@ use crate::{
     pricing::cost,
     providers::{Provider, extract_completion, requested_model},
     request_id::RequestId,
-    telemetry::{ClientStart, CompletionRecord, RequestIdentity, SqliteSink, timestamp},
+    telemetry::{
+        Attribution, ClientStart, CompletionRecord, RequestIdentity, SqliteSink, timestamp,
+    },
 };
 
 #[cfg(test)]
@@ -32,6 +34,9 @@ use tokio_stream::wrappers::ReceiverStream;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const BLOCKING_POLICY_BYTES: usize = 256 * 1024;
 const POLICY_HEADER: HeaderName = HeaderName::from_static("x-aegis-policy");
+const ACCOUNT_HEADER: HeaderName = HeaderName::from_static(crate::ags_wire::ACCOUNT_HEADER);
+const PROFILE_HEADER: HeaderName = HeaderName::from_static(crate::ags_wire::PROFILE_HEADER);
+const RUN_HEADER: HeaderName = HeaderName::from_static(crate::ags_wire::RUN_HEADER);
 
 pub(crate) fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
@@ -64,6 +69,54 @@ struct AuthenticatedClient {
     id: String,
     user_id: String,
     key: Option<(String, String)>,
+    account_id: Option<String>,
+    profile_id: Option<String>,
+    run_id: Option<String>,
+}
+
+/// An attribution header's UUID: `None` when absent, an error when present but malformed.
+fn attribution_id(
+    value: Option<axum::http::HeaderValue>,
+    failure: StatusCode,
+) -> Result<Option<String>, StatusCode> {
+    value
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|v| uuid::Uuid::parse_str(v).ok())
+                .map(|v| v.to_string())
+                .ok_or(failure)
+        })
+        .transpose()
+}
+
+/// A client-controlled identifier safe to store and display.
+fn identifier(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?;
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b)))
+    .then(|| value.to_owned())
+}
+
+fn session_id(provider: Provider, headers: &HeaderMap) -> Option<String> {
+    match provider {
+        Provider::Anthropic => identifier(headers, "x-claude-code-session-id"),
+        // Codex 0.167 sends `session-id`; older releases used `session_id`/`conversation_id`.
+        Provider::Codex => ["session-id", "session_id", "conversation_id"]
+            .into_iter()
+            .find_map(|name| identifier(headers, name)),
+        _ => None,
+    }
+}
+
+fn upstream_account(provider: Provider, headers: &HeaderMap) -> Option<String> {
+    matches!(provider, Provider::Codex)
+        .then(|| identifier(headers, "chatgpt-account-id"))
+        .flatten()
 }
 
 enum AuthenticationFailure {
@@ -170,6 +223,10 @@ impl Gateway {
         headers: &mut HeaderMap,
         provider: &str,
     ) -> Result<AuthenticatedClient, AuthenticationFailure> {
+        // Internal attribution never reaches upstream, whatever the credential.
+        let account = headers.remove(ACCOUNT_HEADER);
+        let profile = headers.remove(PROFILE_HEADER);
+        let run = headers.remove(RUN_HEADER);
         if let Some(token) = headers.remove(crate::ags_wire::ACCESS_TOKEN_HEADER) {
             if headers.remove("x-aegis-api-key").is_some() {
                 return Err(StatusCode::BAD_REQUEST.into());
@@ -196,12 +253,24 @@ impl Gateway {
             {
                 return Err(StatusCode::FORBIDDEN.into());
             }
+            let account_id = attribution_id(account, StatusCode::FORBIDDEN)?;
+            let profile_id = attribution_id(profile, StatusCode::FORBIDDEN)?;
+            let run_id = attribution_id(run, StatusCode::BAD_REQUEST)?;
+            if account_id.is_none() && (profile_id.is_some() || run_id.is_some()) {
+                return Err(StatusCode::BAD_REQUEST.into());
+            }
             let id = domain
                 .oauth()
-                .relay_identity(&principal, provider)
+                .relay_identity(
+                    &principal,
+                    provider,
+                    account_id.as_deref(),
+                    profile_id.as_deref(),
+                )
                 .await
                 .map_err(|error| match error {
                     crate::domain::DomainError::InvalidCredentials
+                    | crate::domain::DomainError::Forbidden
                     | crate::domain::DomainError::InvalidInput(_) => StatusCode::FORBIDDEN,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 })?;
@@ -209,6 +278,9 @@ impl Gateway {
                 id,
                 user_id: principal.user_id().to_string(),
                 key: None,
+                account_id,
+                profile_id,
+                run_id,
             })
         } else {
             let key = self
@@ -220,6 +292,9 @@ impl Gateway {
                 id: key.id.clone(),
                 user_id: key.user_id,
                 key: Some((key.id, key.version_id)),
+                account_id: None,
+                profile_id: None,
+                run_id: None,
             })
         }
     }
@@ -384,6 +459,13 @@ impl Gateway {
                 endpoint,
                 requested_model: model.as_deref(),
                 request_body: &body,
+                attribution: Attribution {
+                    account_id: authenticated.account_id.as_deref(),
+                    profile_id: authenticated.profile_id.as_deref(),
+                    run_id: authenticated.run_id.as_deref(),
+                    session_id: session_id(provider, &parts.headers).as_deref(),
+                    upstream_account: upstream_account(provider, &parts.headers).as_deref(),
+                },
             })
             .await?;
         self.sink

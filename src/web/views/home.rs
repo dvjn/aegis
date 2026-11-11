@@ -7,8 +7,8 @@ use super::charts::{
 use super::format::{count_text, money_text, percent_text, token_text};
 use super::{layout_with_nav, signed_in_nav, tools};
 use crate::usage::{
-    ClientUsage, ContextTotals, GuardrailsSummary, LabeledSeries, Range, ToolUsage, TotalsSeries,
-    UsageGroup, UsageTotals,
+    AccountUsage, ClientUsage, ContextTotals, GuardrailsSummary, LabeledSeries, ProfileUsage,
+    Range, SessionUsage, ToolUsage, TotalsSeries, UsageGroup, UsageTotals,
 };
 
 /// Everything the overview needs, gathered by the handler in one place.
@@ -25,6 +25,9 @@ pub struct Overview<'a> {
     pub provider_series: &'a [LabeledSeries],
     pub client_series: &'a [LabeledSeries],
     pub guardrails: &'a GuardrailsSummary,
+    pub accounts: &'a [AccountUsage],
+    pub profiles: &'a [ProfileUsage],
+    pub sessions: &'a [SessionUsage],
 }
 
 const TILE_SPARKLINE: (u32, u32) = (96, 28);
@@ -68,6 +71,9 @@ pub fn page(overview: &Overview<'_>) -> Markup {
                     (breakdown_card("Models", "Requests, tokens, and cost by the model that answered.", "Model", "grid-half rows-3", overview.models, overview.model_series, None))
                     (breakdown_card("Providers", "Requests, tokens, and cost by the provider account that served them.", "Provider", "grid-half rows-2", overview.providers, overview.provider_series, None))
                     (clients_card(overview.clients, overview.client_series))
+                    (accounts_card(overview.accounts))
+                    (profiles_card(overview.profiles))
+                    (sessions_card(overview.sessions))
                     (context_card(overview.context))
                     (tools::mcp_card(overview.tools))
                     (tools::skills_card(overview.tools))
@@ -313,6 +319,155 @@ fn clients_card(clients: &[ClientUsage], series: &[LabeledSeries]) -> Markup {
     )
 }
 
+/// What users call a vendor's sign-in.
+fn product_name(vendor: &str) -> &str {
+    match vendor {
+        "anthropic" => "claude",
+        "openai" => "chatgpt",
+        "google" => "google",
+        other => other,
+    }
+}
+
+fn accounts_card(accounts: &[AccountUsage]) -> Markup {
+    html! {
+        article class="auth-card account-card grid-half rows-2" {
+            h2 { "Accounts" }
+            p { "Requests, tokens, and cost by vendor sign-in. Unattributed traffic has no account." }
+            div class="table-wrap" {
+                table class="data-table" {
+                    thead {
+                        tr {
+                            th scope="col" { "Account" }
+                            th scope="col" { "Product" }
+                            th scope="col" class="col-numeric" { "Requests" }
+                            th scope="col" class="col-numeric" { "Tokens" }
+                            th scope="col" class="col-numeric" { "Cost" }
+                        }
+                    }
+                    tbody {
+                        @if accounts.is_empty() {
+                            tr { td colspan="5" class="table-empty" { "No traffic in this range." } }
+                        }
+                        @for account in accounts {
+                            tr {
+                                th scope="row" class="cell-title" {
+                                    @if account.id.is_empty() {
+                                        span class="cell-absent" { "Unattributed" }
+                                    } @else {
+                                        (account.label.as_deref().unwrap_or("unknown account"))
+                                        @if account.account_changed {
+                                            span class="cell-warn" title="upstream account changed" { "account changed" }
+                                        }
+                                    }
+                                }
+                                td { (account.vendor.as_deref().map(product_name).unwrap_or("")) }
+                                td class="col-numeric" { (count_text(account.requests)) }
+                                td class="col-numeric" { (token_text(account.tokens)) }
+                                td class="col-numeric" { (money_text(account.cost_nanodollars)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn profiles_card(profiles: &[ProfileUsage]) -> Markup {
+    html! {
+        article class="auth-card account-card grid-half rows-2" {
+            h2 { "Profiles" }
+            p { "Requests, tokens, and cost by AGS profile. Unattributed traffic has no profile." }
+            div class="table-wrap" {
+                table class="data-table" {
+                    thead {
+                        tr {
+                            th scope="col" { "Profile" }
+                            th scope="col" class="col-numeric" { "Requests" }
+                            th scope="col" class="col-numeric" { "Tokens" }
+                            th scope="col" class="col-numeric" { "Cost" }
+                        }
+                    }
+                    tbody {
+                        @if profiles.is_empty() {
+                            tr { td colspan="4" class="table-empty" { "No traffic in this range." } }
+                        }
+                        @for profile in profiles {
+                            tr {
+                                th scope="row" class="cell-title" {
+                                    @if profile.id.is_empty() {
+                                        span class="cell-absent" { "Unattributed" }
+                                    } @else {
+                                        (profile.label.as_deref().unwrap_or("unknown profile"))
+                                    }
+                                }
+                                td class="col-numeric" { (count_text(profile.requests)) }
+                                td class="col-numeric" { (token_text(profile.tokens)) }
+                                td class="col-numeric" { (money_text(profile.cost_nanodollars)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sessions_card(sessions: &[SessionUsage]) -> Markup {
+    html! {
+        article class="auth-card account-card grid-half rows-2" {
+            h2 { "Recent sessions" }
+            p { "The ten most recently active CLI sessions in this range." }
+            div class="table-wrap" {
+                table class="data-table" {
+                    thead {
+                        tr {
+                            th scope="col" { "Session" }
+                            th scope="col" { "Profile" }
+                            th scope="col" { "Account" }
+                            th scope="col" class="col-numeric" { "Requests" }
+                            th scope="col" class="col-numeric" { "Tokens" }
+                            th scope="col" { "Last seen" }
+                        }
+                    }
+                    tbody {
+                        @if sessions.is_empty() {
+                            tr { td colspan="6" class="table-empty" { "No sessions in this range." } }
+                        }
+                        @for session in sessions {
+                            tr {
+                                th scope="row" class="cell-title" title=(session.id) { (short_session(&session.id)) }
+                                td {
+                                    @match &session.profile_label {
+                                        Some(label) => (label),
+                                        None => span class="cell-absent" { "unattributed" },
+                                    }
+                                }
+                                td {
+                                    @match &session.account_label {
+                                        Some(label) => (label),
+                                        None => span class="cell-absent" { "unattributed" },
+                                    }
+                                }
+                                td class="col-numeric" { (count_text(session.requests)) }
+                                td class="col-numeric" { (token_text(session.tokens)) }
+                                td { (session.last_seen.get(..16).unwrap_or(&session.last_seen).replace('T', " ")) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The tail tells sessions apart: UUIDv7 IDs (Codex) share their leading timestamp digits.
+fn short_session(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    chars[chars.len().saturating_sub(8)..].iter().collect()
+}
+
 /// `placement` is the card's span classes in the overview grid.
 fn breakdown_card(
     title: &str,
@@ -548,6 +703,9 @@ mod tests {
             provider_series: &[],
             client_series: &[],
             guardrails: &GuardrailsSummary::default(),
+            accounts: &[],
+            profiles: &[],
+            sessions: &[],
         })
         .into_string();
         assert!(
@@ -643,6 +801,9 @@ mod tests {
             provider_series: &[],
             client_series: &client_series,
             guardrails: &GuardrailsSummary::default(),
+            accounts: &[],
+            profiles: &[],
+            sessions: &[],
         })
         .into_string();
         assert_eq!(page.matches("<h2>Clients</h2>").count(), 1);
@@ -706,6 +867,8 @@ mod tests {
             r#"grid-half rows-3"><h2>Models</h2>"#,
             r#"grid-half rows-2"><h2>Providers</h2>"#,
             r#"grid-half rows-2"><h2>Clients</h2>"#,
+            r#"grid-half rows-2"><h2>Accounts</h2>"#,
+            r#"grid-half rows-2"><h2>Profiles</h2>"#,
             r#"grid-half rows-2"><h2>Context</h2>"#,
             r#"grid-half rows-2"><h2>MCPs</h2>"#,
             r#"grid-half rows-2"><h2>Skills</h2>"#,
@@ -924,6 +1087,9 @@ mod tests {
             provider_series: &[],
             client_series: &[],
             guardrails: &guardrails,
+            accounts: &[],
+            profiles: &[],
+            sessions: &[],
         })
         .into_string();
 
@@ -974,6 +1140,86 @@ mod tests {
     }
 
     #[test]
+    fn sessions_are_told_apart_by_their_tail() {
+        assert_eq!(
+            short_session("01a1c9a0-e817-72f2-968c-a40e5dced556"),
+            "5dced556"
+        );
+        assert_eq!(short_session("abc"), "abc");
+    }
+
+    #[test]
+    fn the_accounts_card_flags_account_changes_and_names_unattributed_traffic() {
+        let accounts = vec![
+            AccountUsage {
+                id: "a1".into(),
+                label: Some("work-claude".into()),
+                vendor: Some("anthropic".into()),
+                account_changed: true,
+                requests: 2,
+                tokens: 30,
+                cost_nanodollars: 0,
+            },
+            AccountUsage {
+                id: "a2".into(),
+                label: Some("me-chatgpt".into()),
+                vendor: Some("openai".into()),
+                account_changed: false,
+                requests: 2,
+                tokens: 3,
+                cost_nanodollars: 0,
+            },
+            AccountUsage {
+                id: String::new(),
+                label: None,
+                vendor: None,
+                account_changed: false,
+                requests: 1,
+                tokens: 5,
+                cost_nanodollars: 0,
+            },
+        ];
+        let html = accounts_card(&accounts).into_string();
+        assert!(html.contains("work-claude") && html.contains("<td>claude</td>"));
+        assert!(html.contains("<td>chatgpt</td>"));
+        assert!(html.contains("Unattributed"));
+        assert_eq!(html.matches("upstream account changed").count(), 1);
+    }
+
+    #[test]
+    fn the_profiles_card_names_unattributed_traffic() {
+        let profiles = vec![
+            ProfileUsage {
+                id: "p1".into(),
+                label: Some("work".into()),
+                requests: 2,
+                tokens: 30,
+                cost_nanodollars: 0,
+            },
+            ProfileUsage {
+                id: String::new(),
+                label: None,
+                requests: 1,
+                tokens: 5,
+                cost_nanodollars: 0,
+            },
+        ];
+        let html = profiles_card(&profiles).into_string();
+        assert!(html.contains("work"));
+        assert!(html.contains("Unattributed"));
+        assert!(!html.contains("account changed"));
+    }
+
+    #[test]
+    fn accounts_precede_profiles_and_sessions_on_the_overview() {
+        let page = page_without_traffic().into_string();
+        let accounts = page.find("<h2>Accounts</h2>").unwrap();
+        let profiles = page.find("<h2>Profiles</h2>").unwrap();
+        let sessions = page.find("<h2>Recent sessions</h2>").unwrap();
+        assert!(accounts < profiles && profiles < sessions);
+    }
+
+    #[test]
     fn the_guardrail_cards_say_when_nothing_was_scanned() {
         let page = page_without_traffic().into_string();
         assert!(page.contains("<h2>Detectors</h2>"));
@@ -1004,6 +1250,9 @@ mod tests {
             provider_series: &[],
             client_series: &[],
             guardrails: &GuardrailsSummary::default(),
+            accounts: &[],
+            profiles: &[],
+            sessions: &[],
         })
     }
 }
