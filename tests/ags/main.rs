@@ -76,9 +76,9 @@ impl Fixture {
         let registrations = Arc::new(AtomicUsize::new(0));
         let registered = registrations.clone();
         let catalog = if single {
-            json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"}]})
+            json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"}],"capabilities":["accounts"]})
         } else {
-            json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"},{"id":"personal","kind":"codex_subscription"},{"id":"work","kind":"codex_subscription"},{"id":"google-personal","kind":"antigravity_subscription"}]})
+            json!({"version":1,"providers":[{"id":"claude-main","kind":"claude_subscription"},{"id":"personal","kind":"codex_subscription"},{"id":"work","kind":"codex_subscription"},{"id":"google-personal","kind":"antigravity_subscription"}],"capabilities":["accounts"]})
         };
         let artifacts_available = Arc::new(AtomicBool::new(true));
         let available = artifacts_available.clone();
@@ -108,6 +108,8 @@ impl Fixture {
             } }))
             .route("/api/relay/connection",get(move || {let catalog=catalog.clone();async move {Json(catalog)}}))
             .route("/api/relay/enroll",post(|| async { axum::http::StatusCode::NO_CONTENT }))
+            .route("/api/relay/accounts/{id}",axum::routing::put(|| async { axum::http::StatusCode::NO_CONTENT }).delete(|| async { axum::http::StatusCode::NO_CONTENT }))
+            .route("/api/relay/profiles/{id}",axum::routing::put(|| async { axum::http::StatusCode::NO_CONTENT }).delete(|| async { axum::http::StatusCode::NO_CONTENT }))
             .route("/api/relay/disconnect",post(|| async { axum::http::StatusCode::NO_CONTENT }))
             .route("/providers/{*path}",any(move |request: Request| { let tx = tx.clone(); async move {
                 let (parts,body) = request.into_parts();
@@ -115,7 +117,7 @@ impl Fixture {
                 assert!(parts.headers["x-aegis-access-token"].to_str().unwrap().starts_with("mock-access"));
                 assert_eq!(parts.headers["authorization"],"Bearer vendor-credential");
                 let body = to_bytes(body,1024).await.unwrap();
-                tx.send(json!({"path":parts.uri.to_string(),"body":String::from_utf8_lossy(&body),"aegis_token":parts.headers["x-aegis-access-token"].to_str().unwrap()})).await.unwrap();
+                tx.send(json!({"path":parts.uri.to_string(),"body":String::from_utf8_lossy(&body),"aegis_token":parts.headers["x-aegis-access-token"].to_str().unwrap(),"account":parts.headers.get("x-aegis-account").and_then(|v| v.to_str().ok()),"profile":parts.headers.get("x-aegis-profile").and_then(|v| v.to_str().ok()),"run":parts.headers.get("x-aegis-run").and_then(|v| v.to_str().ok())})).await.unwrap();
                 Body::from("data: OK\n\n")
             } }));
         let backend = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -379,7 +381,8 @@ async fn setup_repairs_revoked_login_without_requiring_manual_state_deletion() {
     state["expires_at"] = json!(0);
     std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
     f.setup(false).await;
-    assert_eq!(f.registrations.load(Ordering::SeqCst), 2);
+    // Signing in again reuses the client, so its registered accounts and profiles still apply.
+    assert_eq!(f.registrations.load(Ordering::SeqCst), 1);
     let state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(state["refresh_token"], "mock-refresh");
     assert_eq!(state["cli_overrides"]["pi"]["codex_subscription"], "work");
@@ -691,4 +694,396 @@ async fn an_open_cli_refreshes_oauth_before_its_next_request() {
     assert_eq!(first["aegis_token"], "mock-access");
     assert_eq!(second["aegis_token"], "mock-access-1");
     assert_eq!(f.refreshes.load(Ordering::SeqCst), 1);
+}
+
+async fn ok(output: std::process::Output) -> std::process::Output {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn json_file(path: std::path::PathBuf) -> Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn profiles_share_accounts_and_attribute_requests_by_account_profile_and_run() {
+    let mut f = Fixture::new().await;
+    f.setup(true).await;
+    // Profiles only reference existing accounts; `new` and `native` are rejected.
+    for value in ["new", "native"] {
+        let output = f
+            .command()
+            .args(["profile", "new", "work", "--claude", value])
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ags account new <name> --claude"),
+            "{stderr}"
+        );
+    }
+    assert!(
+        !f.root.join("ags/profiles.json").exists()
+            || json_file(f.root.join("ags/profiles.json"))["profiles"]
+                .as_array()
+                .is_none_or(|p| p.is_empty()),
+        "a rejected value must not create the profile"
+    );
+    let created = ok(f
+        .command()
+        .args(["account", "new", "work-claude", "--claude"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    assert!(
+        String::from_utf8_lossy(&created.stdout)
+            .contains("Sign in with `ags account login work-claude`.")
+    );
+    // Two codex routes are granted, so a chatgpt account needs the route named.
+    let output = f
+        .command()
+        .args(["account", "new", "work-chatgpt", "--chatgpt"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ags account new work-chatgpt --chatgpt --route <id>"),
+        "{stderr}"
+    );
+    ok(f.command()
+        .args([
+            "account",
+            "new",
+            "work-chatgpt",
+            "--chatgpt",
+            "--route",
+            "work",
+        ])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    ok(f.command()
+        .args([
+            "profile",
+            "new",
+            "work",
+            "--claude",
+            "work-claude",
+            "--chatgpt",
+            "work-chatgpt",
+        ])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let output = f
+        .command()
+        .args(["profile", "set", "work", "chatgpt", "native"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no longer accepted"));
+
+    let accounts = json_file(f.root.join("ags/accounts.json"));
+    let id_of = |name: &str| {
+        accounts["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (claude_id, codex_id) = (id_of("work-claude"), id_of("work-chatgpt"));
+    let profile_id = json_file(f.root.join("ags/profiles.json"))["profiles"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Not signed in: the error carries the command that fixes it.
+    let output = f
+        .command()
+        .args(["run", "claude", "-P", "work", "--", "hi"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ags account login work-claude"));
+    for (id, file) in [(&claude_id, ".credentials.json"), (&codex_id, "auth.json")] {
+        std::fs::write(f.root.join("ags/accounts").join(id).join(file), "{}").unwrap();
+    }
+
+    let output = ok(f
+        .command()
+        .args(["run", "claude", "-P", "work", "--", "hi"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let launch: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        launch["config_dir"],
+        f.root
+            .join("ags/accounts")
+            .join(&claude_id)
+            .to_str()
+            .unwrap()
+    );
+    let request = f.requests.recv().await.unwrap();
+    assert_eq!(
+        request["path"],
+        "/providers/claude-main/responses?trial=true"
+    );
+    assert_eq!(request["account"], claude_id.as_str());
+    assert_eq!(request["profile"], profile_id.as_str());
+    assert!(uuid::Uuid::parse_str(request["run"].as_str().unwrap()).is_ok());
+    let accounts = json_file(f.root.join("ags/accounts.json"));
+    assert!(accounts["accounts"][0]["registered_with"].is_string());
+    assert!(
+        json_file(f.root.join("ags/profiles.json"))["profiles"][0]["registered_with"].is_string()
+    );
+
+    // AGS_PROFILE selects codex, whose account has its own CODEX_HOME and file credential store.
+    let output = ok(f
+        .command()
+        .env("AGS_PROFILE", "work")
+        .args(["run", "codex", "--", "exec", "prompt"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let launch: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        launch["config_dir"],
+        f.root
+            .join("ags/accounts")
+            .join(&codex_id)
+            .to_str()
+            .unwrap()
+    );
+    assert!(
+        launch["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "cli_auth_credentials_store=\"file\"")
+    );
+    let request = f.requests.recv().await.unwrap();
+    assert_eq!(request["path"], "/providers/work/responses?trial=true");
+    assert_eq!(request["account"], codex_id.as_str());
+    assert_eq!(request["profile"], profile_id.as_str());
+
+    // A directory rule selects the profile from a child directory only.
+    let project = f.root.join("proj");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    ok(f.command()
+        .current_dir(&project)
+        .args(["profile", "use", "work", "--here"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let shown = ok(f
+        .command()
+        .current_dir(project.join("src"))
+        .arg("profile")
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let shown = String::from_utf8_lossy(&shown.stdout).into_owned();
+    assert!(
+        shown.contains("Profile: work (rule ") && shown.contains("work-claude"),
+        "{shown}"
+    );
+    ok(f.command()
+        .current_dir(project.join("src"))
+        .args(["run", "claude", "--", "hi"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let request = f.requests.recv().await.unwrap();
+    assert_eq!(request["account"], claude_id.as_str());
+    assert_eq!(request["profile"], profile_id.as_str());
+
+    // Elsewhere nothing resolves, and --provider is always unprofiled: no attribution.
+    for args in [
+        vec!["run", "claude", "--", "hi"],
+        vec!["run", "claude", "--provider", "claude-main", "--", "hi"],
+    ] {
+        ok(f.command().args(&args).output().await.unwrap()).await;
+        let request = f.requests.recv().await.unwrap();
+        assert!(
+            request["account"].is_null()
+                && request["profile"].is_null()
+                && request["run"].is_null()
+        );
+    }
+    let output = f
+        .command()
+        .args(["run", "pi", "-P", "work"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+
+    let listed = ok(f
+        .command()
+        .args(["profile", "list"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        listed.contains("work-claude")
+            && listed.contains("work-chatgpt")
+            && listed.contains("rule "),
+        "{listed}"
+    );
+    let listed = ok(f
+        .command()
+        .args(["account", "list"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("signed in"));
+
+    // Removal is refused while a profile uses the account; --force detaches it and deletes its dir.
+    let output = f
+        .command()
+        .args(["account", "rm", "work-claude"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ags account rm work-claude --force"));
+    ok(f.command()
+        .args(["account", "rm", "work-claude", "--force"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    assert!(!f.root.join("ags/accounts").join(&claude_id).exists());
+    let output = f
+        .command()
+        .args(["run", "claude", "-P", "work", "--", "hi"])
+        .output()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ags profile set work claude <name>"));
+}
+
+#[tokio::test]
+async fn account_and_profile_commands_explain_empty_state_and_missing_input_without_a_terminal() {
+    let f = Fixture::new().await;
+    f.setup(false).await;
+    let stdout =
+        |output: std::process::Output| String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr =
+        |output: std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    let listed = stdout(ok(f.command().args(["profile", "ls"]).output().await.unwrap()).await);
+    assert!(
+        listed.contains(
+            "No profiles. Create one with `ags profile new <name>`, or run `ags setup` for a guided setup."
+        ),
+        "{listed}"
+    );
+    let listed = stdout(ok(f.command().args(["account", "ls"]).output().await.unwrap()).await);
+    assert!(
+        listed.contains(
+            "No accounts. Create one with `ags account new <name> --claude` or `--chatgpt`, or run `ags setup` for a guided setup."
+        ),
+        "{listed}"
+    );
+
+    for (args, expected) in [
+        (
+            vec!["account", "new"],
+            "a name and product are required: `ags account new <name> --claude`",
+        ),
+        (
+            vec!["account", "new", "solo"],
+            "choose a product: `ags account new solo --claude` or `--chatgpt`",
+        ),
+        (
+            vec!["account", "new", "--claude"],
+            "a name is required: `ags account new <name> --claude`",
+        ),
+    ] {
+        let output = f.command().args(&args).output().await.unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let message = stderr(output);
+        assert!(message.contains(expected), "{args:?}: {message}");
+    }
+
+    // A profile can be created with no accounts; launching with it names the exact fix.
+    ok(f.command()
+        .args(["profile", "new", "bare", "--default"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let output = f
+        .command()
+        .args(["run", "codex", "--", "hi"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    let message = stderr(output);
+    assert!(
+        message.contains(
+            "Profile bare has no chatgpt account. Add one with `ags account new <name> --chatgpt`, then `ags profile set bare chatgpt <name>`."
+        ),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn setup_without_a_terminal_points_to_the_wizard_until_an_account_exists() {
+    let f = Fixture::new().await;
+    let setup = || {
+        let mut cmd = f.command();
+        cmd.args([
+            "setup",
+            &f.server,
+            "--no-browser",
+            "--no-wrappers",
+            "--provider",
+            "codex=personal",
+            "--provider",
+            "pi=work",
+        ]);
+        cmd
+    };
+    let hint = "Run `ags setup` in a terminal to set up accounts and profiles.";
+    let output = ok(setup().output().await.unwrap()).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Connected. Run claude"), "{stdout}");
+    assert!(stdout.contains(hint), "{stdout}");
+    ok(f.command()
+        .args(["account", "new", "work-claude", "--claude"])
+        .output()
+        .await
+        .unwrap())
+    .await;
+    let output = ok(setup().output().await.unwrap()).await;
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(hint));
 }

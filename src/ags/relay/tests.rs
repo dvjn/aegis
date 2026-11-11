@@ -33,6 +33,11 @@ async fn forwards_credentials_query_and_streams_without_buffering_or_redirects()
         &server,
         "work",
         super::super::auth::TokenSource::Fixed("aegis-oauth".into()),
+        Some(Attribution {
+            account: "account-1".into(),
+            profile: Some("profile-1".into()),
+            run: "run-1".into(),
+        }),
     )
     .await
     .unwrap();
@@ -50,6 +55,9 @@ async fn forwards_credentials_query_and_streams_without_buffering_or_redirects()
         .header("x-aegis-api-key", "must-be-replaced")
         .header("connection", "x-remove")
         .header("x-remove", "private")
+        .header("x-aegis-account", "spoofed")
+        .header("x-aegis-profile", "spoofed")
+        .header("x-aegis-run", "spoofed")
         .body(reqwest::Body::wrap_stream(futures_util::stream::iter([
             Ok::<_, std::io::Error>("hello"),
         ])));
@@ -63,6 +71,11 @@ async fn forwards_credentials_query_and_streams_without_buffering_or_redirects()
     assert!(!parts.headers.contains_key("x-aegis-api-key"));
     assert_eq!(parts.headers["x-aegis-access-token"], "aegis-oauth");
     assert!(!parts.headers.contains_key("x-remove"));
+    assert_eq!(parts.headers.get_all("x-aegis-profile").iter().count(), 1);
+    assert_eq!(parts.headers.get_all("x-aegis-account").iter().count(), 1);
+    assert_eq!(parts.headers["x-aegis-account"], "account-1");
+    assert_eq!(parts.headers["x-aegis-profile"], "profile-1");
+    assert_eq!(parts.headers["x-aegis-run"], "run-1");
     assert_eq!(&body[..], b"hello");
     frames_tx.send(Ok("data: first\n\n".into())).await.unwrap();
     let response = tokio::time::timeout(std::time::Duration::from_secs(2), task)

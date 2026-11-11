@@ -1,5 +1,8 @@
 use super::state::{self, Config};
-use crate::ags_wire::{Connection, Enrollment, RESOURCE_PATH, SCOPE};
+use crate::ags_wire::{
+    AccountRegistration, CAPABILITY_ACCOUNTS, Connection, Enrollment, ProfileLabel, RESOURCE_PATH,
+    SCOPE,
+};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
@@ -65,32 +68,68 @@ fn machine_name() -> String {
         .unwrap_or_else(|| "CLI machine".into())
 }
 
-pub async fn pair(server: &str, open_browser: bool) -> Result<Config> {
+/// Pairs through the device flow. `reuse` is the client ID of an earlier pairing with the same
+/// server: signing in again under it keeps the accounts and profiles registered by that client.
+/// If the server no longer knows that client, a new one is registered.
+pub async fn pair(server: &str, open_browser: bool, reuse: Option<&str>) -> Result<Config> {
+    pair_with(server, open_browser, reuse, |url, code| {
+        eprintln!("Open {url}\nConfirm code: {code}");
+    })
+    .await
+}
+
+/// [`pair`], handing the verification URL and user code to `show` instead of printing them.
+pub async fn pair_with(
+    server: &str,
+    open_browser: bool,
+    reuse: Option<&str>,
+    show: impl FnOnce(&str, &str) + Send,
+) -> Result<Config> {
     let client = client()?;
-    let machine = machine_name();
     let scope = format!("{SCOPE} offline_access");
-    let registration: Registration = client.post(format!("{server}/oauth/register")).json(&serde_json::json!({
-        "client_name": format!("ags · {}", machine.chars().take(60).collect::<String>()), "application_type": "native",
-        "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
-        "response_types": [], "scope": scope
-    })).send().await?.error_for_status()?.json().await?;
     let resource = format!("{server}{RESOURCE_PATH}");
-    let device: Device = client
-        .post(format!("{server}/oauth/device_authorization"))
-        .form(&[
-            ("client_id", registration.client_id.as_str()),
-            ("resource", &resource),
-            ("scope", scope.as_str()),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    eprintln!(
-        "Open {}\nConfirm code: {}",
-        device.verification_uri_complete, device.user_code
-    );
+    let authorize = |client_id: String| {
+        let client = client.clone();
+        let (resource, scope) = (resource.clone(), scope.clone());
+        async move {
+            client
+                .post(format!("{server}/oauth/device_authorization"))
+                .form(&[
+                    ("client_id", client_id.as_str()),
+                    ("resource", &resource),
+                    ("scope", scope.as_str()),
+                ])
+                .send()
+                .await
+        }
+    };
+    let reused = match reuse {
+        Some(id) => {
+            let response = authorize(id.to_owned()).await?;
+            if response.status().is_client_error() {
+                None
+            } else {
+                Some((
+                    id.to_owned(),
+                    response.error_for_status()?.json::<Device>().await?,
+                ))
+            }
+        }
+        None => None,
+    };
+    let (client_id, device) = match reused {
+        Some(reused) => reused,
+        None => {
+            let client_id = register(&client, server, &scope).await?;
+            let device: Device = authorize(client_id.clone())
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            (client_id, device)
+        }
+    };
+    show(&device.verification_uri_complete, &device.user_code);
     // Browser opening is optional. The URL/code always works for remote terminals.
     if open_browser {
         let _ = std::process::Command::new("xdg-open")
@@ -111,7 +150,7 @@ pub async fn pair(server: &str, open_browser: bool) -> Result<Config> {
             .post(format!("{server}/oauth/token"))
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", &registration.client_id),
+                ("client_id", &client_id),
                 ("device_code", &device.device_code),
                 ("resource", &resource),
             ])
@@ -121,7 +160,7 @@ pub async fn pair(server: &str, open_browser: bool) -> Result<Config> {
             let token: Token = response.json().await?;
             return Ok(Config {
                 server: server.into(),
-                client_id: registration.client_id,
+                client_id,
                 access_token: token.access_token,
                 refresh_token: token
                     .refresh_token
@@ -142,6 +181,25 @@ pub async fn pair(server: &str, open_browser: bool) -> Result<Config> {
             _ => bail!("device approval failed; run setup again"),
         }
     }
+}
+
+async fn register(client: &Client, server: &str, scope: &str) -> Result<String> {
+    let machine = machine_name();
+    let registration: Registration = client
+        .post(format!("{server}/oauth/register"))
+        .json(&serde_json::json!({
+            "client_name": format!("ags · {}", machine.chars().take(60).collect::<String>()),
+            "application_type": "native",
+            "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+            "response_types": [],
+            "scope": scope
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(registration.client_id)
 }
 
 /// Serialize refresh-token rotation across concurrent wrappers and save before launching a CLI.
@@ -225,6 +283,57 @@ pub async fn enroll(config: &Config) -> Result<()> {
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+pub async fn supports_accounts(config: &Config) -> Result<bool> {
+    Ok(catalog(config)
+        .await?
+        .capabilities
+        .iter()
+        .any(|c| c == CAPABILITY_ACCOUNTS))
+}
+
+async fn put<T: serde::Serialize>(config: &Config, path: &str, body: &T) -> Result<()> {
+    client()?
+        .put(format!("{}/api/relay/{path}", config.server))
+        .bearer_auth(&config.access_token)
+        .json(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn delete(config: &Config, path: &str) -> Result<()> {
+    let response = client()?
+        .delete(format!("{}/api/relay/{path}", config.server))
+        .bearer_auth(&config.access_token)
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::NOT_FOUND {
+        response.error_for_status()?;
+    }
+    Ok(())
+}
+
+pub async fn register_account(
+    config: &Config,
+    id: &str,
+    registration: &AccountRegistration,
+) -> Result<()> {
+    put(config, &format!("accounts/{id}"), registration).await
+}
+
+pub async fn deregister_account(config: &Config, id: &str) -> Result<()> {
+    delete(config, &format!("accounts/{id}")).await
+}
+
+pub async fn register_profile(config: &Config, id: &str, label: &ProfileLabel) -> Result<()> {
+    put(config, &format!("profiles/{id}"), label).await
+}
+
+pub async fn deregister_profile(config: &Config, id: &str) -> Result<()> {
+    delete(config, &format!("profiles/{id}")).await
 }
 
 #[derive(Clone)]

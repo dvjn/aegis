@@ -158,3 +158,20 @@ fn server_validation_rejects_embedded_credentials_and_remote_plaintext() {
     );
     assert!(state::validate_server("http://127.0.0.1:8765").is_ok());
 }
+
+#[test]
+fn short_aliases_parse_like_the_full_commands() {
+    use clap::Parser;
+    for args in [
+        &["ags", "p", "c", "work", "--claude", "new"][..],
+        &["ags", "p", "s", "work", "chatgpt", "none"],
+        &["ags", "p", "u", "work", "--here"],
+        &["ags", "p", "ls"],
+        &["ags", "a", "in", "work-claude"],
+        &["ags", "a", "rm", "work-claude", "--force"],
+        &["ags", "r", "claude", "-P", "work", "--", "-p", "hi"],
+        &["ags", "st"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+    }
+}

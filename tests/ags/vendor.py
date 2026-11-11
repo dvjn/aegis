@@ -48,6 +48,6 @@ if "--refresh-during-run" in args:
     state_path.write_text(json.dumps(state))
     with urllib.request.urlopen(request) as response:
         assert response.read() == b"data: OK\n\n"
-print(json.dumps({"endpoint": endpoint, "args": args, "extension": extension, "pi_config": config if name == "pi" else None,
+print(json.dumps({"endpoint": endpoint, "args": args, "extension": extension, "config_dir": os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CODEX_HOME"), "pi_config": config if name == "pi" else None,
                   "aegis_auth_in_environment": any(v.startswith("mock-access") or v == "mock-refresh" for v in os.environ.values())}))
 sys.exit(7 if "--exit-7" in args else 0)

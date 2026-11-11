@@ -93,7 +93,8 @@ fn launcher() -> Result<String> {
     ))
 }
 
-pub fn wrappers(home: &Path) -> Result<()> {
+/// Installs the wrappers; `announce` prints where they are.
+pub fn wrappers(home: &Path, announce: bool) -> Result<()> {
     state::private_dir(&home.join("shims"))?;
     let mut owned = journal(home)?;
     let executable = launcher()?;
@@ -150,10 +151,12 @@ pub fn wrappers(home: &Path) -> Result<()> {
         }
         fs::write(&file, format!("{current}\n{expected}"))?;
     }
-    eprintln!(
-        "Wrappers installed. Start a new shell, or add {} to PATH.",
-        home.join("shims").display()
-    );
+    if announce {
+        eprintln!(
+            "Wrappers installed. Start a new shell, or add {} to PATH.",
+            home.join("shims").display()
+        );
+    }
     Ok(())
 }
 

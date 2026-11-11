@@ -17,6 +17,15 @@ struct Target {
     upstream: String,
     auth: super::auth::TokenSource,
     host: String,
+    attribution: Option<Attribution>,
+}
+
+/// Account, profile and run identifiers the relay stamps on every request it forwards.
+#[derive(Clone)]
+pub struct Attribution {
+    pub account: String,
+    pub profile: Option<String>,
+    pub run: String,
 }
 
 pub struct Relay {
@@ -30,6 +39,7 @@ impl Relay {
         server: &str,
         provider: &str,
         auth: super::auth::TokenSource,
+        attribution: Option<Attribution>,
     ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let host = listener.local_addr()?.to_string();
@@ -45,6 +55,7 @@ impl Relay {
             upstream: format!("{server}/providers/{provider}"),
             auth,
             host,
+            attribution,
         });
         let router = Router::new()
             .route(&format!("{prefix}/{{*path}}"), any(forward))
@@ -85,6 +96,9 @@ fn allowed(name: &HeaderName, headers: &HeaderMap) -> bool {
             | "upgrade"
             | "x-aegis-api-key"
             | "x-aegis-access-token"
+            | "x-aegis-account"
+            | "x-aegis-profile"
+            | "x-aegis-run"
     ) && !headers
         .get_all(header::CONNECTION)
         .iter()
@@ -134,6 +148,14 @@ async fn forward(State(target): State<Arc<Target>>, request: Request) -> Respons
         .client
         .request(parts.method, url)
         .header(crate::ags_wire::ACCESS_TOKEN_HEADER, token);
+    if let Some(attribution) = &target.attribution {
+        outbound = outbound
+            .header(crate::ags_wire::ACCOUNT_HEADER, &attribution.account)
+            .header(crate::ags_wire::RUN_HEADER, &attribution.run);
+        if let Some(profile) = &attribution.profile {
+            outbound = outbound.header(crate::ags_wire::PROFILE_HEADER, profile);
+        }
+    }
     for (name, value) in &parts.headers {
         if allowed(name, &parts.headers) {
             outbound = outbound.header(name, value);
