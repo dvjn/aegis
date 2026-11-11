@@ -42,11 +42,23 @@ export default function (pi) {
     return { ...original, stream: invoke("stream"), streamSimple: invoke("streamSimple") };
   }
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     const registry = ctx.modelRegistry;
     // pi-subagents shares the parent's model runtime, including these providers.
     const runtime = registry.runtime ?? registry;
-    if (runtime[installation] === identity) return;
+    if (runtime[installation] !== identity) install(registry);
+    runtime[installation] = identity;
+    // Start on the configured subscription's alias rather than pi's native provider name. pi
+    // accepts the alias once its startup sign-in check has seen it, so retry briefly.
+    const current = ctx.model;
+    const route = current && routes.get(config.defaults[current.provider]);
+    const alias = route && registry.find(route.alias, current.id);
+    for (let i = 0; alias && i < 40 && !(await pi.setModel(alias)); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  });
+
+  function install(registry) {
     const sources = new Map(config.routes.map((route) => [route.source, registry.getProvider(route.source)]));
     const existingIds = new Set(registry.getAll().map((model) => model.provider));
 
@@ -100,6 +112,5 @@ export default function (pi) {
         },
       });
     }
-    runtime[installation] = identity;
-  });
+  }
 }
