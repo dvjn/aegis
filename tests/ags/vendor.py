@@ -29,12 +29,25 @@ else:
     endpoint = next(route["endpoint"] for route in config["routes"] if route["id"] == selected)
     assert 'transport: "sse"' in source
     assert "getProvider" in source
+def pi_url(route):
+    """pi's own request URL: an openai-codex base URL gets `/codex/responses` unless it ends in /codex."""
+    base = route["endpoint"].rstrip("/")
+    if route["source"] != "openai-codex":
+        return base + "/responses?trial=true"
+    if base.endswith("/codex/responses"):
+        return base + "?trial=true"
+    if base.endswith("/codex"):
+        return base + "/responses?trial=true"
+    return base + "/codex/responses?trial=true"
 request_path = "/v1internal:streamGenerateContent?alt=sse" if name == "agy" else "/responses?trial=true"
-request = urllib.request.Request(endpoint + request_path, b"prompt", {"Authorization": "Bearer vendor-credential"})
+url = endpoint + request_path
+if extension:
+    url = pi_url(next(route for route in config["routes"] if route["id"] == selected))
+request = urllib.request.Request(url, b"prompt", {"Authorization": "Bearer vendor-credential"})
 if name == "pi" and "--all-providers" in args:
     import concurrent.futures
     def invoke(route):
-        req = urllib.request.Request(route["endpoint"] + "/responses?trial=true", b"prompt", {"Authorization": "Bearer vendor-credential"})
+        req = urllib.request.Request(pi_url(route), b"prompt", {"Authorization": "Bearer vendor-credential"})
         with urllib.request.urlopen(req) as response:
             assert response.read() == b"data: OK\n\n"
     with concurrent.futures.ThreadPoolExecutor() as pool:

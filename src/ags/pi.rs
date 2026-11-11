@@ -8,6 +8,15 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::{collections::BTreeMap, ffi::OsString, path::Path};
 
+/// pi appends `/codex/responses` to an `openai-codex` base URL, so it gets the provider's
+/// ChatGPT path (`/backend-api/codex`), which Aegis maps onto the upstream as-is.
+fn pi_endpoint(source: &str, relay: &str) -> String {
+    match source {
+        "openai-codex" => format!("{relay}/backend-api/codex"),
+        _ => relay.to_owned(),
+    }
+}
+
 pub fn plan(
     config: &Config,
     endpoints: &BTreeMap<String, String>,
@@ -46,7 +55,8 @@ pub fn plan(
     }
     let routes: Vec<_> = config.providers.iter().filter_map(|p| {
         let source = KINDS.iter().find(|k| k.0 == p.kind)?.2;
-        Some(json!({"id":p.id,"source":source,"alias":format!("ags-{}",p.id),"endpoint":endpoints.get(&p.id)?}))
+        let endpoint = pi_endpoint(source, endpoints.get(&p.id)?);
+        Some(json!({"id":p.id,"source":source,"alias":format!("ags-{}",p.id),"endpoint":endpoint}))
     }).collect();
     let data = json!({"server":config.server,"routes":routes,"defaults":defaults});
     let path = home

@@ -262,7 +262,7 @@ async fn wrappers_have_private_lifetimes_and_preserve_args_auth_and_provider_def
     );
     assert_eq!(
         f.requests.recv().await.unwrap()["path"],
-        "/providers/personal/responses?trial=true"
+        "/providers/personal/backend-api/codex/responses?trial=true"
     );
     let output = f.command().args(["uninstall"]).output().await.unwrap();
     assert!(
@@ -433,8 +433,8 @@ async fn pi_proxies_every_enabled_subscription_concurrently_and_keeps_native_con
         paths,
         vec![
             "/providers/claude-main/responses?trial=true",
-            "/providers/personal/responses?trial=true",
-            "/providers/work/responses?trial=true"
+            "/providers/personal/backend-api/codex/responses?trial=true",
+            "/providers/work/backend-api/codex/responses?trial=true"
         ]
     );
     assert_eq!(
