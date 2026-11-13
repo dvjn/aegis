@@ -2,7 +2,7 @@
 rust = { version = "1.99.1", components = "rustfmt,clippy" }
 zig = "0.16.0"
 "github:rustsec/rustsec" = { version = "cargo-audit/v0.22.2" }
-"github:rust-cross/cargo-zigbuild" = { version = "0.24.0" }
+"github:rust-cross/cargo-zigbuild" = { version = "0.24.1" }
 "github:nextest-rs/nextest" = { version = "cargo-nextest-0.9.143" }
 watchexec = "2.8.0"
 jq = "1.8.2"
