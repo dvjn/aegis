@@ -7,7 +7,9 @@
     ":disableRateLimiting",
     "customManagers:githubActionsVersions"
   ],
-  "dependencyDashboard": true,
+  "dependencyDashboard": {
+    "enabled": true
+  },
   "osvVulnerabilityAlerts": true,
   "packageRules": [
     {
