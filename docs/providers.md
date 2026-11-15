@@ -11,7 +11,7 @@ A provider is an upstream that clients reach at `/providers/<id>/…`. Clients k
 | `claude_subscription` | Anthropic API |
 | `codex_subscription` | ChatGPT's Codex backend |
 | `typesafe` | TypeSafe API |
-| `bedrock` | Amazon Bedrock in one region (default `us-east-1`) |
+| `bedrock` | Amazon Bedrock in one region (default `us-east-1`). Clients must use a Bedrock API key; AWS credentials that sign requests are rejected, because Aegis changes the signed host and body. |
 | `vertex` | Google Vertex AI, at the location each request names |
 
 Every type has a default upstream. A custom base URL replaces it, for a proxy or a private endpoint.
