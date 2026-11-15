@@ -20,7 +20,7 @@ mod route;
 use axum::{
     body::{Body, Bytes, to_bytes},
     extract::Request,
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -38,6 +38,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const BLOCKING_POLICY_BYTES: usize = 256 * 1024;
+const BYPASSED_METHODS: [Method; 3] = [Method::GET, Method::HEAD, Method::OPTIONS];
 const POLICY_HEADER: HeaderName = HeaderName::from_static("x-aegis-policy");
 
 pub(crate) fn webpki_roots_tls_config() -> anyhow::Result<rustls::ClientConfig> {
@@ -206,9 +207,12 @@ impl Gateway {
         let route_prefix = format!("/providers/{provider_id}");
         let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
         let route = target.route(upstream_path);
-        // Quota/account/bootstrap calls contain private account metadata and are
-        // not model requests. They still require the same authenticated grant.
-        let Some(provider) = route.protocol else {
+        // The bypass list: methods that carry no request body, such as model
+        // listings, go through unmasked and unrecorded. They still require the
+        // same authenticated grant. Every other request is masked, whether or
+        // not its format is known, so a client cannot route prompts around the
+        // guardrails through a path Aegis does not recognize.
+        if BYPASSED_METHODS.contains(&parts.method) {
             let mut outbound = self.client.request(parts.method, route.url);
             for (name, value) in &parts.headers {
                 if !is_hop_by_hop(name) && name != header::HOST && name != header::ACCEPT_ENCODING {
@@ -224,7 +228,10 @@ impl Gateway {
             return Ok(
                 (status, headers, Body::from_stream(response.bytes_stream())).into_response(),
             );
-        };
+        }
+        // Only a known model format is recorded, because only its usage can
+        // be read.
+        let provider = route.protocol;
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
         let model = requested_model(&body).or(route.model);
         let context = RequestContext {
@@ -263,23 +270,29 @@ impl Gateway {
         if let Some(model) = model.as_deref() {
             span.record("model", tracing::field::display(model));
         }
-        let capture_id = self
-            .sink
-            .start(StartRecord {
-                request_id: &request_id,
-                key_id: &authenticated.id,
-                key_version_id: &authenticated.version_id,
-                provider_id,
-                provider,
-                method: parts.method.as_str(),
-                endpoint,
-                requested_model: model.as_deref(),
-                request_body: &body,
-            })
-            .await?;
-        self.sink
-            .record_evaluations(capture_id, &evaluations)
-            .await?;
+        let capture_id = match provider {
+            Some(provider) => {
+                let capture_id = self
+                    .sink
+                    .start(StartRecord {
+                        request_id: &request_id,
+                        key_id: &authenticated.id,
+                        key_version_id: &authenticated.version_id,
+                        provider_id,
+                        provider,
+                        method: parts.method.as_str(),
+                        endpoint,
+                        requested_model: model.as_deref(),
+                        request_body: &body,
+                    })
+                    .await?;
+                self.sink
+                    .record_evaluations(capture_id, &evaluations)
+                    .await?;
+                Some(capture_id)
+            }
+            None => None,
+        };
 
         let mut outbound = self
             .client
@@ -294,7 +307,9 @@ impl Gateway {
         let upstream = match outbound.send().await {
             Ok(response) => response,
             Err(error) => {
-                self.sink.fail(capture_id, &error.to_string()).await;
+                if let Some(capture_id) = capture_id {
+                    self.sink.fail(capture_id, &error.to_string()).await;
+                }
                 return Err(error.into());
             }
         };
@@ -307,7 +322,7 @@ impl Gateway {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with(crate::eventstream::CONTENT_TYPE));
         let mut restorer = (!replacements.is_empty()).then(|| {
-            let restorer = if matches!(provider, Provider::Gemini) {
+            let restorer = if provider == Some(Provider::Gemini) {
                 StreamRestorer::gemini(replacements)
             } else {
                 StreamRestorer::new(replacements)
@@ -391,6 +406,16 @@ impl Gateway {
             drop(stream);
             drop(sender);
 
+            let Some((provider, capture_id)) = provider.zip(capture_id) else {
+                let _entered = completion_span.enter();
+                tracing::info!(
+                    target: crate::access_log::GATEWAY,
+                    status = status.as_u16(),
+                    latency_ms = started.elapsed().as_millis() as u64,
+                    "request completed"
+                );
+                return;
+            };
             let completion = extract_completion(provider, &capture);
             let usage = completion.usage;
             // Price what actually ran: an alias resolves to a dated or versioned
@@ -426,7 +451,9 @@ impl Gateway {
                     response_truncated: truncated,
                     client_disconnected: disconnected,
                     usage: &usage,
-                    resolved_model: completion.model.as_deref(),
+                    // Some formats, such as Converse, never name the model
+                    // that ran; the requested one stands in for it.
+                    resolved_model: completion.model.as_deref().or(model.as_deref()),
                     cost,
                     error_message: stream_error.as_deref(),
                 })

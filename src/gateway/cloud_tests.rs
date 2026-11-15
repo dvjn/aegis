@@ -208,6 +208,24 @@ fn bedrock_reply(path: &str, masked: &str) -> Response {
             ),
         ]);
     }
+    if path.ends_with("/chat/completions") {
+        let chunk = |text: &str| json!({"object":"chat.completion.chunk","model":"zai.glm-4.7","choices":[{"index":0,"delta":{"content":text}}]});
+        let events = [
+            chunk(head),
+            chunk(tail),
+            json!({"object":"chat.completion.chunk","model":"zai.glm-4.7","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            json!({"object":"chat.completion.chunk","model":"zai.glm-4.7","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}),
+        ];
+        let body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .chain(["data: [DONE]\n\n".to_owned()])
+            .collect();
+        return ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response();
+    }
+    if path.ends_with("/count-tokens") {
+        return axum::Json(json!({"inputTokens": 5, "echo": masked})).into_response();
+    }
     axum::Json(json!({"usage":{"input_tokens":30,"output_tokens":2}})).into_response()
 }
 
@@ -272,6 +290,11 @@ async fn bedrock_serves_claude_code_pi_and_codex_paths() {
         row.try_get::<String>("", "protocol").unwrap(),
         "bedrock_converse"
     );
+    assert_eq!(
+        row.try_get::<String>("", "resolved_model").unwrap(),
+        "eu.anthropic.claude-sonnet-4-6-v1:0",
+        "Converse names no model, so the requested one stands in"
+    );
     assert_eq!(row.try_get::<i64>("", "input_tokens").unwrap(), 20);
     assert_eq!(row.try_get::<i64>("", "cache_read_tokens").unwrap(), 6);
     assert_eq!(row.try_get::<i64>("", "output_tokens").unwrap(), 3);
@@ -296,6 +319,80 @@ async fn bedrock_serves_claude_code_pi_and_codex_paths() {
         row.try_get::<String>("", "requested_model").unwrap(),
         "openai.gpt-5.6-sol"
     );
+}
+
+#[tokio::test]
+async fn bedrock_partner_models_are_recorded_and_unknown_calls_are_still_masked() {
+    let mut upstream = upstream(bedrock_reply).await;
+    let (app, database, key) = gateway(ProviderKind::Bedrock {
+        base_url: upstream.origin.clone(),
+    })
+    .await;
+
+    // Partner models: Chat Completions under `/v1`, recorded and restored.
+    let (status, body) = send(
+        &app,
+        &key,
+        "/v1/chat/completions",
+        json!({"model":"zai.glm-4.7","stream":true,"messages":[{"role":"user","content":SECRET}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (path, sent) = upstream.received.recv().await.unwrap();
+    assert_eq!(path, "/v1/chat/completions");
+    assert!(masked_text(&sent).starts_with("AEGIS_MASKED_"));
+    assert!(String::from_utf8(body.to_vec()).unwrap().contains(SECRET));
+    let row = recorded(&database, "/v1/chat/completions").await;
+    assert_eq!(
+        row.try_get::<String>("", "protocol").unwrap(),
+        "openai_chat_completions"
+    );
+    assert_eq!(row.try_get::<i64>("", "input_tokens").unwrap(), 11);
+    assert_eq!(row.try_get::<i64>("", "output_tokens").unwrap(), 3);
+
+    // A call Aegis cannot read usage from is masked all the same, and its
+    // response restored, but it is not recorded.
+    let (status, body) = send(
+        &app,
+        &key,
+        "/model/eu.anthropic.claude-sonnet-4-6-v1%3A0/count-tokens",
+        json!({"messages":[{"role":"user","content":[{"type":"text","text":SECRET}]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, sent) = upstream.received.recv().await.unwrap();
+    assert!(masked_text(&sent).starts_with("AEGIS_MASKED_"));
+    assert!(String::from_utf8(body.to_vec()).unwrap().contains(SECRET));
+
+    // The bypass list: a request without a body goes through untouched.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/providers/cloud/v1/models?filter=unit-secret-123")
+                .header("x-aegis-api-key", &key)
+                .header(header::AUTHORIZATION, "Bearer cloud-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (path, _) = upstream.received.recv().await.unwrap();
+    assert_eq!(path, "/v1/models?filter=unit-secret-123");
+
+    let recorded: i64 = database
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) n FROM gateway_requests",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(recorded, 1, "only the Chat Completions call is recorded");
 }
 
 fn vertex_reply(path: &str, masked: &str) -> Response {

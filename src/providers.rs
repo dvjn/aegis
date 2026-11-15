@@ -11,6 +11,9 @@ pub enum Provider {
     TypeSafe,
     /// Bedrock's Converse API, which pi uses for Bedrock models.
     BedrockConverse,
+    /// OpenAI Chat Completions, which Bedrock and Vertex use to serve partner
+    /// models such as GLM.
+    ChatCompletions,
 }
 
 impl Provider {
@@ -21,6 +24,7 @@ impl Provider {
             Self::Gemini => "google_gemini",
             Self::TypeSafe => "typesafe_systemone",
             Self::BedrockConverse => "bedrock_converse",
+            Self::ChatCompletions => "openai_chat_completions",
         }
     }
 }
@@ -111,6 +115,24 @@ fn usage_from(provider: Provider, value: &Value) -> Usage {
                 cache_write_tokens: None,
                 reasoning_tokens: value
                     .get("output_tokens_details")
+                    .and_then(|details| integer(details, "reasoning_tokens")),
+                raw_json: serde_json::to_string(value).ok(),
+            }
+        }
+        // Like the Responses API, Chat Completions counts cached tokens inside
+        // the prompt total, so they are subtracted to keep the columns disjoint.
+        Provider::ChatCompletions => {
+            let cache_read_tokens = value
+                .get("prompt_tokens_details")
+                .and_then(|details| integer(details, "cached_tokens"));
+            Usage {
+                input_tokens: integer(value, "prompt_tokens")
+                    .map(|total| (total - cache_read_tokens.unwrap_or(0)).max(0)),
+                output_tokens: integer(value, "completion_tokens"),
+                cache_read_tokens,
+                cache_write_tokens: None,
+                reasoning_tokens: value
+                    .get("completion_tokens_details")
                     .and_then(|details| integer(details, "reasoning_tokens")),
                 raw_json: serde_json::to_string(value).ok(),
             }
@@ -505,5 +527,22 @@ data: {"type":"response.completed","response":{"model":"gpt-5.6-luna","usage":{"
         let usage = extract_usage(Provider::Codex, body);
         let raw: Value = serde_json::from_str(&usage.raw_json.unwrap()).unwrap();
         assert_eq!(raw["input_tokens"], 1000);
+    }
+
+    #[test]
+    fn chat_completion_streams_report_the_final_usage_chunk() {
+        let body = br#"data: {"object":"chat.completion.chunk","model":"zai.glm-4.7","choices":[{"index":0,"delta":{"content":"OK"}}]}
+
+data: {"object":"chat.completion.chunk","model":"zai.glm-4.7","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens_details":{"reasoning_tokens":3}}}
+
+data: [DONE]
+
+"#;
+        let completion = extract_completion(Provider::ChatCompletions, body);
+        assert_eq!(completion.model.as_deref(), Some("zai.glm-4.7"));
+        assert_eq!(completion.usage.input_tokens, Some(60));
+        assert_eq!(completion.usage.cache_read_tokens, Some(40));
+        assert_eq!(completion.usage.output_tokens, Some(7));
+        assert_eq!(completion.usage.reasoning_tokens, Some(3));
     }
 }

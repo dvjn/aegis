@@ -136,7 +136,9 @@ With `AEGIS_API_KEY` set, route pi's built-in providers in `~/.pi/agent/models.j
 }
 ```
 
-Requests, usage and guardrails work as for other providers. Usage records the model named in the request path, and cloud model IDs such as `eu.anthropic.claude-sonnet-4-6-v1:0` are priced as their plain model.
+Requests, usage and guardrails work as for other providers. Usage records the model named in the request path, or in the body, and uses it as the resolved model when the response names none, as with Converse. Cloud model IDs such as `eu.anthropic.claude-sonnet-4-6-v1:0`, `zai.glm-4.7` or `claude-haiku-4-5@20251001` are priced from the cloud's own prices.
+
+Claude Code runs Claude models only, and Codex only models served over the Responses API: OpenAI models on Bedrock and Vertex. pi on Bedrock reaches every Bedrock model through Converse. Partner models are also served over Chat Completions, on Bedrock under `/providers/<id>/v1` and on Vertex under `/providers/<id>/v1/projects/<project>/locations/<location>/endpoints/openapi`, for clients that speak it.
 
 ## TypeSafe
 

@@ -60,8 +60,8 @@ A provider has an ID, a type, and an optional upstream base URL. Clients send re
 
 - IDs contain only letters, digits, `-` or `_`, up to 64 characters. A user's provider cannot reuse an instance provider's ID, and an instance provider cannot take an ID a user already has.
 - Types: `claude_subscription`, `codex_subscription`, `typesafe`, `bedrock`, `vertex`. Each type has a default upstream.
-- `bedrock` is Amazon Bedrock in one region, set with the **Region** field or `--region` (default `us-east-1`). It serves Claude Code (InvokeModel), pi (Converse) and Codex (Bedrock's OpenAI-compatible Responses endpoint). Clients must authenticate with a [Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) in `AWS_BEARER_TOKEN_BEDROCK`: AWS credentials that sign requests cover the host and body, which Aegis changes, so Bedrock rejects them.
-- `vertex` is Google Vertex AI. Each request goes to the Google host for the location in its path, so one provider serves every project and location the client's own Google credentials can reach. It serves Claude Code (Anthropic models), Codex (OpenAI models) and pi (Gemini and other models).
+- `bedrock` is Amazon Bedrock in one region, set with the **Region** field or `--region` (default `us-east-1`). It serves InvokeModel (Claude Code) and Converse (pi, any Bedrock model) on the runtime endpoint, and Bedrock's OpenAI-compatible endpoint: Responses for OpenAI models under `/openai/v1` (Codex), Anthropic Messages for Claude under `/anthropic/v1`, and Chat Completions for partner models such as GLM under `/v1`. Clients must authenticate with a [Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) in `AWS_BEARER_TOKEN_BEDROCK`: AWS credentials that sign requests cover the host and body, which Aegis changes, so Bedrock rejects them.
+- `vertex` is Google Vertex AI. Each request goes to the Google host for the location in its path, so one provider serves every project and location the client's own Google credentials can reach. It serves Anthropic models (Claude Code), OpenAI models over Responses (Codex), Gemini (pi), and partner models such as GLM over its OpenAI-compatible Chat Completions endpoint.
 - The ID and type cannot change after creation, because client URLs and usage history refer to them. Only the upstream can be edited.
 - Deleting a provider removes it from every API key that was granted it. Usage history stays.
 - Deleting an instance provider that users' active API keys use offers two choices: **Delete for everyone**, or **Keep for users**, which gives each of those users a copy of their own with the same ID, type and upstream, then removes it from the instance. Their keys keep working, and they can edit or delete their copy. Other users lose access.
@@ -80,6 +80,8 @@ aegis provider remove work
 ### Guardrails
 
 Guardrails scan request bodies before they reach a provider. Each layer turns on secret detection (built-in detectors) and custom regex patterns, and chooses a mode: `observe` records matches; `mask` replaces them before forwarding and restores them in the response.
+
+Every request to a provider is scanned except `GET`, `HEAD` and `OPTIONS` requests, which carry no body, such as model listings. That includes calls in a format Aegis does not record, such as token counts: they are masked and restored but do not appear in usage.
 
 The instance layer is a minimum that users can only add to. On a user's request, a layer that is on stays on, `mask` wins over `observe`, and the detectors and patterns of both layers run. A user's pattern cannot reuse the name of an instance pattern. The **Guardrails** page has a test box that shows what the saved settings would find in a sample.
 

@@ -63,8 +63,9 @@ fn begins_with_segments(path: &str, prefix: &str) -> bool {
 /// One request's destination.
 pub(crate) struct Route {
     pub url: String,
-    /// The format of a model request. `None` is any other call, such as a
-    /// model listing or token count, which is forwarded but not recorded.
+    /// The format of a model request, which is recorded with its usage.
+    /// `None` is any other call, such as a token count: it is still masked
+    /// unless the gateway's bypass list lets it through, but not recorded.
     pub protocol: Option<Provider>,
     /// The model a path names, for formats that keep it out of the body.
     pub model: Option<String>,
@@ -80,10 +81,17 @@ impl ProviderTarget {
                 model: None,
             },
             Upstream::Bedrock { runtime, openai } => {
-                if bare.starts_with("/openai/") {
+                // Bedrock's OpenAI-compatible host serves one API per prefix:
+                // Responses for OpenAI models under `/openai/v1`, Anthropic
+                // Messages for Claude under `/anthropic/v1`, and Chat
+                // Completions for partner models under `/v1`.
+                if ["/openai/", "/anthropic/", "/v1/"]
+                    .iter()
+                    .any(|prefix| bare.starts_with(prefix))
+                {
                     return Route {
                         url: openai.url(path),
-                        protocol: bare.ends_with("/responses").then_some(Provider::Codex),
+                        protocol: openai_compatible(bare),
                         model: None,
                     };
                 }
@@ -114,8 +122,10 @@ impl ProviderTarget {
                 let counting = model.as_deref() == Some("count-tokens");
                 let protocol = if counting {
                     None
-                } else if bare.contains("/publishers/openai/") {
-                    bare.ends_with("/responses").then_some(Provider::Codex)
+                } else if bare.contains("/publishers/openai/")
+                    || bare.contains("/endpoints/openapi/")
+                {
+                    openai_compatible(bare)
                 } else {
                     match method {
                         Some("rawPredict" | "streamRawPredict")
@@ -134,6 +144,20 @@ impl ProviderTarget {
                 }
             }
         }
+    }
+}
+
+/// The format of a call to an OpenAI- or Anthropic-compatible API, by its
+/// final path segments.
+fn openai_compatible(path: &str) -> Option<Provider> {
+    if path.ends_with("/responses") {
+        Some(Provider::Codex)
+    } else if path.ends_with("/chat/completions") {
+        Some(Provider::ChatCompletions)
+    } else if path.ends_with("/messages") {
+        Some(Provider::Anthropic)
+    } else {
+        None
     }
 }
 
@@ -225,7 +249,29 @@ mod tests {
         );
         assert_eq!(codex.protocol, Some(Provider::Codex));
 
+        let partner = target.route("/v1/chat/completions");
+        assert_eq!(
+            partner.url,
+            "https://bedrock-mantle.eu-west-1.api.aws/v1/chat/completions"
+        );
+        assert_eq!(partner.protocol, Some(Provider::ChatCompletions));
+
+        let messages = target.route("/anthropic/v1/messages");
+        assert_eq!(
+            messages.url,
+            "https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1/messages"
+        );
+        assert_eq!(messages.protocol, Some(Provider::Anthropic));
+        assert_eq!(
+            target.route("/anthropic/v1/messages/count_tokens").protocol,
+            None
+        );
+
         assert_eq!(target.route("/openai/v1/models").protocol, None);
+        assert_eq!(
+            target.route("/v1/models").url,
+            "https://bedrock-mantle.eu-west-1.api.aws/v1/models"
+        );
         assert_eq!(target.route("/model/x/count-tokens").protocol, None);
 
         let custom = bedrock("https://vpce.example.com/bedrock");
@@ -259,6 +305,15 @@ mod tests {
 
         let codex = target.route("/v1/projects/p/locations/global/publishers/openai/v1/responses");
         assert_eq!(codex.protocol, Some(Provider::Codex));
+
+        let partner =
+            target.route("/v1/projects/p/locations/us-central1/endpoints/openapi/chat/completions");
+        assert!(
+            partner
+                .url
+                .starts_with("https://us-central1-aiplatform.googleapis.com/v1/")
+        );
+        assert_eq!(partner.protocol, Some(Provider::ChatCompletions));
 
         let gemini = target.route(
             "/v1/projects/p/locations/eu/publishers/google/models/gemini-3-pro:streamGenerateContent?alt=sse",
