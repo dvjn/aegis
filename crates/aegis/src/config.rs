@@ -557,7 +557,7 @@ pub fn default_vertex_base_url() -> String {
 }
 
 fn default_pricing_url() -> String {
-    "https://raw.githubusercontent.com/dvjn/aegis/main/src/pricing/model_prices.json".into()
+    "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json".into()
 }
 
 fn default_pricing_refresh_hours() -> u64 {
@@ -725,7 +725,7 @@ mod tests {
         let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
         assert_eq!(
             config.pricing.url,
-            "https://raw.githubusercontent.com/dvjn/aegis/main/src/pricing/model_prices.json"
+            "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json"
         );
         assert_eq!(config.pricing.refresh_hours, 12);
         assert!(config.pricing.enabled);

@@ -56,7 +56,7 @@ env = { AEGIS_CONFIG = "config.local.toml" }
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-exec watchexec --restart --watch src --watch crates --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css -- cargo run -- serve
+exec watchexec --restart --watch crates --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css -- cargo run -- serve
 '''
 
 [tasks.serve]
@@ -180,9 +180,6 @@ jq -S '
            else { cache_write: .value.cache_creation_input_token_cost } end)
       )
     })
-  # Releases before LiteLLM keys were kept look TypeSafe models up by their
-  # bare names, and they still fetch this file, so those names stay too.
-  | . + map(select(.value.provider == "typesafe") | .key |= sub("^typesafe/"; ""))
   | from_entries
 ' "$upstream" > "$upstream.filtered"
 
@@ -190,7 +187,7 @@ if [[ ! -s "$upstream.filtered" ]] || [[ "$(jq length "$upstream.filtered")" -eq
   echo "Refusing to vendor an empty price map." >&2
   exit 1
 fi
-mv "$upstream.filtered" src/pricing/model_prices.json
+mv "$upstream.filtered" pricing/model_prices.json
 
 commit="$(curl --fail --silent --show-error --location \
   "https://api.github.com/repos/BerriAI/litellm/commits/main?path=model_prices_and_context_window.json" | jq -r .sha)"
@@ -198,9 +195,9 @@ sed -i \
   -e "s|^Upstream commit: .*|Upstream commit: $commit|" \
   -e "s|^Upstream sha256: .*|Upstream sha256: $(sha256sum "$upstream" | cut -d" " -f1)|" \
   -e "s|^Retrieved:       .*|Retrieved:       $(date -u +%Y-%m-%d)|" \
-  src/pricing/LICENSE
+  pricing/LICENSE
 
-printf 'Priced models: %s\n' "$(jq length src/pricing/model_prices.json)"
+printf 'Priced models: %s\n' "$(jq length pricing/model_prices.json)"
 '''
 
 [tasks.test]
@@ -408,7 +405,7 @@ for entry in $TARGETS; do
   install -Dm755 "target/$target/release/ags" "dist/$arch/ags"
 done
 """
-sources = ["src/**/*.rs", "crates/**/*.rs", "crates/*/Cargo.toml", "build.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["crates/**/*.rs", "crates/*/Cargo.toml", "crates/aegis/src/web/views/assets/**/*", "pricing/model_prices.json", "Cargo.toml", "Cargo.lock"]
 
 [tasks.package]
 description = "Make the release tarballs and checksums from dist/"

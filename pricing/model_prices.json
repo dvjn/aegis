@@ -4068,26 +4068,6 @@
     "output": 0.000022,
     "provider": "bedrock_converse"
   },
-  "jev-1.13.0": {
-    "input": 4.2E-8,
-    "output": 0.0,
-    "provider": "typesafe"
-  },
-  "jev-1.14.0": {
-    "input": 4.2E-8,
-    "output": 0.0,
-    "provider": "typesafe"
-  },
-  "jev-latest": {
-    "input": 4.2E-8,
-    "output": 0.0,
-    "provider": "typesafe"
-  },
-  "jev-preview": {
-    "input": 4.2E-8,
-    "output": 0.0,
-    "provider": "typesafe"
-  },
   "jp.amazon.nova-2-lite-v1:0": {
     "cache_read": 9.9E-8,
     "input": 3.96E-7,

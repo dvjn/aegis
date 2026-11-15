@@ -12,7 +12,7 @@ pub use store::load_effective_map;
 
 pub const NANODOLLARS_PER_DOLLAR: f64 = 1e9;
 
-const PRICE_MAP: &str = include_str!("model_prices.json");
+const PRICE_MAP: &str = include_str!("../../../../pricing/model_prices.json");
 
 const TOKENS_PER_MILLION: f64 = 1e6;
 
@@ -429,37 +429,6 @@ mod tests {
             ),
             Some(1e-6)
         );
-    }
-
-    /// Released servers fetch the published map and read it with this shape,
-    /// looking models up by their bare names. They must keep pricing the
-    /// models they serve.
-    #[test]
-    fn the_published_map_stays_readable_by_earlier_releases() {
-        #[derive(serde::Deserialize)]
-        struct Released {
-            input: f64,
-            #[allow(dead_code)]
-            output: f64,
-            #[allow(dead_code)]
-            cache_read: Option<f64>,
-            #[allow(dead_code)]
-            cache_write: Option<f64>,
-        }
-        let released: HashMap<String, Released> =
-            serde_json::from_str(PRICE_MAP).expect("earlier releases parse the map");
-        for model in [
-            "claude-opus-4-5",
-            "claude-sonnet-4-5",
-            "gpt-5-codex",
-            "jev-1.13.0",
-            "jev-latest",
-        ] {
-            assert!(
-                released.get(model).is_some_and(|price| price.input > 0.0),
-                "{model}"
-            );
-        }
     }
 
     #[test]

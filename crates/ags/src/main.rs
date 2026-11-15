@@ -44,13 +44,20 @@ mod tests {
     fn shares_one_version_with_the_server_and_the_wire_contract() {
         let root: toml::Table = include_str!("../../../Cargo.toml")
             .parse()
-            .expect("the root manifest parses");
-        let server_version = root["package"]["version"]
+            .expect("the workspace manifest parses");
+        let workspace_version = root["workspace"]["package"]["version"]
             .as_str()
-            .expect("the server states its version");
+            .expect("the workspace states its version");
+        let server: toml::Table = include_str!("../../aegis/Cargo.toml")
+            .parse()
+            .expect("the server manifest parses");
 
-        assert_eq!(AGS_VERSION, server_version);
-        assert_eq!(aegis_wire::VERSION, server_version);
+        assert_eq!(AGS_VERSION, workspace_version);
+        assert_eq!(aegis_wire::VERSION, workspace_version);
+        assert_eq!(
+            server["package"]["version"]["workspace"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

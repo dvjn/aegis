@@ -33,7 +33,7 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # [pricing]
 # enabled = true # Default: true.
 # refresh_hours = 12 # Default: 12. Must be at least 1.
-# url = "https://raw.githubusercontent.com/dvjn/aegis/main/src/pricing/model_prices.json" # Default shown. Must use HTTPS.
+# url = "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json" # Default shown. Must use HTTPS.
 #
 # Optional. Add one table per local model-price override.
 # [[pricing.overrides]]
