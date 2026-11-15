@@ -161,6 +161,7 @@ pub(crate) mod tests {
                 endpoint: "/v1/messages",
                 requested_model: None,
                 price_scope: None,
+                session_id: None,
                 request_body: body,
             })
             .await

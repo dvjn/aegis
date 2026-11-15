@@ -27,6 +27,7 @@ mod m20260922_000027_resolved_model;
 mod m20261109_000028_relay_keys;
 mod m20261110_000029_gateway_clients;
 mod m20261111_000030_providers;
+mod m20261115_000031_client_sessions;
 
 pub struct Migrator;
 
@@ -61,6 +62,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261109_000028_relay_keys::Migration),
             Box::new(m20261110_000029_gateway_clients::Migration),
             Box::new(m20261111_000030_providers::Migration),
+            Box::new(m20261115_000031_client_sessions::Migration),
         ]
     }
 }

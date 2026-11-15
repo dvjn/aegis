@@ -11,6 +11,9 @@ use crate::{
     telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
 };
 
+mod client_session;
+#[cfg(test)]
+mod client_session_tests;
 #[cfg(test)]
 mod cloud_tests;
 mod http;
@@ -284,6 +287,7 @@ impl Gateway {
                         endpoint,
                         requested_model: model.as_deref(),
                         price_scope: Some(&target.price_scope),
+                        session_id: client_session::client_session_id(provider, &parts.headers),
                         request_body: &body,
                     })
                     .await?;
