@@ -23,14 +23,16 @@ pub fn router(
     origin: OriginPolicy,
     cancellation: CancellationToken,
 ) -> Router {
+    let gateway = gateway.with_machines(domain.oauth().clone(), origin.clone());
     let session = web::SessionState::new(domain.clone(), origin.clone());
     let web_state = web::AppState::new(session.clone(), gateway.clone(), keys, settings, usage);
-    let oauth_state = oauth::State::new(session);
+    let oauth_state = oauth::State::new(session, gateway.clone());
     let mcp_state = mcp::State::new(domain.oauth().clone(), origin);
     let web_and_gateway = Router::new()
         .merge(gateway::router(gateway).layer(access_log::layer!(
             access_log::GATEWAY,
             user_id,
+            client_id,
             key_id,
             provider_id,
             model,

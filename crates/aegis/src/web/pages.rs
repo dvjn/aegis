@@ -2,10 +2,10 @@ use super::{AppState, authenticate, csrf_from_token, error::WebError, new_csrf_v
 use crate::{
     api_keys::{KeyChanges, KeyEditError},
     domain::role_allows_scope,
-    domain::{DomainError, Password, Principal},
+    domain::{ConnectedClient, DomainError, Password, Principal},
     policies::EVALUATION_METADATA_SCOPE,
     usage::Range,
-    web::views::account::{KeyAction, KeyPage},
+    web::views::account::{AppPage, KeyAction, KeyPage},
 };
 use axum::{
     Form,
@@ -892,6 +892,98 @@ pub(super) async fn account_app_revoke(
         .domain
         .oauth()
         .revoke_client_grants(&principal, &issuer, &client_id)
+        .await?;
+    Ok(Redirect::to("/account").into_response())
+}
+
+async fn connected_machine(
+    state: &AppState,
+    headers: &HeaderMap,
+    principal: &Principal,
+    client_id: &str,
+) -> Result<(String, ConnectedClient), WebError> {
+    let issuer = state
+        .origin
+        .effective_origin(headers)
+        .map_err(|()| WebError::forbidden_request())?;
+    let app = state
+        .domain
+        .oauth()
+        .list_connected_clients(principal, &issuer)
+        .await?
+        .into_iter()
+        .find(|app| app.client_id == client_id && app.providers.is_some())
+        .ok_or(DomainError::NotFound)?;
+    Ok((issuer, app))
+}
+
+pub(super) async fn account_app_edit_page(
+    Path(client_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Result<Response, WebError> {
+    let Some((principal, csrf)) = account_principal(&state, &jar).await else {
+        return Ok(to_login());
+    };
+    let (_, app) = connected_machine(&state, &headers, &principal, &client_id).await?;
+    let available = state.gateway.provider_ids(&principal.user_id().to_string());
+    Ok(views::account::app_page(&AppPage {
+        csrf: &csrf,
+        superuser: is_superuser(&principal),
+        app: &app,
+        available: &available,
+        selected: app.providers.as_deref().unwrap_or_default(),
+        error: None,
+    })
+    .into_response())
+}
+
+pub(super) async fn account_app_edit(
+    Path(client_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    RawForm(body): RawForm,
+) -> Result<Response, WebError> {
+    let mut csrf = None;
+    let mut providers = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(&body) {
+        match key.as_ref() {
+            "csrf" => csrf = Some(value.into_owned()),
+            "providers" => providers.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    let csrf = csrf.ok_or(DomainError::InvalidInput("missing CSRF token"))?;
+    csrf_from_token(&state, &csrf, &jar)?;
+    let Ok(principal) = authenticate(&state, &jar, Some(&csrf)).await else {
+        return Ok(to_login());
+    };
+    let (issuer, app) = connected_machine(&state, &headers, &principal, &client_id).await?;
+    let available = state.gateway.provider_ids(&principal.user_id().to_string());
+    let problem = if providers.is_empty() {
+        Some("Select at least one provider.")
+    } else if providers.iter().any(|id| !available.contains(id)) {
+        Some("Select only providers that exist.")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        let page = views::account::app_page(&AppPage {
+            csrf: &csrf,
+            superuser: is_superuser(&principal),
+            app: &app,
+            available: &available,
+            selected: &providers,
+            error: Some(problem),
+        });
+        return Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
+    }
+    state
+        .domain
+        .oauth()
+        .set_machine_providers(&principal, &issuer, &client_id, &providers)
         .await?;
     Ok(Redirect::to("/account").into_response())
 }

@@ -153,8 +153,10 @@ pub(crate) mod tests {
         SqliteSink::new(database.clone())
             .start(StartRecord {
                 request_id: "req-1",
-                key_id: "key-1",
-                key_version_id: "key-version-1",
+                client: crate::telemetry::RequestClient::ApiKey {
+                    id: "key-1",
+                    version_id: "key-version-1",
+                },
                 provider_id: "claude",
                 provider,
                 method: "POST",

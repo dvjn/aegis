@@ -1,6 +1,6 @@
 use super::layout;
 use super::permissions::{
-    account_entry, application_group, detail_row, permission_group, switch_form,
+    account_entry, application_group, detail_row, permission_group, provider_group, switch_form,
 };
 use maud::{Markup, html};
 
@@ -34,6 +34,10 @@ pub struct Consent<'a> {
     pub role: &'a str,
     pub resource: &'a str,
     pub switch_to: &'a str,
+    /// The providers a gateway pairing can be granted; `None` for any other grant.
+    pub providers: Option<&'a [String]>,
+    pub selected: &'a [String],
+    pub error: Option<&'a str>,
 }
 
 pub fn consent(
@@ -47,6 +51,9 @@ pub fn consent(
         role,
         resource,
         switch_to,
+        providers,
+        selected,
+        error,
     }: Consent,
 ) -> Markup {
     layout(
@@ -60,6 +67,7 @@ pub fn consent(
                         p { "Confirm that the code below matches the app or device you are connecting." }
                     }
                     p class="user-code" aria-label="Device code" { (code) }
+                    @if let Some(error) = error { p class="auth-error" role="alert" { (error) } }
                     (account_entry(email))
                     (application_group(html! {
                         (detail_row("Name", html! { strong { (client_name) } }))
@@ -67,6 +75,9 @@ pub fn consent(
                         (detail_row("Resource", html! { code { (resource) } }))
                     }))
                     (permission_group(scope, role))
+                    @if let Some(providers) = providers {
+                        (provider_group(providers, selected))
+                    }
                     div class="consent-actions" {
                         button type="submit" name="decision" value="deny" class="secondary" { "Deny" }
                         button type="submit" name="decision" value="allow" { "Allow" }

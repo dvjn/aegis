@@ -1,6 +1,10 @@
 use crate::{
-    api_keys::{AuthenticationError, KeyStore},
+    api_keys::{
+        API_KEY_HEADER, AuthenticatedKey, AuthenticationError, KeyStore, presented_credential,
+    },
     config::{GuardrailsConfig, ProviderConfig},
+    domain::{DomainError, MachineClient, OAuthService, is_access_token},
+    origin::OriginPolicy,
     policies::{
         Decision, Pipeline, PolicyError, PolicyFailure, RequestContext, restore::StreamRestorer,
     },
@@ -8,7 +12,7 @@ use crate::{
     providers::{Provider, extract_completion, requested_model},
     request_id::RequestId,
     settings::{SettingsStore, StoredProvider},
-    telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
+    telemetry::{CompletionRecord, RequestClient, SqliteSink, StartRecord, timestamp},
 };
 
 mod client_session;
@@ -65,9 +69,41 @@ pub struct Gateway {
     client: reqwest::Client,
     sink: SqliteSink,
     keys: KeyStore,
+    machines: Option<Machines>,
     registry: registry::Registry,
     placeholder_key: [u8; 32],
     max_capture_bytes: usize,
+}
+
+/// Authenticates paired machines, whose tokens are bound to the server's origin.
+#[derive(Clone)]
+struct Machines {
+    oauth: OAuthService,
+    origin: OriginPolicy,
+}
+
+enum Caller {
+    Key(AuthenticatedKey),
+    Machine(MachineClient),
+}
+
+impl Caller {
+    fn user_id(&self) -> &str {
+        match self {
+            Self::Key(key) => &key.user_id,
+            Self::Machine(machine) => &machine.user_id,
+        }
+    }
+
+    fn client(&self) -> RequestClient<'_> {
+        match self {
+            Self::Key(key) => RequestClient::ApiKey {
+                id: &key.id,
+                version_id: &key.version_id,
+            },
+            Self::Machine(machine) => RequestClient::Machine { id: &machine.id },
+        }
+    }
 }
 
 impl Gateway {
@@ -98,10 +134,57 @@ impl Gateway {
             client,
             sink,
             keys,
+            machines: None,
             registry: Arc::new(RwLock::new(Arc::new(snapshot))),
             placeholder_key,
             max_capture_bytes,
         })
+    }
+
+    /// Also accepts the access token of a paired machine where an API key goes.
+    pub fn with_machines(mut self, oauth: OAuthService, origin: OriginPolicy) -> Self {
+        self.machines = Some(Machines { oauth, origin });
+        self
+    }
+
+    async fn authenticate(
+        &self,
+        headers: &mut HeaderMap,
+        provider_id: &str,
+    ) -> Result<Caller, AuthenticationError> {
+        let token = headers
+            .get(&API_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(presented_credential)
+            .filter(|value| is_access_token(value))
+            .map(str::to_owned);
+        let (Some(token), Some(machines)) = (token, &self.machines) else {
+            return self
+                .keys
+                .authenticate(headers, provider_id)
+                .await
+                .map(Caller::Key);
+        };
+        headers.remove(&API_KEY_HEADER);
+        let issuer = machines
+            .origin
+            .effective_origin(headers)
+            .map_err(|()| AuthenticationError::InvalidToken)?;
+        match machines
+            .oauth
+            .authenticate_machine(&token, &issuer, provider_id)
+            .await
+        {
+            Ok(machine) => Ok(Caller::Machine(machine)),
+            Err(DomainError::Forbidden) => Err(AuthenticationError::ProviderNotAllowed(
+                provider_id.to_owned(),
+            )),
+            Err(DomainError::Internal(error)) => Err(AuthenticationError::Backend(error)),
+            Err(DomainError::TemporarilyUnavailable) => Err(AuthenticationError::Backend(
+                sea_orm::DbErr::Custom("database busy".into()),
+            )),
+            Err(_) => Err(AuthenticationError::InvalidToken),
+        }
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -189,19 +272,15 @@ impl Gateway {
             .unwrap_or("unknown")
             .to_owned();
         let (mut parts, body) = request.into_parts();
-        let authenticated = match self
-            .keys
-            .authenticate(&mut parts.headers, provider_id)
-            .await
-        {
-            Ok(key) => key,
+        let authenticated = match self.authenticate(&mut parts.headers, provider_id).await {
+            Ok(caller) => caller,
             Err(error) => return Ok(authentication_error(error)),
         };
         // Another user's provider with this ID is not this user's to reach.
-        let Some(target) = snapshot.resolve(&authenticated.user_id, provider_id) else {
+        let Some(target) = snapshot.resolve(authenticated.user_id(), provider_id) else {
             return Ok(provider_not_found());
         };
-        let policies = snapshot.pipeline(&authenticated.user_id, self.placeholder_key);
+        let policies = snapshot.pipeline(authenticated.user_id(), self.placeholder_key);
         let endpoint = parts
             .uri
             .path_and_query()
@@ -267,8 +346,14 @@ impl Gateway {
             .unwrap_or(parts.uri.path());
         let upstream_url = route.url;
         let span = tracing::Span::current();
-        span.record("user_id", tracing::field::display(&authenticated.user_id));
-        span.record("key_id", tracing::field::display(&authenticated.id));
+        span.record("user_id", tracing::field::display(authenticated.user_id()));
+        span.record(
+            "client_id",
+            tracing::field::display(authenticated.client().id()),
+        );
+        if let RequestClient::ApiKey { id, .. } = authenticated.client() {
+            span.record("key_id", tracing::field::display(id));
+        }
         span.record("provider_id", tracing::field::display(provider_id));
         if let Some(model) = model.as_deref() {
             span.record("model", tracing::field::display(model));
@@ -279,8 +364,7 @@ impl Gateway {
                     .sink
                     .start(StartRecord {
                         request_id: &request_id,
-                        key_id: &authenticated.id,
-                        key_version_id: &authenticated.version_id,
+                        client: authenticated.client(),
                         provider_id,
                         provider,
                         method: parts.method.as_str(),
@@ -522,7 +606,9 @@ fn provider_not_found() -> Response {
 fn authentication_error(error: AuthenticationError) -> Response {
     let status = match error {
         AuthenticationError::ProviderNotAllowed(_) => StatusCode::FORBIDDEN,
-        AuthenticationError::Missing | AuthenticationError::Invalid => StatusCode::UNAUTHORIZED,
+        AuthenticationError::Missing
+        | AuthenticationError::Invalid
+        | AuthenticationError::InvalidToken => StatusCode::UNAUTHORIZED,
         AuthenticationError::Backend(ref backend) => {
             tracing::error!(error = %backend, "API key validation failed");
             StatusCode::INTERNAL_SERVER_ERROR

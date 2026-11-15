@@ -9,10 +9,10 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{
-    GrantContext, IssuedAccessToken, OAuthConfig, OAuthService, add_duration, keep_earliest,
-    new_opaque_value, parse_opaque_value, parse_stored_date, pkce_challenge, scope_is_subset,
-    validate_client_id, validate_code_verifier, validate_issuer, validate_redirect_uri,
-    validate_resource, validate_scope,
+    GATEWAY_SCOPE, GrantContext, IssuedAccessToken, OAuthConfig, OAuthService, add_duration,
+    keep_earliest, new_opaque_value, parse_opaque_value, parse_stored_date, pkce_challenge,
+    scope_allows, scope_fits_resource, scope_is_subset, validate_client_id, validate_code_verifier,
+    validate_issuer, validate_redirect_uri, validate_resource, validate_scope,
 };
 use crate::domain::{
     auth::Identity,
@@ -75,7 +75,11 @@ impl OAuthService {
         let (client, registered_redirect_uri) = self
             .find_authorization_client(request.client_id, request.issuer, request.redirect_uri)
             .await?;
-        if !scope_is_subset(&scope, client.scope()) {
+        // Only the device flow pairs a machine with the gateway.
+        if !scope_is_subset(&scope, client.scope())
+            || scope_allows(&scope, GATEWAY_SCOPE)
+            || !scope_fits_resource(&scope, request.issuer, request.resource)
+        {
             return Err(DomainError::InvalidInput("invalid scope"));
         }
         let verified = users::Entity::find_by_id(request.identity.user_id.to_string())

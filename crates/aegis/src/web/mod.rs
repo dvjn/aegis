@@ -202,6 +202,10 @@ pub fn auth_router(state: AppState) -> Router {
                 post(pages::account_session_revoke),
             )
             .route(
+                "/account/apps/{client_id}/edit",
+                get(pages::account_app_edit_page).post(pages::account_app_edit),
+            )
+            .route(
                 "/account/apps/{client_id}/revoke",
                 post(pages::account_app_revoke),
             )
@@ -217,6 +221,7 @@ fn router(state: AppState) -> Router {
         .merge(auth_router(state.clone()))
         .merge(crate::oauth::router(crate::oauth::State::new(
             state.session.clone(),
+            state.gateway.clone(),
         )))
         .merge(asset_router())
         .merge(crate::health::router(state.domain.clone()))
@@ -840,6 +845,13 @@ mod tests {
     }
 
     async fn application_parts(origin: OriginPolicy) -> (Router, Arc<Domain>) {
+        application_with_providers(origin, vec![]).await
+    }
+
+    async fn application_with_providers(
+        origin: OriginPolicy,
+        providers: Vec<crate::config::ProviderConfig>,
+    ) -> (Router, Arc<Domain>) {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let domain = Arc::new(
@@ -879,7 +891,7 @@ mod tests {
             keys.clone(),
             Default::default(),
             [0; 32],
-            vec![],
+            providers,
             1024,
         )
         .unwrap();
@@ -3303,5 +3315,241 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repeated.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn text_body(response: Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_machine_pairs_with_the_providers_chosen_on_approval_and_unpairs_itself() {
+        let provider = |id: &str| crate::config::ProviderConfig {
+            id: id.into(),
+            kind: crate::config::ProviderKind::ClaudeSubscription {
+                base_url: "https://upstream.invalid".into(),
+            },
+        };
+        let (app, _) = application_with_providers(
+            OriginPolicy::new(Some("https://127.0.0.1:3000".into())),
+            vec![provider("claude"), provider("codex")],
+        )
+        .await;
+        let host = "127.0.0.1:3000";
+        let gateway = "https://127.0.0.1:3000/providers";
+        let form = |path: &str, body: String| {
+            Request::post(path)
+                .header(header::HOST, host)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let registration = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/register")
+                    .header(header::HOST, host)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"client_name":"ags on laptop","grant_types":["{}","refresh_token"],"response_types":[],"scope":"gateway:use offline_access","application_type":"native"}}"#,
+                        crate::domain::DEVICE_GRANT_TYPE
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registration.status(), StatusCode::CREATED);
+        let client_id = json_body(registration).await["client_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let device_request = |resource: &str| {
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("client_id", &client_id)
+                .append_pair("resource", resource)
+                .finish()
+        };
+        let wrong_resource = app
+            .clone()
+            .oneshot(form(
+                "/oauth/device_authorization",
+                device_request("https://127.0.0.1:3000/mcp"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_body(wrong_resource).await["error"], "invalid_scope");
+        let issued = app
+            .clone()
+            .oneshot(form("/oauth/device_authorization", device_request(gateway)))
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let issued = json_body(issued).await;
+        let device_code = issued["device_code"].as_str().unwrap().to_owned();
+        let page = url::Url::parse(issued["verification_uri_complete"].as_str().unwrap()).unwrap()
+            [url::Position::BeforePath..]
+            .to_owned();
+
+        let (cookies, csrf) = sign_in(&app, host, "admin@example.com", "correct passw0rd!").await;
+        let consent = app
+            .clone()
+            .oneshot(
+                Request::get(&page)
+                    .header(header::HOST, host)
+                    .header(header::COOKIE, &cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let consent = text_body(consent).await;
+        for text in [
+            "ags on laptop",
+            "Send requests to the selected providers",
+            r#"name="providers" value="claude" checked"#,
+            r#"name="providers" value="codex" checked"#,
+        ] {
+            assert!(consent.contains(text), "the approval page lacks {text}");
+        }
+
+        let decide = |providers: &[&str]| {
+            let mut body = url::form_urlencoded::Serializer::new(String::new());
+            body.append_pair("csrf", &csrf)
+                .append_pair("decision", "allow");
+            for provider in providers {
+                body.append_pair("providers", provider);
+            }
+            form_post(&page, host, &cookies, body.finish())
+        };
+        let none = app.clone().oneshot(decide(&[])).await.unwrap();
+        assert_eq!(none.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            text_body(none)
+                .await
+                .contains("Select at least one provider.")
+        );
+        let unknown = app.clone().oneshot(decide(&["other"])).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let approved = app.clone().oneshot(decide(&["claude"])).await.unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+
+        let token = app
+            .clone()
+            .oneshot(form(
+                "/oauth/token",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("grant_type", crate::domain::DEVICE_GRANT_TYPE)
+                    .append_pair("client_id", &client_id)
+                    .append_pair("device_code", &device_code)
+                    .append_pair("resource", gateway)
+                    .finish(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(token.status(), StatusCode::OK);
+        let token = json_body(token).await;
+        assert_eq!(token["scope"], "gateway:use offline_access");
+        let refreshed = app
+            .clone()
+            .oneshot(form(
+                "/oauth/token",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("grant_type", "refresh_token")
+                    .append_pair("client_id", &client_id)
+                    .append_pair("refresh_token", token["refresh_token"].as_str().unwrap())
+                    .append_pair("resource", gateway)
+                    .finish(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let access_token = json_body(refreshed).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let machine = |method: &str| {
+            Request::builder()
+                .method(method)
+                .uri(aegis_wire::MACHINE_PATH)
+                .header(header::HOST, host)
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let status = app.clone().oneshot(machine("GET")).await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(status).await,
+            serde_json::json!({
+                "account": "admin@example.com",
+                "name": "ags on laptop",
+                "providers": ["claude"],
+            })
+        );
+
+        let (_, _, account) = get_account(&app, host, &cookies).await;
+        assert!(account.contains("ags on laptop"));
+        assert!(account.contains(&format!(r#"href="/account/apps/{client_id}/edit""#)));
+        let edit = format!("/account/apps/{client_id}/edit");
+        let edit_page = app
+            .clone()
+            .oneshot(
+                Request::get(&edit)
+                    .header(header::HOST, host)
+                    .header(header::COOKIE, &cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edit_page.status(), StatusCode::OK);
+        assert!(
+            text_body(edit_page)
+                .await
+                .contains(r#"value="claude" checked"#)
+        );
+        let saved = app
+            .clone()
+            .oneshot(form_post(
+                &edit,
+                host,
+                &cookies,
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("csrf", &csrf)
+                    .append_pair("providers", "codex")
+                    .append_pair("providers", "claude")
+                    .finish(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        let status = app.clone().oneshot(machine("GET")).await.unwrap();
+        assert_eq!(
+            json_body(status).await["providers"],
+            serde_json::json!(["claude", "codex"])
+        );
+
+        let unpaired = app.clone().oneshot(machine("DELETE")).await.unwrap();
+        assert_eq!(unpaired.status(), StatusCode::NO_CONTENT);
+        let after = app.clone().oneshot(machine("GET")).await.unwrap();
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        let (_, _, account) = get_account(&app, host, &cookies).await;
+        assert!(!account.contains("ags on laptop"));
     }
 }

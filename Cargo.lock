@@ -12,6 +12,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "aegis"
 version = "0.11.0"
 dependencies = [
+ "aegis-wire",
+ "ags",
  "anyhow",
  "argon2",
  "async-trait",
@@ -64,14 +66,26 @@ dependencies = [
 [[package]]
 name = "aegis-wire"
 version = "0.11.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "ags"
 version = "0.11.0"
 dependencies = [
  "aegis-wire",
+ "anyhow",
  "clap",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -2527,6 +2541,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

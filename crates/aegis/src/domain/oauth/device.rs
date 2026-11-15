@@ -8,8 +8,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     DEVICE_GRANT_TYPE, GrantContext, IssuedAccessToken, OAuthConfig, OAuthService, add_duration,
-    parse_opaque_value, parse_stored_date, scope_is_subset, validate_client_id, validate_issuer,
-    validate_resource, validate_scope,
+    gateway_resource, parse_opaque_value, parse_stored_date, scope_fits_resource, scope_is_subset,
+    validate_client_id, validate_issuer, validate_resource, validate_scope,
 };
 use crate::domain::{
     auth::Identity,
@@ -67,6 +67,8 @@ pub struct DeviceAuthorization {
     pub client_name: Option<String>,
     pub resource: String,
     pub scope: String,
+    /// Approving it pairs a machine with the gateway, for providers chosen at approval.
+    pub gateway: bool,
 }
 
 pub struct DeviceTokenRequest<'a> {
@@ -102,7 +104,9 @@ impl OAuthService {
         }
         let scope = request.scope.unwrap_or_else(|| client.scope());
         validate_scope(scope)?;
-        if !scope_is_subset(scope, client.scope()) {
+        if !scope_is_subset(scope, client.scope())
+            || !scope_fits_resource(scope, request.issuer, request.resource)
+        {
             return Err(DomainError::InvalidInput("invalid scope"));
         }
         let (id, selector, secret, device_code) = super::new_opaque_value(DEVICE_CODE_PREFIX);
@@ -198,6 +202,7 @@ impl OAuthService {
             last_poll_at: Set(None),
             decision_at: Set(None),
             consumed_at: Set(None),
+            providers: Set(None),
         }
         .insert(&tx)
         .await?;
@@ -239,6 +244,7 @@ impl OAuthService {
         }
         Ok(DeviceAuthorization {
             user_code: format_user_code(&normalized),
+            gateway: row.resource == gateway_resource(&row.issuer),
             client_id: row.client_id,
             client_name: client.client_name().map(str::to_owned),
             resource: row.resource,
@@ -246,11 +252,13 @@ impl OAuthService {
         })
     }
 
+    /// Denies when `granted_scope` is `None`; only a gateway pairing is approved with `providers`.
     pub async fn decide_device_authorization(
         &self,
         user_code: &str,
         identity: &Identity,
         granted_scope: Option<&str>,
+        providers: Option<&[String]>,
     ) -> Result<(), DomainError> {
         let approve = granted_scope.is_some();
         let normalized =
@@ -285,12 +293,28 @@ impl OAuthService {
         let granted_scope = match granted_scope {
             Some(requested) => {
                 let granted = super::normalize_scope(&super::consent_scope(requested, &user.role));
-                if !scope_is_subset(&granted, &row.scope) {
+                if !scope_is_subset(&granted, &row.scope)
+                    || !scope_fits_resource(&granted, &row.issuer, &row.resource)
+                {
                     return Err(DomainError::InvalidInput("invalid scope"));
                 }
                 granted
             }
             None => row.scope.clone(),
+        };
+        let gateway = row.resource == gateway_resource(&row.issuer);
+        let providers = match providers.filter(|_| approve) {
+            Some(providers) if gateway => {
+                if providers.is_empty() {
+                    return Err(DomainError::InvalidInput("no providers selected"));
+                }
+                Some(super::machines::provider_list(providers))
+            }
+            None if gateway && approve => {
+                return Err(DomainError::InvalidInput("no providers selected"));
+            }
+            Some(_) => return Err(DomainError::InvalidInput("invalid providers")),
+            None => None,
         };
         let changed = oauth_device_authorizations::Entity::update_many()
             .col_expr(
@@ -312,6 +336,10 @@ impl OAuthService {
             .col_expr(
                 oauth_device_authorizations::Column::DecisionAt,
                 Expr::value(now.to_rfc3339()),
+            )
+            .col_expr(
+                oauth_device_authorizations::Column::Providers,
+                Expr::value(providers),
             )
             .filter(oauth_device_authorizations::Column::Id.eq(row.id))
             .filter(oauth_device_authorizations::Column::Status.eq("pending"))
@@ -465,6 +493,25 @@ impl OAuthService {
             )
             .await
             .map_err(map_poll_error)?;
+        if let Some(providers) = &row.providers {
+            self.pair_machine(
+                &tx,
+                GrantContext {
+                    user_id: &user_id,
+                    client_id: request.client_id,
+                    issuer: request.issuer,
+                    redirect_uri: None,
+                    resource: &row.resource,
+                    scope: &row.scope,
+                    auth_version,
+                    now,
+                },
+                client.client_name(),
+                providers,
+            )
+            .await
+            .map_err(map_poll_error)?;
+        }
         tx.commit().await.map_err(|e| map_poll_error(e.into()))?;
         Ok(issued)
     }
@@ -573,6 +620,7 @@ mod tests {
                 &issued.user_code().to_ascii_lowercase(),
                 &identity,
                 Some("usage:read offline_access"),
+                None,
             )
             .await
             .unwrap();
@@ -617,7 +665,7 @@ mod tests {
 
         let active = oauth.issue_device_authorization(issue()).await.unwrap();
         oauth
-            .decide_device_authorization(active.user_code(), &identity, Some("usage:read"))
+            .decide_device_authorization(active.user_code(), &identity, Some("usage:read"), None)
             .await
             .unwrap();
         db.execute_unprepared("UPDATE users SET auth_version=auth_version+1")

@@ -14,7 +14,7 @@ use std::{
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-pub const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-aegis-api-key");
+pub const API_KEY_HEADER: HeaderName = HeaderName::from_static(aegis_wire::CREDENTIAL_HEADER);
 const CACHE_TTL: Duration = Duration::from_secs(30);
 const REVOKED_KEY_RETENTION: chrono::TimeDelta = chrono::TimeDelta::days(7);
 const MAX_CACHE_ENTRIES: usize = 1024;
@@ -96,6 +96,8 @@ pub enum AuthenticationError {
     Missing,
     #[error("invalid Aegis API key")]
     Invalid,
+    #[error("invalid or expired Aegis access token")]
+    InvalidToken,
     #[error("this key cannot use provider {0}")]
     ProviderNotAllowed(String),
     #[error("authentication backend failed")]
@@ -229,7 +231,7 @@ impl KeyStore {
             .ok_or(AuthenticationError::Missing)?
             .to_str()
             .ok()
-            .and_then(parse_api_key)
+            .and_then(presented_credential)
             .ok_or(AuthenticationError::Invalid)?
             .to_owned();
         let cache_key: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
@@ -370,7 +372,8 @@ fn normalized_providers(providers: &[String]) -> Result<String> {
     values.dedup();
     Ok(serde_json::to_string(&values)?)
 }
-fn parse_api_key(value: &str) -> Option<&str> {
+/// The credential in the header value: bare, or after a `Bearer` scheme.
+pub fn presented_credential(value: &str) -> Option<&str> {
     if let Some((scheme, credential)) = value.split_once(' ') {
         return (scheme.eq_ignore_ascii_case("bearer") && !credential.is_empty())
             .then_some(credential);

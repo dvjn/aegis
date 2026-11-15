@@ -1,6 +1,7 @@
 mod http;
+mod machine;
 
-use crate::web::SessionState;
+use crate::{gateway::Gateway, web::SessionState};
 use axum::{
     Router, middleware,
     routing::{get, post},
@@ -10,11 +11,13 @@ use std::ops::Deref;
 #[derive(Clone)]
 pub struct State {
     session: SessionState,
+    /// Offers the providers a machine can be granted when it is paired.
+    gateway: Gateway,
 }
 
 impl State {
-    pub fn new(session: SessionState) -> Self {
-        Self { session }
+    pub fn new(session: SessionState, gateway: Gateway) -> Self {
+        Self { session, gateway }
     }
 }
 
@@ -30,7 +33,7 @@ pub fn router(state: State) -> Router {
     crate::web::common(
         Router::new()
             .route(
-                "/.well-known/oauth-authorization-server",
+                aegis_wire::METADATA_PATH,
                 get(http::authorization_server_metadata),
             )
             .route(
@@ -48,6 +51,10 @@ pub fn router(state: State) -> Router {
                 get(http::authorize).post(http::authorize_submit),
             )
             .route("/oauth/token", post(http::token))
+            .route(
+                aegis_wire::MACHINE_PATH,
+                get(machine::machine).delete(machine::unpair),
+            )
             .layer(middleware::map_response(crate::web::auth_no_store))
             .with_state(state),
     )

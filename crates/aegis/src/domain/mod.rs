@@ -19,9 +19,9 @@ pub use mailer::{LogMailer, Mailer, SmtpMailer, SmtpSettings};
 pub use oauth::{
     AuthorizationCodeRedemption, AuthorizationCodeRequest, ClientRegistration, ConnectedClient,
     DEVICE_GRANT_TYPE, DeviceAuthorizationRequest, DevicePollError, DeviceTokenRequest,
-    IssuedAccessToken, OAuthConfig, OAuthService, RefreshTokenRequest, SCOPES,
-    default_registration_scope, granted_scope, normalize_user_code, resource_scopes,
-    role_allows_scope, scope_allows,
+    GATEWAY_SCOPE, IssuedAccessToken, MachineClient, OAuthConfig, OAuthService,
+    RefreshTokenRequest, SCOPES, default_registration_scope, gateway_resource, granted_scope,
+    is_access_token, normalize_user_code, resource_scopes, role_allows_scope, scope_allows,
 };
 pub use secrets::Password;
 

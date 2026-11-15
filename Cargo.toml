@@ -11,6 +11,8 @@ license = "MIT"
 [workspace.dependencies]
 aegis-wire = { path = "crates/aegis-wire" }
 clap = { version = "4.6.6", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 toml = "1.1.4"
 
 [profile.dev]

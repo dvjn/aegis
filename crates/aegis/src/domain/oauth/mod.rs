@@ -2,6 +2,7 @@ mod clients;
 mod codes;
 mod device;
 mod grants;
+mod machines;
 mod refresh;
 mod tokens;
 
@@ -16,6 +17,7 @@ pub use device::{
 };
 pub use grants::ConnectedClient;
 pub(super) use grants::GrantContext;
+pub use machines::MachineClient;
 pub use refresh::RefreshTokenRequest;
 
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
@@ -34,13 +36,15 @@ use zeroize::Zeroize;
 
 use super::{Clock, error::DomainError};
 
-pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+pub const DEVICE_GRANT_TYPE: &str = aegis_wire::DEVICE_GRANT_TYPE;
+pub const GATEWAY_SCOPE: &str = aegis_wire::GATEWAY_SCOPE;
 
-pub const SCOPES: [&str; 5] = [
+pub const SCOPES: [&str; 6] = [
     "usage:read",
     "requests:read",
     "payloads:read",
     "keys:read",
+    GATEWAY_SCOPE,
     "offline_access",
 ];
 
@@ -48,23 +52,46 @@ pub fn role_allows_scope(scope: &str, role: &str) -> bool {
     scope != "payloads:read" || role == "superuser"
 }
 
-pub const OFFLINE_ACCESS: &str = "offline_access";
+pub const OFFLINE_ACCESS: &str = aegis_wire::OFFLINE_ACCESS_SCOPE;
 
+/// The scopes of the MCP resource.
 pub fn resource_scopes() -> Vec<&'static str> {
     SCOPES
         .into_iter()
-        .filter(|scope| *scope != OFFLINE_ACCESS)
+        .filter(|scope| *scope != OFFLINE_ACCESS && *scope != GATEWAY_SCOPE)
         .collect()
 }
 
+/// Gateway access is never a default: a client has to ask for it by name.
 pub fn default_registration_scope(refresh_token_grant: bool) -> String {
     SCOPES
         .into_iter()
+        .filter(|scope| *scope != GATEWAY_SCOPE)
         .filter(|scope| refresh_token_grant || *scope != OFFLINE_ACCESS)
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+pub fn gateway_resource(issuer: &str) -> String {
+    format!("{issuer}{}", aegis_wire::GATEWAY_RESOURCE_PATH)
+}
+
+/// A gateway token never reads account data, and an account-data token never reaches the gateway.
+fn scope_fits_resource(scope: &str, issuer: &str, resource: &str) -> bool {
+    let gateway = resource == gateway_resource(issuer);
+    scope
+        .split(' ')
+        .all(|item| item == OFFLINE_ACCESS || (item == GATEWAY_SCOPE) == gateway)
+        && (!gateway || scope_allows(scope, GATEWAY_SCOPE))
+}
 const TOKEN_PREFIX: &str = "ag_at1";
+
+/// Tells an OAuth access token from an API key by its form, without checking it.
+pub fn is_access_token(value: &str) -> bool {
+    value
+        .strip_prefix(TOKEN_PREFIX)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
 const TOKEN_DOMAIN: &[u8] = b"aegis/oauth-access-token/v1\0";
 const MAX_URI_LEN: usize = 2048;
 const MAX_SCOPE_LEN: usize = 512;
@@ -600,7 +627,11 @@ pub(super) mod tests {
         assert!(validate_scope(&SCOPES.join(" ")).is_ok());
         assert!(validate_scope(&resource_scopes().join(" ")).is_ok());
         assert!(!resource_scopes().contains(&OFFLINE_ACCESS));
-        assert_eq!(default_registration_scope(true), SCOPES.join(" "));
+        assert_eq!(
+            default_registration_scope(true),
+            "usage:read requests:read payloads:read keys:read offline_access"
+        );
+        assert!(!resource_scopes().contains(&GATEWAY_SCOPE));
         assert_eq!(
             default_registration_scope(false),
             resource_scopes().join(" ")
@@ -610,6 +641,36 @@ pub(super) mod tests {
         for token in ["", "ag_ac1.a.b", "ag_at1.a.b.extra", "ag_at1.a.b="] {
             assert!(parse_opaque_value(token, TOKEN_PREFIX).is_err());
         }
+    }
+
+    #[test]
+    fn gateway_access_is_granted_only_for_the_gateway_resource() {
+        let issuer = "https://aegis.example";
+        let gateway = "https://aegis.example/providers";
+        let mcp = "https://aegis.example/mcp";
+        assert!(scope_fits_resource(
+            "gateway:use offline_access",
+            issuer,
+            gateway
+        ));
+        assert!(scope_fits_resource("gateway:use", issuer, gateway));
+        assert!(!scope_fits_resource("offline_access", issuer, gateway));
+        assert!(!scope_fits_resource(
+            "gateway:use usage:read",
+            issuer,
+            gateway
+        ));
+        assert!(!scope_fits_resource("gateway:use", issuer, mcp));
+        assert!(scope_fits_resource(
+            "usage:read offline_access",
+            issuer,
+            mcp
+        ));
+        assert!(!scope_fits_resource(
+            "gateway:use",
+            issuer,
+            "https://other.example/providers"
+        ));
     }
 
     #[test]

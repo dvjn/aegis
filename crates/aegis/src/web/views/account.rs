@@ -297,6 +297,68 @@ pub fn key_page(page: &KeyPage<'_>) -> Markup {
     )
 }
 
+pub struct AppPage<'a> {
+    pub csrf: &'a str,
+    pub superuser: bool,
+    pub app: &'a ConnectedClient,
+    /// Provider IDs the user can grant.
+    pub available: &'a [String],
+    pub selected: &'a [String],
+    pub error: Option<&'a str>,
+}
+
+pub fn app_page(page: &AppPage<'_>) -> Markup {
+    let app = page.app;
+    let name = app.client_name.as_deref().unwrap_or("Unnamed application");
+    let granted = app.providers.as_deref().unwrap_or_default();
+    // A granted provider stays listed even if it can no longer be selected.
+    let mut options: Vec<&String> = page.available.iter().chain(granted).collect();
+    options.sort();
+    options.dedup();
+    layout_with_nav(
+        "Edit connected app · Aegis",
+        Some(signed_in_nav(page.superuser)),
+        html! {
+            main class="account-shell" {
+                div class="page-head" {
+                    h1 class="page-title" { "Edit " (name) }
+                }
+                div class="account-grid" {
+                    div class="account-column" {
+                        article class="auth-card account-card" {
+                            h2 { "Providers" }
+                            p { "Changes apply from the app's next request." }
+                            @if let Some(error) = page.error { p class="auth-error" role="alert" { (error) } }
+                            form method="post" action=(format!("/account/apps/{}/edit", app.client_id)) {
+                                input type="hidden" name="csrf" value=(page.csrf);
+                                fieldset class="field-group" {
+                                    legend { "Providers" }
+                                    div class="checkbox-grid" {
+                                        @for provider in options {
+                                            label class="checkbox-row" {
+                                                input type="checkbox" name="providers" value=(provider)
+                                                    checked[page.selected.contains(provider)];
+                                                span { (provider) }
+                                                @if !page.available.contains(provider) {
+                                                    span class="status-tag" { "Unavailable" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                div class="form-actions" {
+                                    button type="submit" { "Save" }
+                                    a href="/account" role="button" class="secondary" { "Cancel" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
 fn sessions_card(csrf: &str, sessions: &[SessionSummary]) -> Markup {
     html! {
         article class="auth-card account-card" {
@@ -372,7 +434,13 @@ fn apps_card(csrf: &str, apps: &[ConnectedClient]) -> Markup {
                                     (app.client_name.as_deref().unwrap_or("Unnamed application"))
                                     code class="cell-subtitle" { (app.client_id) }
                                 }
-                                td { (super::permissions::scope_chips(&app.scope)) }
+                                td {
+                                    (super::permissions::scope_chips(&app.scope))
+                                    @if let Some(providers) = &app.providers {
+                                        span class="cell-subtitle" { "Providers" }
+                                        (provider_list_chips(providers))
+                                    }
+                                }
                                 td class="cell-moment" { (moment(app.created_at)) }
                                 td class="cell-moment" {
                                     @match app.last_used_at {
@@ -381,10 +449,16 @@ fn apps_card(csrf: &str, apps: &[ConnectedClient]) -> Markup {
                                     }
                                 }
                                 td class="col-actions" {
-                                    form method="post"
-                                        action=(format!("/account/apps/{}/revoke", app.client_id)) {
-                                        input type="hidden" name="csrf" value=(csrf);
-                                        button type="submit" class="secondary compact" { "Disconnect" }
+                                    div class="cell-actions" {
+                                        @if app.providers.is_some() {
+                                            a href=(format!("/account/apps/{}/edit", app.client_id))
+                                                role="button" class="secondary compact" { "Edit" }
+                                        }
+                                        form method="post"
+                                            action=(format!("/account/apps/{}/revoke", app.client_id)) {
+                                            input type="hidden" name="csrf" value=(csrf);
+                                            button type="submit" class="secondary compact" { "Disconnect" }
+                                        }
                                     }
                                 }
                             }
@@ -445,12 +519,16 @@ fn key_name_text(name: &str) -> String {
 fn provider_chips(value: &str) -> Markup {
     let providers =
         serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_owned()]);
+    provider_list_chips(&providers)
+}
+
+fn provider_list_chips(providers: &[String]) -> Markup {
     html! {
         @if providers.is_empty() {
             span class="cell-absent" { "none" }
         } @else {
             div class="chip-row" {
-                @for provider in &providers { span class="chip" { (provider) } }
+                @for provider in providers { span class="chip" { (provider) } }
             }
         }
     }

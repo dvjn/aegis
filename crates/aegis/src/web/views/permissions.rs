@@ -7,7 +7,7 @@ struct Permission {
     label: &'static str,
 }
 
-const REGISTRY: [Permission; 5] = [
+const REGISTRY: [Permission; 6] = [
     Permission {
         scope: "usage:read",
         label: "Read usage totals",
@@ -23,6 +23,10 @@ const REGISTRY: [Permission; 5] = [
     Permission {
         scope: "keys:read",
         label: "Read API key metadata",
+    },
+    Permission {
+        scope: crate::domain::GATEWAY_SCOPE,
+        label: "Send requests to the selected providers",
     },
     Permission {
         scope: "offline_access",
@@ -103,6 +107,29 @@ pub fn detail_row(label: &str, value: Markup) -> Markup {
 
 pub fn application_group(rows: Markup) -> Markup {
     group("Application", rows)
+}
+
+pub fn provider_group(available: &[String], selected: &[String]) -> Markup {
+    group(
+        "Providers",
+        html! {
+            @if available.is_empty() {
+                p class="auth-note" {
+                    "No provider exists yet. " a href="/settings/providers" { "Add a provider" } " first."
+                }
+            } @else {
+                div class="checkbox-grid" {
+                    @for provider in available {
+                        label class="checkbox-row" {
+                            input type="checkbox" name="providers" value=(provider)
+                                checked[selected.contains(provider)];
+                            span { (provider) }
+                        }
+                    }
+                }
+            }
+        },
+    )
 }
 
 pub fn permission_group(requested_scope: &str, role: &str) -> Markup {

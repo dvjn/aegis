@@ -21,6 +21,8 @@ pub struct Model {
     pub last_poll_at: Option<String>,
     pub decision_at: Option<String>,
     pub consumed_at: Option<String>,
+    /// JSON list of the provider IDs approved for a gateway pairing.
+    pub providers: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

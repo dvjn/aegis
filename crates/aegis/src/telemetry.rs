@@ -25,10 +25,30 @@ pub struct SqliteSink {
     database: DatabaseConnection,
 }
 
+/// The gateway client a request is recorded against.
+#[derive(Clone, Copy, Debug)]
+pub enum RequestClient<'a> {
+    ApiKey {
+        id: &'a str,
+        version_id: &'a str,
+    },
+    /// A paired machine, by its `gateway_clients` row.
+    Machine {
+        id: &'a str,
+    },
+}
+
+impl<'a> RequestClient<'a> {
+    pub fn id(self) -> &'a str {
+        match self {
+            Self::ApiKey { id, .. } | Self::Machine { id } => id,
+        }
+    }
+}
+
 pub struct StartRecord<'a> {
     pub request_id: &'a str,
-    pub key_id: &'a str,
-    pub key_version_id: &'a str,
+    pub client: RequestClient<'a>,
     pub provider_id: &'a str,
     pub provider: Provider,
     pub method: &'a str,
@@ -355,12 +375,21 @@ impl SqliteSink {
         let inserted = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, price_scope, session_id, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+                "INSERT INTO gateway_requests (id, request_id, client_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, price_scope, session_id, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
                 [
                     id.to_string().into(),
                     record.request_id.to_owned().into(),
-                    record.key_id.to_owned().into(),
-                    record.key_version_id.to_owned().into(),
+                    record.client.id().to_owned().into(),
+                    match record.client {
+                        RequestClient::ApiKey { id, .. } => Some(id.to_owned()),
+                        RequestClient::Machine { .. } => None,
+                    }
+                    .into(),
+                    match record.client {
+                        RequestClient::ApiKey { version_id, .. } => Some(version_id.to_owned()),
+                        RequestClient::Machine { .. } => None,
+                    }
+                    .into(),
                     record.provider_id.to_owned().into(),
                     record.provider.protocol().into(),
                     record.method.to_owned().into(),

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set,
-    sea_query::Expr,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait,
+    QueryFilter, Set, Statement, sea_query::Expr,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -26,6 +26,8 @@ pub struct ConnectedClient {
     pub scope: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+    /// The providers of a machine paired with the gateway.
+    pub providers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +143,7 @@ impl OAuthService {
                         scope: scope.clone(),
                         created_at,
                         last_used_at: None,
+                        providers: None,
                     });
                 if created_at < entry.created_at {
                     entry.created_at = created_at;
@@ -172,7 +175,7 @@ impl OAuthService {
         }
 
         let tokens = oauth_access_tokens::Entity::find()
-            .filter(oauth_access_tokens::Column::UserId.eq(user_id))
+            .filter(oauth_access_tokens::Column::UserId.eq(user_id.clone()))
             .filter(oauth_access_tokens::Column::Issuer.eq(issuer))
             .filter(oauth_access_tokens::Column::AuthVersion.eq(auth_version))
             .filter(oauth_access_tokens::Column::RevokedAt.is_null())
@@ -202,6 +205,19 @@ impl OAuthService {
         for client in names {
             if let Some(entry) = connected.get_mut(&client.id) {
                 entry.client_name = client.client_name;
+            }
+        }
+        for (client_id, providers, last_used_at) in self.machine_grants(&user_id, issuer).await? {
+            let Some(entry) = connected.get_mut(&client_id) else {
+                continue;
+            };
+            entry.providers = Some(providers);
+            if let Some(used) = last_used_at
+                .as_deref()
+                .and_then(|v| parse_stored_date(v).ok())
+                && entry.last_used_at.is_none_or(|last| used > last)
+            {
+                entry.last_used_at = Some(used);
             }
         }
         Ok(connected.into_values().collect())
@@ -253,7 +269,7 @@ impl OAuthService {
         }
         affected += oauth_access_tokens::Entity::update_many()
             .col_expr(oauth_access_tokens::Column::RevokedAt, Expr::value(now))
-            .filter(oauth_access_tokens::Column::UserId.eq(user_id))
+            .filter(oauth_access_tokens::Column::UserId.eq(user_id.clone()))
             .filter(oauth_access_tokens::Column::ClientId.eq(client_id))
             .filter(oauth_access_tokens::Column::Issuer.eq(issuer))
             .filter(oauth_access_tokens::Column::RevokedAt.is_null())
@@ -264,6 +280,18 @@ impl OAuthService {
             tx.rollback().await?;
             return Err(DomainError::NotFound);
         }
+        // The row stays for the requests recorded against it, but holds no provider.
+        tx.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE gateway_clients SET allowed_providers = '[]'
+            WHERE user_id = ? AND kind = 'oauth' AND oauth_client_id = ? AND oauth_issuer = ?",
+            [
+                user_id.into(),
+                client_id.to_owned().into(),
+                issuer.to_owned().into(),
+            ],
+        ))
+        .await?;
         tx.commit().await?;
         Ok(())
     }

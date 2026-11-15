@@ -9,14 +9,20 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use url::Url;
+
+use aegis_wire::{
+    AuthorizationServerMetadata, ClientRegistrationRequest, ClientRegistrationResponse,
+    DeviceAuthorizationResponse, OAuthError, TokenResponse,
+};
 
 use crate::{
     domain::{
         AuthorizationCodeRedemption, AuthorizationCodeRequest, ClientRegistration,
         DEVICE_GRANT_TYPE, DeviceAuthorizationRequest, DevicePollError, DeviceTokenRequest,
-        DomainError, IssuedAccessToken, RefreshTokenRequest, normalize_user_code,
+        DomainError, GATEWAY_SCOPE, IssuedAccessToken, RefreshTokenRequest, gateway_resource,
+        normalize_user_code, scope_allows,
     },
     oauth::State as AppState,
     web,
@@ -25,14 +31,17 @@ use crate::{
 const TOKEN_BASIC_CHALLENGE: &str = "Basic realm=\"aegis OAuth token\", charset=\"UTF-8\"";
 const MAX_PARAMETER_BYTES: usize = 4 * 1024;
 const MAX_PARAMETERS: usize = 16;
-
-#[derive(Serialize)]
-struct OAuthError {
-    error: &'static str,
-}
+const MAX_CONSENT_PARAMETERS: usize = 128;
 
 fn error(status: StatusCode, code: &'static str) -> Response {
-    (status, Json(OAuthError { error: code })).into_response()
+    (
+        status,
+        Json(OAuthError {
+            error: code.to_owned(),
+            interval: None,
+        }),
+    )
+        .into_response()
 }
 
 fn error_with_challenge(
@@ -45,22 +54,6 @@ fn error_with_challenge(
         .headers_mut()
         .insert(header::WWW_AUTHENTICATE, challenge);
     response
-}
-
-#[derive(Serialize)]
-pub struct AuthorizationServerMetadata {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    device_authorization_endpoint: String,
-    registration_endpoint: String,
-    response_types_supported: [&'static str; 1],
-    grant_types_supported: [&'static str; 3],
-    token_endpoint_auth_methods_supported: [&'static str; 1],
-    code_challenge_methods_supported: [&'static str; 1],
-    scopes_supported: Vec<&'static str>,
-    authorization_response_iss_parameter_supported: bool,
-    resource_parameter_supported: bool,
 }
 
 pub async fn authorization_server_metadata(
@@ -76,11 +69,18 @@ pub async fn authorization_server_metadata(
         token_endpoint: format!("{origin}/oauth/token"),
         device_authorization_endpoint: format!("{origin}/oauth/device_authorization"),
         registration_endpoint: format!("{origin}/oauth/register"),
-        response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "refresh_token", DEVICE_GRANT_TYPE],
-        token_endpoint_auth_methods_supported: ["none"],
-        code_challenge_methods_supported: ["S256"],
-        scopes_supported: crate::domain::SCOPES.to_vec(),
+        response_types_supported: vec!["code".into()],
+        grant_types_supported: ["authorization_code", "refresh_token", DEVICE_GRANT_TYPE]
+            .map(str::to_owned)
+            .to_vec(),
+        token_endpoint_auth_methods_supported: vec!["none".into()],
+        code_challenge_methods_supported: vec!["S256".into()],
+        // Unlisted, so a client that asks for every listed scope is not refused at authorization.
+        scopes_supported: crate::domain::SCOPES
+            .into_iter()
+            .filter(|scope| *scope != GATEWAY_SCOPE)
+            .map(str::to_owned)
+            .collect(),
         authorization_response_iss_parameter_supported: true,
         resource_parameter_supported: true,
     })
@@ -111,35 +111,10 @@ pub async fn protected_resource_metadata(
     .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct RegistrationRequest {
-    #[serde(default)]
-    redirect_uris: Vec<String>,
-    client_name: Option<String>,
-    token_endpoint_auth_method: Option<String>,
-    grant_types: Option<Vec<String>>,
-    response_types: Option<Vec<String>>,
-    scope: Option<String>,
-    application_type: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct RegistrationResponse {
-    client_id: String,
-    client_id_issued_at: i64,
-    redirect_uris: Vec<String>,
-    client_name: Option<String>,
-    token_endpoint_auth_method: &'static str,
-    grant_types: Vec<String>,
-    response_types: Vec<String>,
-    scope: String,
-    application_type: String,
-}
-
 pub async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
-    input: Result<Json<RegistrationRequest>, JsonRejection>,
+    input: Result<Json<ClientRegistrationRequest>, JsonRejection>,
 ) -> Response {
     let Ok(issuer) = state.origin.effective_origin(&headers) else {
         return error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
@@ -186,12 +161,12 @@ pub async fn register(
     {
         Ok(client) => (
             StatusCode::CREATED,
-            Json(RegistrationResponse {
+            Json(ClientRegistrationResponse {
                 client_id: client.client_id().to_owned(),
                 client_id_issued_at: chrono::Utc::now().timestamp(),
                 redirect_uris: client.redirect_uris().to_vec(),
                 client_name: client.client_name().map(str::to_owned),
-                token_endpoint_auth_method: client.token_endpoint_auth_method(),
+                token_endpoint_auth_method: client.token_endpoint_auth_method().to_owned(),
                 grant_types: client.grant_types().to_vec(),
                 response_types: client.response_types().to_vec(),
                 scope: client.scope().to_owned(),
@@ -213,16 +188,6 @@ pub async fn register(
             error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
         }
     }
-}
-
-#[derive(Serialize)]
-pub struct DeviceAuthorizationResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    verification_uri_complete: String,
-    expires_in: u64,
-    interval: u64,
 }
 
 pub async fn device_authorization(
@@ -248,7 +213,7 @@ pub async fn device_authorization(
     let (Some(client_id), Some(resource)) = (input.one("client_id"), input.one("resource")) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    if resource != format!("{issuer}/mcp") {
+    if resource != format!("{issuer}/mcp") && resource != gateway_resource(&issuer) {
         return error(StatusCode::BAD_REQUEST, "invalid_target");
     }
     match state
@@ -297,15 +262,18 @@ pub struct ConsentForm {
     csrf: String,
     user_code: Option<String>,
     decision: Option<String>,
+    providers: Vec<String>,
 }
 
 impl ConsentForm {
     fn parse(body: &str) -> Result<Self, ()> {
-        let parameters = UniqueParameters::parse(body)?;
+        // One checkbox per provider can exceed the usual parameter count.
+        let mut parameters = UniqueParameters::parse_at_most(body, MAX_CONSENT_PARAMETERS)?;
         Ok(Self {
             csrf: parameters.one("csrf").ok_or(())?.to_owned(),
             user_code: parameters.one("user_code").map(ToOwned::to_owned),
             decision: parameters.one("decision").map(ToOwned::to_owned),
+            providers: parameters.values.remove("providers").unwrap_or_default(),
         })
     }
 }
@@ -427,7 +395,10 @@ async fn device_inner(
     let Ok(email) = state.domain.auth().account_email(&principal).await else {
         return redirect_to_login(&return_to);
     };
-    let consent_page = || {
+    let available = authorization
+        .gateway
+        .then(|| state.gateway.provider_ids(&principal.user_id().to_string()));
+    let consent_page = |selected: &[String], problem: Option<&str>| {
         crate::web::views::device::consent(crate::web::views::device::Consent {
             csrf: &csrf,
             email: &email,
@@ -441,11 +412,13 @@ async fn device_inner(
             scope: &authorization.scope,
             role: principal.role(),
             resource: &authorization.resource,
+            providers: available.as_deref(),
+            selected,
+            error: problem,
         })
-        .into_response()
     };
     let Some(form) = form else {
-        return consent_page();
+        return consent_page(available.as_deref().unwrap_or_default(), None).into_response();
     };
     let Ok(form) = form else {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
@@ -467,6 +440,22 @@ async fn device_inner(
     if approve && granted.is_none() {
         return error(StatusCode::BAD_REQUEST, "invalid_scope");
     }
+    if let Some(available) = available.as_deref().filter(|_| approve) {
+        let problem = if form.providers.is_empty() {
+            Some("Select at least one provider.")
+        } else if form.providers.iter().any(|id| !available.contains(id)) {
+            Some("Select only providers that exist.")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                consent_page(&form.providers, Some(problem)),
+            )
+                .into_response();
+        }
+    }
     match state
         .domain
         .oauth()
@@ -474,6 +463,7 @@ async fn device_inner(
             &authorization.user_code,
             &principal.identity,
             granted.filter(|_| approve).as_deref(),
+            authorization.gateway.then_some(form.providers.as_slice()),
         )
         .await
     {
@@ -606,7 +596,7 @@ async fn authorize_inner(
         );
         return authorization_error(redirect_uri, "invalid_target", state_parameter, &issuer);
     }
-    if !client.allows_scope(scope) {
+    if !client.allows_scope(scope) || scope_allows(scope, GATEWAY_SCOPE) {
         return authorization_error(redirect_uri, "invalid_scope", state_parameter, &issuer);
     }
     if code_challenge_method != "S256" || !valid_pkce_challenge(code_challenge) {
@@ -747,20 +737,10 @@ fn redirect_to_login(return_to: &str) -> Response {
     Redirect::to(&format!("/login?{query}")).into_response()
 }
 
-#[derive(Serialize)]
-pub struct TokenResponse {
-    access_token: String,
-    token_type: &'static str,
-    expires_in: u64,
-    scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refresh_token: Option<String>,
-}
-
 fn token_response(issued: &IssuedAccessToken) -> Response {
     Json(TokenResponse {
         access_token: issued.expose().to_owned(),
-        token_type: "Bearer",
+        token_type: "Bearer".into(),
         expires_in: issued.expires_in(),
         scope: issued.scope().to_owned(),
         refresh_token: issued.refresh_token().map(str::to_owned),
@@ -768,17 +748,11 @@ fn token_response(issued: &IssuedAccessToken) -> Response {
     .into_response()
 }
 
-#[derive(Serialize)]
-struct DevicePollOAuthError {
-    error: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    interval: Option<u64>,
-}
 fn device_poll_error(code: &'static str, interval: Option<u64>) -> Response {
     (
         StatusCode::BAD_REQUEST,
-        Json(DevicePollOAuthError {
-            error: code,
+        Json(OAuthError {
+            error: code.to_owned(),
             interval,
         }),
     )
@@ -876,7 +850,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, body: Byte
     let Some(resource) = input.one("resource") else {
         return error(StatusCode::BAD_REQUEST, "invalid_target");
     };
-    if resource != expected_resource {
+    if resource != expected_resource && resource != gateway_resource(&issuer) {
         return error(StatusCode::BAD_REQUEST, "invalid_target");
     }
     let result = match grant_type {
@@ -939,6 +913,10 @@ struct UniqueParameters {
 
 impl UniqueParameters {
     fn parse(raw: &str) -> Result<Self, ()> {
+        Self::parse_at_most(raw, MAX_PARAMETERS)
+    }
+
+    fn parse_at_most(raw: &str, max_parameters: usize) -> Result<Self, ()> {
         if raw.len() > MAX_PARAMETER_BYTES
             || raw.bytes().any(|byte| byte.is_ascii_control())
             || malformed_percent_encoding(raw)
@@ -949,7 +927,7 @@ impl UniqueParameters {
         let mut count = 0;
         for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
             count += 1;
-            if count > MAX_PARAMETERS || name.len() > 64 || value.len() > 2048 || name.is_empty() {
+            if count > max_parameters || name.len() > 64 || value.len() > 2048 || name.is_empty() {
                 return Err(());
             }
             values
