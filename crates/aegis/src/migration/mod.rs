@@ -29,6 +29,7 @@ mod m20261110_000029_gateway_clients;
 mod m20261111_000030_providers;
 mod m20261115_000031_client_sessions;
 mod m20261116_000032_device_providers;
+mod m20261116_000033_request_client_time_index;
 
 pub struct Migrator;
 
@@ -65,6 +66,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261111_000030_providers::Migration),
             Box::new(m20261115_000031_client_sessions::Migration),
             Box::new(m20261116_000032_device_providers::Migration),
+            Box::new(m20261116_000033_request_client_time_index::Migration),
         ]
     }
 }

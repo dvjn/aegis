@@ -595,11 +595,12 @@ const LABELED_SERIES_SQL: &str = "{rows} SELECT {column} label, {bucket} bucket,
 
 /// The evaluations of the requests in the window's partial edge hours, one
 /// row per evaluation. Whole hours come from the guardrail buckets instead.
-/// Parameters follow [`WINDOW_ROWS_SQL`].
+/// Parameters follow [`WINDOW_ROWS_SQL`]. CROSS JOIN pins the join order so
+/// SQLite starts from the edge requests, not every evaluation of the policies.
 const EDGE_EVALUATIONS_SQL: &str = "SELECT q.started_at moment, e.request_id, e.outcome, e.match_count, e.metadata \
-     FROM policy_evaluations e \
-     JOIN gateway_requests q ON q.id = e.request_id \
-     JOIN gateway_clients k ON k.id = q.client_id \
+     FROM gateway_clients k \
+     CROSS JOIN gateway_requests q ON q.client_id = k.id \
+     CROSS JOIN policy_evaluations e ON e.request_id = q.id \
      WHERE e.policy IN ('secrets', 'regex') AND k.user_id = ? \
      AND ((q.started_at >= ? AND q.started_at < ?) OR (q.started_at >= ? AND q.started_at <= ?))";
 
@@ -2376,5 +2377,40 @@ mod tests {
         assert_eq!(stranger.requests_scanned, 0);
         assert_eq!(stranger.distinct_values, 0);
         assert!(stranger.detectors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn windowed_queries_seek_the_requests_by_client_and_start_time() {
+        let (db, user) = empty_store("user@example.com").await;
+        let store = UsageStore::new(db.clone());
+        let window = last(Range::Day);
+        let statements = [
+            (
+                "totals",
+                store.window_statement(&render_sql(TOTALS_SQL, "", window.bucket), user, window),
+            ),
+            ("context", store.statement(&context_sql(), user, window)),
+            (
+                "guardrails",
+                store.guardrail_statement(GUARDRAILS_COUNTS_SQL, GUARDRAIL_ROWS_SQL, user, window),
+            ),
+        ];
+        for (name, statement) in statements {
+            let plan = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("EXPLAIN QUERY PLAN {}", statement.sql),
+                    statement.values.unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|row| row.try_get::<String>("", "detail").unwrap().contains(
+                        "ix_gateway_requests_client_started_at (client_id=? AND started_at>?"
+                    )),
+                "{name} reads only the window's requests"
+            );
+        }
     }
 }
