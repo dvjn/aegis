@@ -1,8 +1,22 @@
+[workspace]
+members = ["crates/aegis-wire", "crates/ags"]
+resolver = "3"
+
+[workspace.package]
+# No shared version: release-please only bumps each crate's own.
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+aegis-wire = { path = "crates/aegis-wire" }
+clap = { version = "4.6.6", features = ["derive"] }
+toml = "1.1.4"
+
 [package]
 name = "aegis"
 version = "0.11.0"
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+license.workspace = true
 
 [profile.dev]
 debug = "line-tables-only"
@@ -19,7 +33,7 @@ axum-extra = { version = "0.12", features = ["cookie"] }
 base64 = "0.23.1"
 brotli = "9.0.0"
 chrono = { version = "0.4.45", features = ["serde", "clock"] }
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { workspace = true }
 crc32fast = "1.5.4"
 email_address = "0.2.9"
 fastcdc = "5.0.0"
@@ -49,7 +63,7 @@ time = { version = "0.3.55", default-features = false }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.19"
 tokio-util = "0.7.19"
-toml = "1.1.4"
+toml = { workspace = true }
 tower-http = { version = "0.7.0", features = ["compression-br", "compression-gzip", "timeout", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

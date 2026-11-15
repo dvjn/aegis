@@ -56,7 +56,7 @@ env = { AEGIS_CONFIG = "config.local.toml" }
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
-exec watchexec --restart --watch src --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css -- cargo run -- serve
+exec watchexec --restart --watch src --watch crates --watch Cargo.toml --watch Cargo.lock --exts rs,toml,css -- cargo run -- serve
 '''
 
 [tasks.serve]
@@ -205,11 +205,11 @@ printf 'Priced models: %s\n' "$(jq length src/pricing/model_prices.json)"
 
 [tasks.test]
 description = "Run every test"
-run = "cargo nextest run"
+run = "cargo nextest run --workspace"
 
 [tasks."test:unit"]
 description = "Run the in-crate unit tests"
-run = "cargo nextest run --bins"
+run = "cargo nextest run --workspace --lib --bins"
 
 [tasks."test:integration"]
 description = "Run the black-box integration suite"
@@ -219,7 +219,7 @@ run = "cargo nextest run --test integration"
 run = "cargo fmt --all"
 
 [tasks.lint]
-run = "cargo clippy --all-targets --all-features -- -D warnings"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
 [tasks.audit]
 description = "Check dependencies for known vulnerabilities"
@@ -232,7 +232,7 @@ warn() { echo "::warning title=Security advisory::$1"; }
 cargo audit || warn "cargo audit found advisories; see the audit output"
 # An ignored advisory in .cargo/audit.toml is only safe while the crate stays
 # out of the resolved graph. Warn when it comes back.
-tree="$(cargo tree --target all --prefix none --format '{p}')"
+tree="$(cargo tree --workspace --target all --prefix none --format '{p}')"
 if grep -Eq '^rkyv v0\\.7\\.46($|[[:space:]])' <<<"$tree"; then
   warn "rkyv 0.7.46 is in the dependency graph, so RUSTSEC-2026-0235 is no longer unreachable"
 fi
@@ -391,10 +391,10 @@ exec "$harness" "${arguments[@]}"
 run = "cargo fmt --all --check"
 
 [tasks.build]
-run = "cargo build --release"
+run = "cargo build --release --workspace"
 
 [tasks.dist]
-description = "Cross-compile the release binaries into dist/<arch>/aegis"
+description = "Cross-compile the release binaries into dist/<arch>/{aegis,ags}"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -403,11 +403,12 @@ for entry in $TARGETS; do
   target="${entry%%:*}"
   arch="${entry##*:}"
   rustup target add "$target"
-  cargo zigbuild --release --locked --target "$target"
+  cargo zigbuild --release --locked --workspace --bins --target "$target"
   install -Dm755 "target/$target/release/aegis" "dist/$arch/aegis"
+  install -Dm755 "target/$target/release/ags" "dist/$arch/ags"
 done
 """
-sources = ["src/**/*.rs", "build.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["src/**/*.rs", "crates/**/*.rs", "crates/*/Cargo.toml", "build.rs", "Cargo.toml", "Cargo.lock"]
 
 [tasks.package]
 description = "Make the release tarballs and checksums from dist/"
@@ -415,17 +416,21 @@ depends = ["dist"]
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-version="${VERSION:-$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)}"
+version="${VERSION:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "aegis") | .version')}"
 for entry in $TARGETS; do
   target="${entry%%:*}"
   arch="${entry##*:}"
-  name="aegis-${version}-${target}"
-  mkdir -p "dist/${name}"
-  cp "dist/${arch}/aegis" "dist/${name}/aegis"
-  cp README.md "dist/${name}/"
-  tar -czf "dist/${name}.tar.gz" -C dist "${name}"
-  rm -rf "dist/${name}"
-  (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+  for binary in aegis ags; do
+    name="${binary}-${version}-${target}"
+    mkdir -p "dist/${name}"
+    cp "dist/${arch}/${binary}" "dist/${name}/${binary}"
+    if [[ "$binary" == aegis ]]; then
+      cp README.md "dist/${name}/"
+    fi
+    tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+    rm -rf "dist/${name}"
+    (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+  done
 done
 """
 
