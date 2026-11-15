@@ -19,6 +19,13 @@ pub const EVALUATION_METADATA_SCOPE: &str = "payloads:read";
 const PROVIDER_SIGNED_ITEM_TYPES: [&str; 3] = ["reasoning", "thinking", "redacted_thinking"];
 
 fn is_provider_signed_item(fields: &Map<String, Value>) -> bool {
+    // Bedrock Converse signs reasoning in a `reasoningContent` block.
+    if fields.contains_key("thoughtSignature")
+        || fields.contains_key("thought_signature")
+        || fields.contains_key("reasoningContent")
+    {
+        return true;
+    }
     fields
         .get("type")
         .and_then(Value::as_str)

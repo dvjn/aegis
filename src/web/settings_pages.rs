@@ -194,6 +194,8 @@ struct CreateProviderForm {
     id: String,
     kind: String,
     #[serde(default)]
+    region: String,
+    #[serde(default)]
     base_url: String,
 }
 
@@ -212,14 +214,30 @@ async fn provider_create(
         return Ok(to_login());
     };
     let id = input.id.trim().to_owned();
-    let result = match ProviderKind::from_parts(&input.kind, optional(&input.base_url)) {
-        Ok(kind) => {
+    // The region field is hidden for other types, but a value typed before
+    // switching type is still submitted, so only Bedrock reads it.
+    let region = (input.kind == "bedrock")
+        .then(|| optional(&input.region))
+        .flatten();
+    let base_url = match region {
+        None => Ok(optional(&input.base_url)),
+        Some(region) if optional(&input.base_url).is_some() => Err(format!(
+            "Set either a region or an upstream base URL, not both (region {region})."
+        )),
+        Some(region) if crate::config::is_cloud_region(&region) => {
+            Ok(Some(crate::config::bedrock_runtime_url(&region)))
+        }
+        Some(_) => Err("A region contains only lowercase letters, digits and hyphens.".into()),
+    };
+    let result = match base_url.map(|base_url| ProviderKind::from_parts(&input.kind, base_url)) {
+        Err(message) => Err(SettingsError::Invalid(message)),
+        Ok(Ok(kind)) => {
             state
                 .settings
                 .create_provider(scope, &ProviderConfig { id, kind })
                 .await
         }
-        Err(_) => Err(SettingsError::Invalid("Choose a provider type.".into())),
+        Ok(Err(_)) => Err(SettingsError::Invalid("Choose a provider type.".into())),
     };
     match result {
         Ok(()) => {
@@ -236,6 +254,7 @@ async fn provider_create(
                     new: Some(NewProvider {
                         id: input.id,
                         kind: input.kind,
+                        region: input.region,
                         base_url: input.base_url,
                     }),
                     error: Some(&message),

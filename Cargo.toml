@@ -20,6 +20,7 @@ base64 = "0.23.1"
 brotli = "9.0.0"
 chrono = { version = "0.4.45", features = ["serde", "clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
+crc32fast = "1.5.4"
 email_address = "0.2.9"
 fastcdc = "5.0.0"
 flate2 = "1.1.9"

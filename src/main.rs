@@ -5,6 +5,7 @@ mod compression;
 mod config;
 mod db;
 mod domain;
+mod eventstream;
 mod gateway;
 mod guardrails_hourly;
 mod health;
@@ -101,8 +102,11 @@ enum ProviderCommand {
         #[arg(long = "type", value_parser = clap::builder::PossibleValuesParser::new(ProviderKind::TYPE_NAMES))]
         kind: String,
         /// Upstream base URL; defaults to the provider type's usual upstream.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "region")]
         base_url: Option<String>,
+        /// AWS region of a `bedrock` provider, instead of a base URL.
+        #[arg(long)]
+        region: Option<String>,
     },
     /// Change an instance provider's upstream. Its ID and type are fixed.
     Update {
@@ -324,7 +328,22 @@ fn settings_error(error: settings::SettingsError) -> anyhow::Error {
 async fn manage_provider(command: ProviderCommand, database: DatabaseConnection) -> Result<()> {
     let store = SettingsStore::new(database);
     match command {
-        ProviderCommand::Add { id, kind, base_url } => {
+        ProviderCommand::Add {
+            id,
+            kind,
+            base_url,
+            region,
+        } => {
+            let base_url = match region {
+                None => base_url,
+                Some(region) if kind == "bedrock" && config::is_cloud_region(&region) => {
+                    Some(config::bedrock_runtime_url(&region))
+                }
+                Some(_) if kind == "bedrock" => {
+                    bail!("a region contains only lowercase letters, digits and hyphens")
+                }
+                Some(_) => bail!("--region applies only to bedrock providers"),
+            };
             let provider = ProviderConfig {
                 kind: ProviderKind::from_parts(&kind, base_url)?,
                 id,

@@ -21,6 +21,7 @@ dependencies = [
  "brotli",
  "chrono",
  "clap",
+ "crc32fast",
  "email_address",
  "fastcdc",
  "flate2",

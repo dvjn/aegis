@@ -66,6 +66,8 @@ pub fn type_label(type_name: &str) -> &'static str {
         "claude_subscription" => "Claude subscription",
         "codex_subscription" => "Codex subscription",
         "typesafe" => "TypeSafe",
+        "bedrock" => "Amazon Bedrock",
+        "vertex" => "Google Vertex AI",
         _ => "Unknown",
     }
 }
@@ -81,6 +83,7 @@ fn default_url(type_name: &str) -> String {
 pub struct NewProvider {
     pub id: String,
     pub kind: String,
+    pub region: String,
     pub base_url: String,
 }
 
@@ -182,6 +185,13 @@ pub fn providers_page(view: &ProvidersView<'_>) -> Markup {
                                         }
                                     }
                                 }
+                                // Shown only while Amazon Bedrock is the selected type; see
+                                // `.bedrock-only` in the stylesheet.
+                                div class="bedrock-only" {
+                                    label for="provider-region" { "Region" }
+                                    input id="provider-region" name="region" maxlength="40" pattern="[a-z0-9-]+"
+                                        placeholder="us-east-1" value=(view.new.region);
+                                }
                                 details class="advanced" open[!view.new.base_url.is_empty()] {
                                     summary { "Advanced" }
                                     label for="provider-url" { "Upstream base URL" }
@@ -226,7 +236,9 @@ fn provider_row(view: &ProvidersView<'_>, provider: &ProviderConfig, inherited: 
                 }
             } @else {
                 td {
-                    @if url == default { span class="cell-absent" { "default" } } @else { code { (url) } }
+                    @if url == default { span class="cell-absent" { "default" } }
+                    @else if let Some(region) = provider.kind.bedrock_region() { (region) }
+                    @else { code { (url) } }
                 }
                 td { (usage_text(keys, apps)) }
                 td class="col-actions" {

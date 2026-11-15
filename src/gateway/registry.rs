@@ -1,8 +1,8 @@
 //! The gateway's in-memory view of stored providers and guardrails. It is
 //! swapped whole on reload, so a request keeps the snapshot it started with.
-use super::ProviderTarget;
+use super::route::{Base, ProviderTarget, Upstream};
 use crate::{
-    config::{GuardrailsConfig, ProviderConfig, ProviderKind},
+    config::{GuardrailsConfig, ProviderConfig, ProviderKind, default_vertex_base_url},
     policies::{Pipeline, pipeline},
     providers::Provider,
     settings::{SettingsStore, StoredProvider, effective_guardrails},
@@ -66,12 +66,12 @@ impl Snapshot {
     }
 
     /// The user's own providers and the instance's, sorted by ID.
-    pub(super) fn visible(&self, user: &str) -> Vec<(String, Provider)> {
+    pub(super) fn visible(&self, user: &str) -> Vec<(String, &ProviderTarget)> {
         let mut visible: Vec<_> = self
             .providers
             .iter()
             .filter(|((owner, _), _)| owner.as_deref().is_none_or(|owner| owner == user))
-            .map(|((_, id), target)| (id.clone(), target.kind))
+            .map(|((_, id), target)| (id.clone(), target))
             .collect();
         visible.sort_by(|a, b| a.0.cmp(&b.0));
         visible
@@ -97,19 +97,33 @@ impl Snapshot {
 pub(super) type Registry = Arc<RwLock<Arc<Snapshot>>>;
 
 fn target(config: ProviderConfig) -> anyhow::Result<(String, ProviderTarget)> {
-    let (kind, base_url) = match config.kind {
-        ProviderKind::ClaudeSubscription { base_url } => (Provider::Anthropic, base_url),
-        ProviderKind::CodexSubscription { base_url } => (Provider::Codex, base_url),
-        ProviderKind::TypeSafe { base_url } => (Provider::TypeSafe, base_url),
+    let invalid = || format!("provider {:?} has an invalid base_url", config.id);
+    let region = config.kind.bedrock_region();
+    let fixed = |protocol, base_url: &str| -> anyhow::Result<Upstream> {
+        Ok(Upstream::Fixed {
+            protocol,
+            base: Base::parse(base_url).with_context(invalid)?,
+        })
     };
-    let parsed = url::Url::parse(&base_url)
-        .with_context(|| format!("provider {:?} has an invalid base_url", config.id))?;
-    Ok((
-        config.id,
-        ProviderTarget {
-            kind,
-            origin: Arc::from(parsed.origin().ascii_serialization()),
-            base_path: Arc::from(parsed.path().trim_end_matches('/')),
+    let upstream = match &config.kind {
+        ProviderKind::ClaudeSubscription { base_url } => fixed(Provider::Anthropic, base_url)?,
+        ProviderKind::CodexSubscription { base_url } => fixed(Provider::Codex, base_url)?,
+        ProviderKind::TypeSafe { base_url } => fixed(Provider::TypeSafe, base_url)?,
+        ProviderKind::Bedrock { base_url } => {
+            let runtime = Base::parse(base_url).with_context(invalid)?;
+            let openai = match &region {
+                Some(region) => Base::parse(&format!("https://bedrock-mantle.{region}.api.aws"))
+                    .with_context(invalid)?,
+                None => runtime.clone(),
+            };
+            Upstream::Bedrock { runtime, openai }
+        }
+        ProviderKind::Vertex { base_url } => Upstream::Vertex {
+            custom: (*base_url != default_vertex_base_url())
+                .then(|| Base::parse(base_url))
+                .transpose()
+                .with_context(invalid)?,
         },
-    ))
+    };
+    Ok((config.id, ProviderTarget { upstream }))
 }

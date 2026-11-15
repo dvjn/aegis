@@ -11,8 +11,11 @@ use crate::{
     telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
 };
 
+#[cfg(test)]
+mod cloud_tests;
 mod http;
 mod registry;
+mod route;
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -61,30 +64,6 @@ pub struct Gateway {
     registry: registry::Registry,
     placeholder_key: [u8; 32],
     max_capture_bytes: usize,
-}
-
-#[derive(Clone)]
-struct ProviderTarget {
-    kind: Provider,
-    origin: Arc<str>,
-    base_path: Arc<str>,
-}
-
-impl ProviderTarget {
-    fn upstream_url(&self, path: &str) -> String {
-        if self.base_path.is_empty() || begins_with_segments(path, &self.base_path) {
-            format!("{}{path}", self.origin)
-        } else {
-            format!("{}{}{path}", self.origin, self.base_path)
-        }
-    }
-}
-
-fn begins_with_segments(path: &str, prefix: &str) -> bool {
-    let Some(rest) = path.strip_prefix(prefix) else {
-        return false;
-    };
-    rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
 }
 
 impl Gateway {
@@ -218,10 +197,36 @@ impl Gateway {
         let Some(target) = snapshot.resolve(&authenticated.user_id, provider_id) else {
             return Ok(provider_not_found());
         };
-        let provider = target.kind;
         let policies = snapshot.pipeline(&authenticated.user_id, self.placeholder_key);
+        let endpoint = parts
+            .uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or(parts.uri.path());
+        let route_prefix = format!("/providers/{provider_id}");
+        let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
+        let route = target.route(upstream_path);
+        // Quota/account/bootstrap calls contain private account metadata and are
+        // not model requests. They still require the same authenticated grant.
+        let Some(provider) = route.protocol else {
+            let mut outbound = self.client.request(parts.method, route.url);
+            for (name, value) in &parts.headers {
+                if !is_hop_by_hop(name) && name != header::HOST && name != header::ACCEPT_ENCODING {
+                    outbound = outbound.header(name, value);
+                }
+            }
+            let response = outbound
+                .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+                .send()
+                .await?;
+            let status = response.status();
+            let headers = filtered_headers(response.headers());
+            return Ok(
+                (status, headers, Body::from_stream(response.bytes_stream())).into_response(),
+            );
+        };
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
-        let model = requested_model(&body);
+        let model = requested_model(&body).or(route.model);
         let context = RequestContext {
             body: body.clone(),
             content_encoding: parts
@@ -240,8 +245,7 @@ impl Gateway {
             evaluations,
             restore,
         } = decision;
-        let mut restorer =
-            (!restore.replacements.is_empty()).then(|| StreamRestorer::new(restore.replacements));
+        let replacements = restore.replacements;
         if transformed {
             parts.headers.remove(header::CONTENT_ENCODING);
             parts.headers.remove(header::CONTENT_LENGTH);
@@ -251,9 +255,7 @@ impl Gateway {
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or(parts.uri.path());
-        let route_prefix = format!("/providers/{provider_id}");
-        let upstream_path = endpoint.strip_prefix(&route_prefix).unwrap_or(endpoint);
-        let upstream_url = target.upstream_url(upstream_path);
+        let upstream_url = route.url;
         let span = tracing::Span::current();
         span.record("user_id", tracing::field::display(&authenticated.user_id));
         span.record("key_id", tracing::field::display(&authenticated.id));
@@ -298,6 +300,24 @@ impl Gateway {
         };
         let status = upstream.status();
         let mut response_headers = filtered_headers(upstream.headers());
+        // Bedrock streams arrive as AWS event stream frames rather than SSE.
+        let event_stream = upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(crate::eventstream::CONTENT_TYPE));
+        let mut restorer = (!replacements.is_empty()).then(|| {
+            let restorer = if matches!(provider, Provider::Gemini) {
+                StreamRestorer::gemini(replacements)
+            } else {
+                StreamRestorer::new(replacements)
+            };
+            if event_stream {
+                ResponseRestorer::EventStream(crate::eventstream::Restorer::new(restorer))
+            } else {
+                ResponseRestorer::Sse(restorer)
+            }
+        });
         if restorer.is_some() {
             // Restoring a placeholder changes the body length, and the rewritten
             // body is streamed, so the final length is unknown here.
@@ -436,6 +456,28 @@ async fn evaluate_policies(
     Ok(tokio::task::spawn_blocking(move || policies.evaluate(context)).await?)
 }
 
+/// Restores masked values in a response, in whichever framing it arrives.
+enum ResponseRestorer {
+    Sse(StreamRestorer),
+    EventStream(crate::eventstream::Restorer),
+}
+
+impl ResponseRestorer {
+    fn rewrite_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sse(restorer) => restorer.rewrite_chunk(chunk),
+            Self::EventStream(restorer) => restorer.rewrite_chunk(chunk),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        match self {
+            Self::Sse(restorer) => restorer.finish(),
+            Self::EventStream(restorer) => restorer.finish(),
+        }
+    }
+}
+
 fn provider_not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -517,15 +559,27 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Provider, ProviderTarget};
-    use std::sync::Arc;
+    use super::{
+        Provider,
+        route::{Base, ProviderTarget, Upstream},
+    };
 
     fn target(base_url: &str) -> ProviderTarget {
-        let parsed = url::Url::parse(base_url).expect("valid base_url");
         ProviderTarget {
-            kind: Provider::Codex,
-            origin: Arc::from(parsed.origin().ascii_serialization()),
-            base_path: Arc::from(parsed.path().trim_end_matches('/')),
+            upstream: Upstream::Fixed {
+                protocol: Provider::Codex,
+                base: Base::parse(base_url).expect("valid base_url"),
+            },
+        }
+    }
+
+    trait UpstreamUrl {
+        fn upstream_url(&self, path: &str) -> String;
+    }
+
+    impl UpstreamUrl for ProviderTarget {
+        fn upstream_url(&self, path: &str) -> String {
+            self.route(path).url
         }
     }
 

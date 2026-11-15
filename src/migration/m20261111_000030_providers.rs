@@ -22,7 +22,7 @@ impl MigrationTrait for Migration {
             id TEXT NOT NULL,
             user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
             kind TEXT NOT NULL CHECK(kind IN
-                ('claude_subscription','codex_subscription','typesafe')),
+                ('claude_subscription','codex_subscription','typesafe','bedrock','vertex')),
             base_url TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,

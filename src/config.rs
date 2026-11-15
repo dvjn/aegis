@@ -145,17 +145,47 @@ pub enum ProviderKind {
         #[serde(default = "default_typesafe_base_url")]
         base_url: String,
     },
+    /// Amazon Bedrock in one region, named by the runtime host in `base_url`.
+    /// Claude Code and pi reach the runtime endpoint; Codex reaches the
+    /// region's OpenAI-compatible endpoint, derived from the same region.
+    Bedrock {
+        #[serde(default = "default_bedrock_base_url")]
+        base_url: String,
+    },
+    /// Google Vertex AI. With the default `base_url`, each request goes to the
+    /// Google host for the location named in its own path.
+    Vertex {
+        #[serde(default = "default_vertex_base_url")]
+        base_url: String,
+    },
 }
 
 impl ProviderKind {
-    pub const TYPE_NAMES: [&'static str; 3] = ["claude_subscription", "codex_subscription", "typesafe"];
+    pub const TYPE_NAMES: [&'static str; 5] = [
+        "claude_subscription",
+        "codex_subscription",
+        "typesafe",
+        "bedrock",
+        "vertex",
+    ];
 
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::ClaudeSubscription { .. } => "claude_subscription",
             Self::CodexSubscription { .. } => "codex_subscription",
             Self::TypeSafe { .. } => "typesafe",
+            Self::Bedrock { .. } => "bedrock",
+            Self::Vertex { .. } => "vertex",
         }
+    }
+
+    /// The AWS region of a Bedrock provider whose upstream is a standard
+    /// runtime host.
+    pub fn bedrock_region(&self) -> Option<&str> {
+        let Self::Bedrock { base_url } = self else {
+            return None;
+        };
+        bedrock_region(base_url)
     }
 
     /// Rebuilds a kind from its stored type name; an absent `base_url` takes
@@ -171,6 +201,12 @@ impl ProviderKind {
             "typesafe" => Self::TypeSafe {
                 base_url: base_url.unwrap_or_else(default_typesafe_base_url),
             },
+            "bedrock" => Self::Bedrock {
+                base_url: base_url.unwrap_or_else(default_bedrock_base_url),
+            },
+            "vertex" => Self::Vertex {
+                base_url: base_url.unwrap_or_else(default_vertex_base_url),
+            },
             other => bail!(
                 "provider type {other:?} must be one of {}",
                 Self::TYPE_NAMES.join(", ")
@@ -182,7 +218,9 @@ impl ProviderKind {
         match self {
             Self::ClaudeSubscription { base_url }
             | Self::CodexSubscription { base_url }
-            | Self::TypeSafe { base_url } => base_url,
+            | Self::TypeSafe { base_url }
+            | Self::Bedrock { base_url }
+            | Self::Vertex { base_url } => base_url,
         }
     }
 }
@@ -311,7 +349,7 @@ impl Config {
             database_url,
             max_capture_bytes,
             providers,
-            public_url: file.public_url,
+            public_url: optional_var("PUBLIC_URL")?.or(file.public_url),
             registration_enabled: file.registration_enabled,
             smtp,
             auth: AuthConfig {
@@ -484,6 +522,38 @@ fn default_codex_base_url() -> String {
 
 fn default_typesafe_base_url() -> String {
     "https://api.typesafe.ai".into()
+}
+
+fn default_bedrock_base_url() -> String {
+    bedrock_runtime_url("us-east-1")
+}
+
+pub fn bedrock_runtime_url(region: &str) -> String {
+    format!("https://bedrock-runtime.{region}.amazonaws.com")
+}
+
+/// The region of a standard Bedrock runtime URL, such as
+/// `https://bedrock-runtime.eu-west-1.amazonaws.com`.
+pub fn bedrock_region(base_url: &str) -> Option<&str> {
+    let host = base_url
+        .strip_prefix("https://bedrock-runtime.")?
+        .trim_end_matches('/');
+    let region = host.strip_suffix(".amazonaws.com")?;
+    is_cloud_region(region).then_some(region)
+}
+
+/// Letters, digits and hyphens only: a region or location becomes part of a
+/// host name, so nothing else may reach it.
+pub fn is_cloud_region(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+pub fn default_vertex_base_url() -> String {
+    "https://aiplatform.googleapis.com".into()
 }
 
 fn default_pricing_url() -> String {

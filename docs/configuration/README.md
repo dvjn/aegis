@@ -59,7 +59,9 @@ A running server picks up changes made in the web interface immediately, and cha
 A provider has an ID, a type, and an optional upstream base URL. Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header, and the key must allow that provider.
 
 - IDs contain only letters, digits, `-` or `_`, up to 64 characters. A user's provider cannot reuse an instance provider's ID, and an instance provider cannot take an ID a user already has.
-- Types: `claude_subscription`, `codex_subscription`, `typesafe`. Each type has a default upstream.
+- Types: `claude_subscription`, `codex_subscription`, `typesafe`, `bedrock`, `vertex`. Each type has a default upstream.
+- `bedrock` is Amazon Bedrock in one region, set with the **Region** field or `--region` (default `us-east-1`). It serves Claude Code (InvokeModel), pi (Converse) and Codex (Bedrock's OpenAI-compatible Responses endpoint). Clients must authenticate with a [Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) in `AWS_BEARER_TOKEN_BEDROCK`: AWS credentials that sign requests cover the host and body, which Aegis changes, so Bedrock rejects them.
+- `vertex` is Google Vertex AI. Each request goes to the Google host for the location in its path, so one provider serves every project and location the client's own Google credentials can reach. It serves Claude Code (Anthropic models), Codex (OpenAI models) and pi (Gemini and other models).
 - The ID and type cannot change after creation, because client URLs and usage history refer to them. Only the upstream can be edited.
 - Deleting a provider removes it from every API key that was granted it. Usage history stays.
 - Deleting an instance provider that users' active API keys use offers two choices: **Delete for everyone**, or **Keep for users**, which gives each of those users a copy of their own with the same ID, type and upstream, then removes it from the instance. Their keys keep working, and they can edit or delete their copy. Other users lose access.
@@ -67,6 +69,8 @@ A provider has an ID, a type, and an optional upstream base URL. Clients send re
 ```sh
 aegis provider add claude --type claude_subscription
 aegis provider add work --type codex_subscription --base-url https://proxy.example/codex
+aegis provider add aws --type bedrock --region eu-west-1
+aegis provider add gcp --type vertex
 aegis provider update work --default-url
 aegis provider list
 aegis provider keep-for-users work   # delete from the instance, keeping a copy for each user of it

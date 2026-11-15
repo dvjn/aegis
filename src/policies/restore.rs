@@ -2,6 +2,8 @@ use super::sse::{Frame, FrameParser};
 use super::{Replacement, is_provider_signed_item};
 use serde_json::Value;
 
+mod gemini;
+
 /// Rewrites masking placeholders back to their originals in a streamed
 /// response, holding back text that could still be the start of a placeholder
 /// split across frames.
@@ -9,6 +11,7 @@ pub struct StreamRestorer {
     parser: FrameParser,
     replacements: Vec<Replacement>,
     blocks: Vec<Block>,
+    gemini: Option<gemini::GeminiRestorer>,
 }
 
 struct Block {
@@ -49,10 +52,20 @@ impl StreamRestorer {
             parser: FrameParser::default(),
             replacements,
             blocks: Vec::new(),
+            gemini: None,
         }
     }
 
+    pub fn gemini(replacements: Vec<Replacement>) -> Self {
+        let mut restorer = Self::new(Vec::new());
+        restorer.gemini = Some(gemini::GeminiRestorer::new(replacements));
+        restorer
+    }
+
     pub fn rewrite_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if let Some(gemini) = &mut self.gemini {
+            return gemini.push(chunk);
+        }
         if self.replacements.is_empty() {
             return chunk.to_vec();
         }
@@ -64,6 +77,9 @@ impl StreamRestorer {
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
+        if let Some(gemini) = &mut self.gemini {
+            return gemini.finish();
+        }
         let mut output = Vec::new();
         for block in std::mem::take(&mut self.blocks) {
             self.flush_block(block, &mut output);
@@ -191,6 +207,9 @@ fn classify(data: &Value) -> Role {
     if data["object"] == "chat.completion.chunk" {
         return classify_chat_completion_chunk(data);
     }
+    if data["contentBlockIndex"].is_number() {
+        return classify_converse(data);
+    }
     let Some(kind) = data["type"].as_str() else {
         return Role::Other;
     };
@@ -239,6 +258,38 @@ fn classify(data: &Value) -> Role {
         },
         _ => Role::Other,
     }
+}
+
+/// Bedrock Converse stream events, which carry no type field: the event name
+/// travels in a frame header, so the shape tells a delta from a stop.
+fn classify_converse(data: &Value) -> Role {
+    let key = format!("converse:{}", data["contentBlockIndex"]);
+    let delta = &data["delta"];
+    if delta["text"].is_string() {
+        return Role::Delta {
+            key,
+            field: &["delta", "text"],
+            encoding: Encoding::Plain,
+        };
+    }
+    if delta["toolUse"]["input"].is_string() {
+        return Role::Delta {
+            key,
+            field: &["delta", "toolUse", "input"],
+            encoding: Encoding::Json,
+        };
+    }
+    if delta["reasoningContent"]["text"].is_string() {
+        return Role::Delta {
+            key,
+            field: &["delta", "reasoningContent", "text"],
+            encoding: Encoding::Plain,
+        };
+    }
+    if delta.is_null() && data["start"].is_null() {
+        return Role::Stop { key };
+    }
+    Role::Other
 }
 
 fn item_key(data: &Value) -> String {

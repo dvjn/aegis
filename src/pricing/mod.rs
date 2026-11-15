@@ -97,7 +97,11 @@ impl PriceMap {
 
     pub fn price(&self, model: &str) -> Option<ModelPrice> {
         let unprefixed = model.rsplit('/').next().unwrap_or(model);
-        for candidate in [model, unprefixed] {
+        let cloud = cloud_model_name(unprefixed);
+        for candidate in [Some(model), Some(unprefixed), cloud.as_deref()]
+            .into_iter()
+            .flatten()
+        {
             if let Some(price) = self.models.get(candidate) {
                 return Some(*price);
             }
@@ -155,6 +159,50 @@ pub fn price(model: &str) -> Option<ModelPrice> {
     active_map().price(model)
 }
 
+/// The plain model name inside a cloud provider's model ID: Bedrock's
+/// `eu.anthropic.claude-sonnet-4-6-v1:0` or `openai.gpt-5.6-sol`, and Vertex's
+/// `claude-sonnet-4-5@20250929`.
+fn cloud_model_name(model: &str) -> Option<String> {
+    const REGIONS: [&str; 7] = ["us", "eu", "apac", "global", "us-gov", "jp", "au"];
+    const VENDORS: [&str; 8] = [
+        "anthropic",
+        "openai",
+        "amazon",
+        "meta",
+        "mistral",
+        "cohere",
+        "deepseek",
+        "qwen",
+    ];
+    let mut name = model.split('@').next().unwrap_or(model);
+    if let Some((region, rest)) = name.split_once('.')
+        && REGIONS.contains(&region)
+    {
+        name = rest;
+    }
+    if let Some((vendor, rest)) = name.split_once('.')
+        && VENDORS.contains(&vendor)
+    {
+        name = rest;
+    }
+    // Bedrock's version suffix: `-v1:0`, `-v2`, or a bare `:0`.
+    let name = name.rsplit_once(':').map_or(name, |(head, tail)| {
+        if tail.bytes().all(|byte| byte.is_ascii_digit()) {
+            head
+        } else {
+            name
+        }
+    });
+    let name = name.rsplit_once("-v").map_or(name, |(head, tail)| {
+        if !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()) {
+            head
+        } else {
+            name
+        }
+    });
+    (name != model).then(|| name.to_owned())
+}
+
 fn strip_release_date(model: &str) -> Option<&str> {
     let (name, date) = model.rsplit_once('-')?;
     let is_release_date = date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit());
@@ -189,6 +237,28 @@ pub async fn backfill_costs(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cloud_model_ids_resolve_to_their_plain_names() {
+        for (id, name) in [
+            (
+                "eu.anthropic.claude-sonnet-4-6-v1:0",
+                Some("claude-sonnet-4-6"),
+            ),
+            (
+                "anthropic.claude-haiku-4-5-20251001-v1:0",
+                Some("claude-haiku-4-5-20251001"),
+            ),
+            ("global.anthropic.claude-opus-4-7", Some("claude-opus-4-7")),
+            ("openai.gpt-5.6-sol", Some("gpt-5.6-sol")),
+            ("claude-sonnet-4-5@20250929", Some("claude-sonnet-4-5")),
+            ("gpt-5.6-sol", None),
+            ("claude-sonnet-4-6", None),
+        ] {
+            assert_eq!(super::cloud_model_name(id).as_deref(), name, "{id}");
+        }
+    }
+
     use super::*;
 
     fn usage(input: i64, cache_read: i64, cache_write: i64, output: i64) -> Usage {

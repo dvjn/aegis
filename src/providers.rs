@@ -2,11 +2,15 @@ use crate::compression::{decode_body, decode_brotli_unsniffable};
 use serde::Deserialize;
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     Anthropic,
     Codex,
+    /// Gemini's generateContent format, as Vertex serves it.
+    Gemini,
     TypeSafe,
+    /// Bedrock's Converse API, which pi uses for Bedrock models.
+    BedrockConverse,
 }
 
 impl Provider {
@@ -14,7 +18,9 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic_messages",
             Self::Codex => "openai_responses",
+            Self::Gemini => "google_gemini",
             Self::TypeSafe => "typesafe_systemone",
+            Self::BedrockConverse => "bedrock_converse",
         }
     }
 }
@@ -109,6 +115,15 @@ fn usage_from(provider: Provider, value: &Value) -> Usage {
                 raw_json: serde_json::to_string(value).ok(),
             }
         }
+        // Converse reports cached input apart from `inputTokens`.
+        Provider::BedrockConverse => Usage {
+            input_tokens: integer(value, "inputTokens"),
+            output_tokens: integer(value, "outputTokens"),
+            cache_read_tokens: integer(value, "cacheReadInputTokens"),
+            cache_write_tokens: integer(value, "cacheWriteInputTokens"),
+            reasoning_tokens: None,
+            raw_json: serde_json::to_string(value).ok(),
+        },
         Provider::TypeSafe => Usage {
             input_tokens: integer(value, "input_tokens"),
             output_tokens: integer(value, "output_tokens"),
@@ -117,6 +132,21 @@ fn usage_from(provider: Provider, value: &Value) -> Usage {
             reasoning_tokens: None,
             raw_json: serde_json::to_string(value).ok(),
         },
+        Provider::Gemini => {
+            let cached = integer(value, "cachedContentTokenCount");
+            let thoughts = integer(value, "thoughtsTokenCount");
+            Usage {
+                input_tokens: integer(value, "promptTokenCount")
+                    .map(|n| n.saturating_sub(cached.unwrap_or(0)).max(0)),
+                output_tokens: integer(value, "candidatesTokenCount")
+                    .or(thoughts.map(|_| 0))
+                    .map(|n| n.saturating_add(thoughts.unwrap_or(0))),
+                cache_read_tokens: cached,
+                cache_write_tokens: None,
+                reasoning_tokens: thoughts,
+                raw_json: serde_json::to_string(value).ok(),
+            }
+        }
     }
 }
 
@@ -136,7 +166,14 @@ enum Scan {
 }
 
 fn decoded_response(body: &[u8]) -> Found {
-    match scan_response(&decode_body(body)) {
+    let decoded = decode_body(body);
+    if let Some(sse) = crate::eventstream::to_sse(&decoded) {
+        return match scan_response(&sse) {
+            Scan::Found(found) => found,
+            Scan::NoValues => Found::default(),
+        };
+    }
+    match scan_response(&decoded) {
         Scan::Found(found) => found,
         Scan::NoValues => match decode_brotli_unsniffable(body).map(|body| scan_response(&body)) {
             Some(Scan::Found(found)) => found,
@@ -187,11 +224,29 @@ fn take_model(value: &Value) -> Option<String> {
     [Some(value), value.get("response"), value.get("message")]
         .into_iter()
         .flatten()
-        .find_map(|owner| owner.get("model").and_then(Value::as_str))
+        .find_map(|owner| {
+            owner
+                .get("model")
+                .or_else(|| owner.get("modelVersion"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_owned)
 }
 
 fn take_usage(value: &mut Value) -> Option<Value> {
+    for owner in ["response", ""] {
+        let node = if owner.is_empty() {
+            &mut *value
+        } else {
+            let Some(node) = value.get_mut(owner) else {
+                continue;
+            };
+            node
+        };
+        if let Some(usage) = node.get_mut("usageMetadata").filter(|v| v.is_object()) {
+            return Some(usage.take());
+        }
+    }
     if let Some(usage) = value.get_mut("usage") {
         return Some(usage.take());
     }
@@ -211,6 +266,26 @@ fn integer(value: &Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_stream_totals_cached_input_and_thinking_without_double_counting() {
+        let body = b"data: {\"response\":{\"modelVersion\":\"gemini-3.8-flash-n\",\"candidates\":[]}}\n\ndata: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":40,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":5,\"totalTokenCount\":125}}}\n\n";
+        for body in [
+            body.to_vec(),
+            crate::compression::tests::gzip(body),
+            zstd::encode_all(body.as_slice(), 0).unwrap(),
+        ] {
+            let completion = extract_completion(Provider::Gemini, &body);
+            assert_eq!(completion.model.as_deref(), Some("gemini-3.8-flash-n"));
+            assert_eq!(completion.usage.input_tokens, Some(60));
+            assert_eq!(completion.usage.cache_read_tokens, Some(40));
+            assert_eq!(completion.usage.output_tokens, Some(25));
+            assert_eq!(completion.usage.reasoning_tokens, Some(5));
+            let raw: Value =
+                serde_json::from_str(completion.usage.raw_json.as_ref().unwrap()).unwrap();
+            assert_eq!(raw["totalTokenCount"], 125);
+        }
+    }
 
     const REQUEST: &[u8] = br#"{"model":"gpt-5.6-sol","input":"hello"}"#;
 

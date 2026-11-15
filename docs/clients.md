@@ -68,6 +68,76 @@ Add this override to `~/.pi/agent/models.json`:
 
 The override keeps pi's built-in models and provider authentication. Replace `codex` in the URL when the configured provider uses another ID.
 
+## Amazon Bedrock and Google Vertex AI
+
+A `bedrock` or `vertex` provider serves Claude Code, Codex and pi. Each client keeps its own cloud credentials and sends the Aegis key as an extra header. Claude Code runs Claude models only, and Codex runs OpenAI models only. pi can use any model the cloud offers.
+
+Bedrock needs a Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK`; other AWS credentials fail. Vertex uses your Google Cloud sign-in, such as `gcloud auth application-default login`. The examples use provider IDs `aws` and `gcp`.
+
+### Claude Code
+
+```sh
+export ANTHROPIC_CUSTOM_HEADERS="x-aegis-api-key: YOUR_AEGIS_KEY"
+
+# Bedrock
+export CLAUDE_CODE_USE_BEDROCK=1
+export ANTHROPIC_BEDROCK_BASE_URL="http://127.0.0.1:8765/providers/aws"
+export AWS_REGION=eu-west-1   # the provider's region
+
+# Vertex
+export CLAUDE_CODE_USE_VERTEX=1
+export ANTHROPIC_VERTEX_BASE_URL="http://127.0.0.1:8765/providers/gcp"
+export ANTHROPIC_VERTEX_PROJECT_ID=your-project
+export CLOUD_ML_REGION=global
+```
+
+### Codex
+
+Codex's built-in `amazon-bedrock` and `gcp` providers keep their authentication; only the endpoint moves. They accept only static `http_headers`, not `env_http_headers`, so the Aegis key goes into the file. Add one of these to `~/.codex/config.toml`:
+
+```toml
+# Bedrock
+model_provider = "amazon-bedrock"
+model = "openai.gpt-5.6-sol"
+
+[model_providers.amazon-bedrock]
+base_url = "http://127.0.0.1:8765/providers/aws/openai/v1"
+http_headers = { "x-aegis-api-key" = "YOUR_AEGIS_KEY" }
+
+[model_providers.amazon-bedrock.aws]
+region = "eu-west-1"
+```
+
+```toml
+# Vertex: the base URL names your project and location.
+model_provider = "gcp"
+
+[model_providers.gcp]
+base_url = "http://127.0.0.1:8765/providers/gcp/v1/projects/your-project/locations/global/publishers/openai/v1"
+http_headers = { "x-aegis-api-key" = "YOUR_AEGIS_KEY" }
+```
+
+### pi
+
+With `AEGIS_API_KEY` set, route pi's built-in providers in `~/.pi/agent/models.json`. pi leaves the project and location out of Vertex paths when its endpoint is replaced, so the Vertex URL names them:
+
+```json
+{
+  "providers": {
+    "amazon-bedrock": {
+      "baseUrl": "http://127.0.0.1:8765/providers/aws",
+      "headers": { "x-aegis-api-key": "$AEGIS_API_KEY" }
+    },
+    "google-vertex": {
+      "baseUrl": "http://127.0.0.1:8765/providers/gcp/v1/projects/your-project/locations/global",
+      "headers": { "x-aegis-api-key": "$AEGIS_API_KEY" }
+    }
+  }
+}
+```
+
+Requests, usage and guardrails work as for other providers. Usage records the model named in the request path, and cloud model IDs such as `eu.anthropic.claude-sonnet-4-6-v1:0` are priced as their plain model.
+
 ## TypeSafe
 
 Both official SDKs read the API root from `TYPESAFE_BASE_URL`, so the gateway URL is set once for every program on the machine:

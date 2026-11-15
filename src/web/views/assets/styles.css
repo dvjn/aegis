@@ -1468,3 +1468,13 @@ button.danger:hover {
   color: var(--ink-secondary);
   font-size: 13px;
 }
+
+/* Fields for one provider type, shown only while that type is selected.
+   Pages carry no script, so the add form's own selection decides. */
+.bedrock-only {
+  display: none;
+}
+
+form:has(select[name="kind"] option[value="bedrock"]:checked) .bedrock-only {
+  display: block;
+}
