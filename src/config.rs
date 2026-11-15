@@ -1,7 +1,7 @@
 use crate::domain::{AuthConfig, OAuthConfig, SmtpSettings};
 use anyhow::{Context, Result, bail};
 use hkdf::Hkdf;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -27,7 +27,7 @@ pub struct Config {
     pub secret_placeholder_key: [u8; 32],
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct GuardrailsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -41,7 +41,7 @@ pub struct GuardrailsConfig {
 
 /// One guardrail. `detectors` names the subset to run; absent, every detector
 /// of that guardrail runs.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct GuardrailConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -60,7 +60,7 @@ impl GuardrailConfig {
 
 /// User-defined detectors: a name and the regex it runs. Every match is
 /// masked like a secret.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RegexGuardrailConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -68,7 +68,7 @@ pub struct RegexGuardrailConfig {
     pub detectors: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailsMode {
     #[default]
@@ -148,6 +148,36 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    pub const TYPE_NAMES: [&'static str; 3] = ["claude_subscription", "codex_subscription", "typesafe"];
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeSubscription { .. } => "claude_subscription",
+            Self::CodexSubscription { .. } => "codex_subscription",
+            Self::TypeSafe { .. } => "typesafe",
+        }
+    }
+
+    /// Rebuilds a kind from its stored type name; an absent `base_url` takes
+    /// that type's default upstream.
+    pub fn from_parts(type_name: &str, base_url: Option<String>) -> Result<Self> {
+        Ok(match type_name {
+            "claude_subscription" => Self::ClaudeSubscription {
+                base_url: base_url.unwrap_or_else(default_anthropic_base_url),
+            },
+            "codex_subscription" => Self::CodexSubscription {
+                base_url: base_url.unwrap_or_else(default_codex_base_url),
+            },
+            "typesafe" => Self::TypeSafe {
+                base_url: base_url.unwrap_or_else(default_typesafe_base_url),
+            },
+            other => bail!(
+                "provider type {other:?} must be one of {}",
+                Self::TYPE_NAMES.join(", ")
+            ),
+        })
+    }
+
     pub fn base_url(&self) -> &str {
         match self {
             Self::ClaudeSubscription { base_url }
@@ -193,6 +223,35 @@ impl Default for FileConfig {
 }
 
 impl Config {
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self {
+            http_addr: default_http_addr(),
+            database_url: default_database_url(),
+            max_capture_bytes: default_max_capture_bytes(),
+            providers: Vec::new(),
+            public_url: None,
+            registration_enabled: false,
+            smtp: None,
+            auth: AuthConfig {
+                session_hmac_key: [1; 32],
+                session_key_id: "v1".into(),
+                password_pepper: vec![2; 32],
+                pepper_key_id: "v1".into(),
+                password_concurrency: 2,
+                idle_lifetime: Duration::from_secs(60),
+                absolute_lifetime: Duration::from_secs(60),
+            },
+            oauth: OAuthConfig {
+                hmac_key: [3; 32],
+                key_id: "v1".into(),
+            },
+            pricing: PricingConfig::default(),
+            guardrails: GuardrailsConfig::default(),
+            secret_placeholder_key: [4; 32],
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         let path = env::var("AEGIS_CONFIG").unwrap_or_else(|_| "config.toml".into());
         let file = if Path::new(&path).exists() {
@@ -242,19 +301,7 @@ impl Config {
         validate_pricing(&pricing)?;
 
         let mut guardrails = file.guardrails;
-        if let Some(enabled) = optional_var("GUARDRAILS_ENABLED")? {
-            guardrails.enabled = enabled
-                .parse()
-                .context("GUARDRAILS_ENABLED must be true or false")?;
-        }
-        if let Some(mode) = optional_var("GUARDRAILS_MODE")? {
-            guardrails.mode = mode.parse()?;
-        }
-        if let Some(enabled) = optional_var("GUARDRAILS_SECRETS_ENABLED")? {
-            guardrails.secrets.enabled = enabled
-                .parse()
-                .context("GUARDRAILS_SECRETS_ENABLED must be true or false")?;
-        }
+        apply_guardrails_env(&mut guardrails)?;
         validate_detectors(&guardrails)?;
 
         let smtp = smtp_config()?;
@@ -285,6 +332,25 @@ impl Config {
             secret_placeholder_key: derive_key(&root_key, b"aegis/v1/secret-placeholder"),
         })
     }
+}
+
+/// Environment variables override the file's guardrails. Both are read only by
+/// the one-time import into the database (see `settings::import_config_once`).
+fn apply_guardrails_env(guardrails: &mut GuardrailsConfig) -> Result<()> {
+    if let Some(enabled) = optional_var("GUARDRAILS_ENABLED")? {
+        guardrails.enabled = enabled
+            .parse()
+            .context("GUARDRAILS_ENABLED must be true or false")?;
+    }
+    if let Some(mode) = optional_var("GUARDRAILS_MODE")? {
+        guardrails.mode = mode.parse()?;
+    }
+    if let Some(enabled) = optional_var("GUARDRAILS_SECRETS_ENABLED")? {
+        guardrails.secrets.enabled = enabled
+            .parse()
+            .context("GUARDRAILS_SECRETS_ENABLED must be true or false")?;
+    }
+    Ok(())
 }
 
 fn smtp_config() -> Result<Option<SmtpSettings>> {
@@ -432,7 +498,7 @@ fn default_pricing_enabled() -> bool {
     true
 }
 
-fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
+pub(crate) fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
     let mut ids = HashSet::new();
     for provider in providers {
         let valid_id = !provider.id.is_empty()
@@ -475,7 +541,7 @@ fn validate_pricing(pricing: &PricingConfig) -> Result<()> {
 
 /// A misspelled detector would silently mask nothing, so a name that no
 /// guardrail defines is refused at startup.
-fn validate_detectors(guardrails: &GuardrailsConfig) -> Result<()> {
+pub(crate) fn validate_detectors(guardrails: &GuardrailsConfig) -> Result<()> {
     if let Some(names) = &guardrails.secrets.detectors {
         let known = crate::policies::detect::names(&crate::policies::secrets::DETECTORS);
         for name in names {

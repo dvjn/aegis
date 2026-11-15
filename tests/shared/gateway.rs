@@ -210,6 +210,7 @@ impl Gateway {
             workdir.join("aegis.toml"),
             config_file(port, upstream.base_url(), &options),
         )?;
+        provision_settings(binary, &workdir, upstream.base_url(), &options)?;
         let api_key = provision_credentials(binary, &workdir)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
@@ -580,12 +581,12 @@ fn install_crypto_provider() {
     });
 }
 
+/// Releases before database-backed settings read providers and guardrails
+/// from this file, and the load suite still starts such a baseline binary.
+/// Newer releases ignore these sections on a new database and get the same
+/// settings from [`provision_settings`].
 fn config_file(port: u16, upstream_url: &str, options: &GatewayOptions) -> String {
-    let enabled = options.guardrails != GuardrailsMode::Off;
-    let mode = match options.guardrails {
-        GuardrailsMode::Off => GuardrailsMode::Observe,
-        mode => mode,
-    };
+    let (enabled, mode) = guardrails_settings(options);
     format!(
         r#"http_addr = "127.0.0.1:{port}"
 database_url = "sqlite://data/aegis.db?mode=rwc"
@@ -619,6 +620,62 @@ base_url = "{upstream_url}"
         capture = options.max_capture_bytes,
         mode = mode.label(),
     )
+}
+
+fn guardrails_settings(options: &GatewayOptions) -> (bool, GuardrailsMode) {
+    let enabled = options.guardrails != GuardrailsMode::Off;
+    let mode = match options.guardrails {
+        GuardrailsMode::Off => GuardrailsMode::Observe,
+        mode => mode,
+    };
+    (enabled, mode)
+}
+
+/// Providers and guardrails live in the database, so a new instance gets them
+/// through the CLI rather than the configuration file.
+fn provision_settings(
+    binary: &Path,
+    workdir: &Path,
+    upstream_url: &str,
+    options: &GatewayOptions,
+) -> Result<()> {
+    if !run_cli(binary, workdir, &["--help"])?.contains("guardrails") {
+        return Ok(());
+    }
+    for (id, kind) in [
+        ("claude", "claude_subscription"),
+        ("codex", "codex_subscription"),
+        ("typesafe", "typesafe"),
+    ] {
+        run_cli(
+            binary,
+            workdir,
+            &[
+                "provider",
+                "add",
+                id,
+                "--type",
+                kind,
+                "--base-url",
+                upstream_url,
+            ],
+        )?;
+    }
+    let (enabled, mode) = guardrails_settings(options);
+    run_cli(
+        binary,
+        workdir,
+        &[
+            "guardrails",
+            "set",
+            "--enabled",
+            &enabled.to_string(),
+            "--mode",
+            mode.label(),
+        ],
+    )?;
+    run_cli(binary, workdir, &["guardrails", "secrets", "all"])?;
+    Ok(())
 }
 
 fn provision_credentials(binary: &Path, workdir: &Path) -> Result<String> {

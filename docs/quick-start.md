@@ -9,7 +9,7 @@ The commands below use Podman. Replace `podman` with `docker` if needed.
 
 ## 1. Create the configuration
 
-Create `config.toml` from the complete example in [Configuration](configuration/README.md#example). Add the providers this Aegis instance will route.
+Create `config.toml` from the complete example in [Configuration](configuration/README.md#config-file).
 
 Set `public_url` when clients will reach Aegis through a URL other than `http://127.0.0.1:8765`.
 
@@ -17,7 +17,7 @@ Set `public_url` when clients will reach Aegis through a URL other than `http://
 podman volume create aegis-data
 ```
 
-Provider IDs become part of the gateway URL. Keep the configuration file when you restart or upgrade Aegis.
+Keep the configuration file and the `aegis-data` volume when you restart or upgrade Aegis.
 
 ## 2. Create the first account
 
@@ -43,7 +43,11 @@ podman run --rm --name aegis \
   ghcr.io/dvjn/aegis:latest
 ```
 
-Open <http://127.0.0.1:8765>, sign in, and create an API key under **Account**. Grant the key access to the provider the client will use.
+Open <http://127.0.0.1:8765> and sign in. The first account is a superuser.
+
+Add the providers this instance will route under **Instance settings** (the gear button in the top bar), or add your own under **Account** → **Providers**. Provider IDs become part of the gateway URL. See [Providers and guardrails](configuration/README.md#providers-and-guardrails).
+
+Create an API key under **Account** and grant it access to the provider the client will use.
 
 ## 4. Connect a client
 

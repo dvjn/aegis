@@ -1303,3 +1303,161 @@ a[role="button"].compact {
     letter-spacing: .16em;
   }
 }
+
+/* --- Settings ------------------------------------------------------------ */
+
+/* The account and settings pages share one row of tabs under the title. */
+.settings-tabs {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 var(--space-6);
+  overflow-x: auto;
+}
+
+select,
+textarea {
+  display: block;
+  width: 100%;
+  margin: 0 0 var(--space-4);
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  color: var(--ink);
+  background: var(--surface-2);
+  font: inherit;
+  font-size: 14px;
+}
+
+select {
+  min-height: var(--control-height);
+}
+
+textarea {
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+select:hover,
+textarea:hover {
+  border-color: var(--line-hover);
+}
+
+select:focus-visible,
+textarea:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 0;
+}
+
+input:disabled {
+  color: var(--muted);
+  background: var(--surface-1);
+}
+
+.checkbox-row input[type="radio"] {
+  width: 14px;
+  height: 14px;
+  min-height: 0;
+  margin: 0;
+  flex: none;
+  accent-color: var(--accent);
+}
+
+.checkbox-grid.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* A lone switch above the field groups it governs. */
+.toggle-row {
+  margin: 0 0 var(--space-4);
+}
+
+.field-note {
+  clear: both;
+  margin: 0;
+  padding: 0 var(--space-3) var(--space-3);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.advanced {
+  margin: 0 0 var(--space-4);
+}
+
+.advanced summary {
+  margin: 0 0 var(--space-3);
+  color: var(--ink-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.pattern-rows {
+  clear: both;
+  padding: var(--space-3) var(--space-3) 0;
+}
+
+.pattern-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto;
+  gap: var(--space-2);
+  align-items: start;
+}
+
+.pattern-row input:not([type="hidden"]) {
+  margin-bottom: var(--space-2);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.pattern-row .status-tag {
+  margin: 8px 0 0;
+}
+
+/* Row buttons line up with the inputs beside them. */
+.pattern-row button {
+  min-height: var(--control-height);
+  margin-bottom: var(--space-2);
+}
+
+/* An edit form that takes over a table row. */
+.inline-form {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.inline-form input:not([type="hidden"]) {
+  min-height: var(--control-height-sm);
+  margin: 0;
+}
+
+.danger-card {
+  border-color: var(--danger-line);
+  background: var(--danger-surface);
+}
+
+button.danger {
+  border-color: var(--danger);
+  color: var(--ink);
+  background: var(--danger-line);
+}
+
+button.danger:hover {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .pattern-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+}
+
+.plain-list {
+  margin: 0 0 var(--space-4);
+  padding-left: var(--space-5);
+  color: var(--ink-secondary);
+  font-size: 13px;
+}

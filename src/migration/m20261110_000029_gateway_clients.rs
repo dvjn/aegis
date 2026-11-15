@@ -81,9 +81,12 @@ mod tests {
     #[tokio::test]
     async fn legacy_relay_secrets_are_removed_without_losing_request_or_bucket_history() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, Some((Migrator::migrations().len() - 1) as u32))
-            .await
-            .unwrap();
+        let this = Migration.name();
+        let before = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == this)
+            .expect("this migration is registered");
+        Migrator::up(&db, Some(before as u32)).await.unwrap();
         for sql in [
             "INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('u1','migration@example.com','migration@example.com','user','active',0,'2026-01-01','2026-01-01')",
             "INSERT INTO oauth_clients(id,issuer,client_name,application_type,grant_types,response_types,scope,token_endpoint_auth_method,created_at) VALUES('app1','https://aegis.example','AGS machine','native','refresh_token','','relay:manage offline_access','none','2026-01-01')",

@@ -81,6 +81,7 @@ pub(super) async fn root(
         provider_series: &provider_series.map_err(DomainError::from)?,
         client_series: &client_series.map_err(DomainError::from)?,
         guardrails: &guardrails,
+        superuser: is_superuser(&principal),
     };
     Ok(views::home::page(&overview).into_response())
 }
@@ -466,7 +467,14 @@ fn to_login() -> Response {
     Redirect::to("/login").into_response()
 }
 
-async fn account_principal(state: &AppState, jar: &CookieJar) -> Option<(Principal, String)> {
+pub(super) fn is_superuser(principal: &Principal) -> bool {
+    principal.role() == "superuser"
+}
+
+pub(super) async fn account_principal(
+    state: &AppState,
+    jar: &CookieJar,
+) -> Option<(Principal, String)> {
     let csrf = state.csrf_value(jar)?.to_owned();
     let principal = authenticate(state, jar, Some(&csrf)).await.ok()?;
     Some((principal, csrf))
@@ -503,7 +511,8 @@ async fn render_account(
         &sessions,
         &apps,
         &keys,
-        &state.gateway.provider_ids(),
+        &state.gateway.provider_ids(&principal.user_id().to_string()),
+        is_superuser(principal),
         revealed,
         key_error,
         notice,
@@ -640,7 +649,7 @@ pub(super) async fn api_key_create(
     let Ok(principal) = authenticate(&state, &jar, Some(&input.csrf)).await else {
         return Ok(to_login());
     };
-    let configured = state.gateway.provider_ids();
+    let configured = state.gateway.provider_ids(&principal.user_id().to_string());
     if input.providers.iter().any(|id| !configured.contains(id)) {
         return key_failure(
             &state,

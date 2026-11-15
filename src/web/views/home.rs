@@ -25,6 +25,7 @@ pub struct Overview<'a> {
     pub provider_series: &'a [LabeledSeries],
     pub client_series: &'a [LabeledSeries],
     pub guardrails: &'a GuardrailsSummary,
+    pub superuser: bool,
 }
 
 const TILE_SPARKLINE: (u32, u32) = (96, 28);
@@ -34,7 +35,7 @@ pub fn page(overview: &Overview<'_>) -> Markup {
     let totals = overview.totals;
     layout_with_nav(
         "Aegis",
-        Some(signed_in_nav()),
+        Some(signed_in_nav(overview.superuser)),
         html! {
             main class="account-shell" {
                 div class="page-head" {
@@ -536,6 +537,7 @@ mod tests {
             tokens: vec![10, 25, 0, 0, 0, 0, 0, 0],
         }];
         let page = page(&Overview {
+            superuser: false,
             range: Range::Week,
             totals: &totals,
             context: &ContextTotals::default(),
@@ -627,6 +629,7 @@ mod tests {
             },
         ];
         let page = page(&Overview {
+            superuser: false,
             range: Range::Week,
             totals: &UsageTotals::default(),
             context: &ContextTotals::default(),
@@ -908,6 +911,7 @@ mod tests {
             ],
         };
         let page = page(&Overview {
+            superuser: false,
             range: Range::Week,
             totals: &UsageTotals::default(),
             context: &ContextTotals::default(),
@@ -988,6 +992,7 @@ mod tests {
 
     fn page_without_traffic() -> Markup {
         page(&Overview {
+            superuser: false,
             range: Range::Week,
             totals: &UsageTotals::default(),
             context: &ContextTotals::default(),

@@ -2,7 +2,7 @@
 
 ## 1. Prepare the configuration
 
-Create `config.toml`. At minimum, set the public URL and one provider. See [Configuration](../configuration/README.md).
+Create `config.toml`. At minimum, set the public URL. See [Configuration](../configuration/README.md). Providers and guardrails are added after the server starts, in the web interface or with `aegis provider` and `aegis guardrails`.
 
 Create persistent storage:
 

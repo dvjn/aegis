@@ -119,6 +119,12 @@ impl KeyStore {
         Ok(plaintext)
     }
 
+    /// Forgets authenticated keys, so a change to grants applies to the next
+    /// request rather than after the cache entry expires.
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
+    }
+
     async fn create_version(&self, key_id: &str) -> Result<String> {
         let version_id = Uuid::now_v7().simple().to_string();
         let mut secret = [0_u8; 32];

@@ -8,6 +8,7 @@ pub mod login;
 pub mod permissions;
 pub mod register;
 pub mod reset;
+pub mod settings;
 pub mod tools;
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -33,8 +34,19 @@ pub static FONT_STYLE: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-pub fn signed_in_nav() -> Markup {
+/// The signed-in controls in the top bar. Superusers also get the instance
+/// settings, kept apart from their own account settings.
+pub fn signed_in_nav(superuser: bool) -> Markup {
     html! {
+        @if superuser {
+            a class="nav-icon" href="/admin/providers" role="button" aria-label="Instance settings" title="Instance settings" {
+                svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"
+                    fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" {
+                    circle cx="12" cy="12" r="3" {}
+                    path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" {}
+                }
+            }
+        }
         a class="nav-icon" href="/account" role="button" aria-label="Account" title="Account" {
             svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"
                 fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" {

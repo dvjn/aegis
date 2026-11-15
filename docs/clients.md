@@ -14,7 +14,7 @@ export ANTHROPIC_CUSTOM_HEADERS="x-aegis-api-key: YOUR_AEGIS_KEY"
 claude
 ```
 
-Replace `claude` in the URL when the configured provider uses another ID.
+Replace `claude` in the URL when the provider uses another ID.
 
 ## Codex
 

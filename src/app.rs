@@ -18,12 +18,13 @@ pub fn router(
     domain: Arc<Domain>,
     gateway: Gateway,
     keys: KeyStore,
+    settings: crate::settings::SettingsStore,
     usage: UsageStore,
     origin: OriginPolicy,
     cancellation: CancellationToken,
 ) -> Router {
     let session = web::SessionState::new(domain.clone(), origin.clone());
-    let web_state = web::AppState::new(session.clone(), gateway.clone(), keys, usage);
+    let web_state = web::AppState::new(session.clone(), gateway.clone(), keys, settings, usage);
     let oauth_state = oauth::State::new(session);
     let mcp_state = mcp::State::new(domain.oauth().clone(), origin);
     let web_and_gateway = Router::new()

@@ -29,6 +29,25 @@ impl WebError {
     pub fn is_invalid_credentials(&self) -> bool {
         self.code == "invalid_credentials"
     }
+    pub fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+        }
+    }
+    pub fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+        }
+    }
+    pub fn internal(error: impl std::fmt::Display) -> Self {
+        tracing::error!(%error, "web request failed");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+        }
+    }
     pub fn forbidden_request() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,

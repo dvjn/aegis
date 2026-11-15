@@ -1,10 +1,10 @@
 # Configuration
 
-Aegis reads settings from `config.toml` in the working directory. Environment variables select the file, override selected settings, and configure mail and logs.
+Aegis reads server settings from `config.toml` in the working directory. Environment variables select the file, override selected settings, and configure mail and logs. Providers and guardrails are stored in the database; see [Providers and guardrails](#providers-and-guardrails).
 
 ## Config file
 
-Create `config.toml` from this block. Uncomment settings that need non-default values and add one `[[providers]]` table per provider.
+Create `config.toml` from this block. Uncomment settings that need non-default values.
 
 ```toml
 # Optional. Listener address and port.
@@ -28,33 +28,6 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # Default: false.
 # registration_enabled = false
 
-# Optional. Scans request bodies for secrets. Default: disabled.
-# [guardrails]
-# enabled = false
-# mode = "observe" # observe | mask. Observe records matches; mask replaces them before forwarding.
-#
-# Optional. Enabled by default when guardrails are enabled. Omit detectors to run all built-ins.
-# [guardrails.secrets]
-# enabled = true
-# detectors = [
-#   "anthropic_api_key", "openai_api_key", "github_token", "gitlab_token",
-#   "aws_access_key_id", "slack_token", "google_api_key", "stripe_key",
-#   "npm_token", "jwt", "pem_private_key", "aegis_api_key",
-# ]
-#
-# Optional. User-defined patterns masked like secrets.
-# [guardrails.regex]
-# enabled = true
-# [guardrails.regex.detectors]
-# internal_token = '\bint_[a-z0-9]{32}\b' # Names must be unique lowercase snake_case.
-# employee_id = '\bEMP-\d{6}\b'
-
-# Optional. Add one table per upstream provider.
-# [[providers]]
-# id = "provider-name" # Required. Unique URL segment and API-key permission name. Maximum 64 characters: letters, digits, - or _.
-# type = "claude_subscription" # Required: claude_subscription | codex_subscription | typesafe.
-# base_url = "https://provider.example/v1" # Optional. The provider type supplies a default.
-
 # Optional. Controls model-price refreshes.
 # [pricing]
 # enabled = true # Default: true.
@@ -72,7 +45,55 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 
 Aegis creates `data/root.key` on first start. The file must contain 32 bytes and must not be accessible by group or other users.
 
-Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header. The API key must allow the selected provider.
+## Providers and guardrails
+
+Providers and guardrails live in the database at two layers:
+
+- **Instance:** set by superusers under **Instance settings** (the gear button in the top bar, shown only to superusers), or with the `aegis provider` and `aegis guardrails` commands. Every user can use instance providers, and instance guardrails apply to every request.
+- **User:** each user adds their own under **Providers** and **Guardrails** in their account settings (the person button in the top bar). Nobody else sees or edits them.
+
+A running server picks up changes made in the web interface immediately, and changes made with the CLI within 15 seconds.
+
+### Providers
+
+A provider has an ID, a type, and an optional upstream base URL. Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header, and the key must allow that provider.
+
+- IDs contain only letters, digits, `-` or `_`, up to 64 characters. A user's provider cannot reuse an instance provider's ID, and an instance provider cannot take an ID a user already has.
+- Types: `claude_subscription`, `codex_subscription`, `typesafe`. Each type has a default upstream.
+- The ID and type cannot change after creation, because client URLs and usage history refer to them. Only the upstream can be edited.
+- Deleting a provider removes it from every API key that was granted it. Usage history stays.
+- Deleting an instance provider that users' active API keys use offers two choices: **Delete for everyone**, or **Keep for users**, which gives each of those users a copy of their own with the same ID, type and upstream, then removes it from the instance. Their keys keep working, and they can edit or delete their copy. Other users lose access.
+
+```sh
+aegis provider add claude --type claude_subscription
+aegis provider add work --type codex_subscription --base-url https://proxy.example/codex
+aegis provider update work --default-url
+aegis provider list
+aegis provider keep-for-users work   # delete from the instance, keeping a copy for each user of it
+aegis provider remove work
+```
+
+### Guardrails
+
+Guardrails scan request bodies before they reach a provider. Each layer turns on secret detection (built-in detectors) and custom regex patterns, and chooses a mode: `observe` records matches; `mask` replaces them before forwarding and restores them in the response.
+
+The instance layer is a minimum that users can only add to. On a user's request, a layer that is on stays on, `mask` wins over `observe`, and the detectors and patterns of both layers run. A user's pattern cannot reuse the name of an instance pattern. The **Guardrails** page has a test box that shows what the saved settings would find in a sample.
+
+```sh
+aegis guardrails show
+aegis guardrails set --enabled true --mode mask
+aegis guardrails secrets all                   # every built-in detector
+aegis guardrails secrets disable jwt           # all except jwt
+aegis guardrails secrets disable               # secret detection off
+aegis guardrails regex add employee_id '\bEMP-\d{6}\b'
+aegis guardrails regex remove employee_id
+```
+
+Built-in secret detectors: `anthropic_api_key`, `openai_api_key`, `github_token`, `gitlab_token`, `aws_access_key_id`, `slack_token`, `google_api_key`, `stripe_key`, `npm_token`, `jwt`, `pem_private_key`, `aegis_api_key`. Pattern names are unique lowercase snake_case.
+
+### Upgrading from configuration-file settings
+
+Earlier releases read `[[providers]]` and `[guardrails]` from `config.toml`, with `GUARDRAILS_ENABLED`, `GUARDRAILS_MODE` and `GUARDRAILS_SECRETS_ENABLED` as overrides. On the first start after upgrading, Aegis copies those settings once into the instance layer. After that, and on any new installation, those sections and variables are ignored, and Aegis logs a warning if they are still set. Remove them once the import is done.
 
 ## Environment variables
 
@@ -89,14 +110,6 @@ Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header.
 | `HTTP_ADDR` | no | config file | `http_addr` |
 | `DATABASE_URL` | no | config file | `database_url` |
 | `MAX_CAPTURE_BYTES` | no | config file | `max_capture_bytes` |
-
-### Guardrail overrides
-
-| Variable | Required | Default | Overrides |
-| --- | --- | --- | --- |
-| `GUARDRAILS_ENABLED` | no | config file | `guardrails.enabled` |
-| `GUARDRAILS_MODE` | no | config file | `guardrails.mode` |
-| `GUARDRAILS_SECRETS_ENABLED` | no | config file | `guardrails.secrets.enabled` |
 
 ### Mail
 

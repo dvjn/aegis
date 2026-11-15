@@ -20,6 +20,7 @@ mod pricing;
 mod providers;
 mod request_id;
 mod request_metrics;
+mod settings;
 mod telemetry;
 mod tool_usage_hourly;
 mod usage;
@@ -30,9 +31,10 @@ mod web;
 use anyhow::{Context, Result, bail};
 use api_keys::KeyStore;
 use clap::{Parser, Subcommand};
-use config::Config;
+use config::{Config, GuardrailsMode, ProviderConfig, ProviderKind};
 use domain::{Domain, DomainOptions, LogMailer, Mailer, SmtpMailer};
 use sea_orm::DatabaseConnection;
+use settings::{Scope, SettingsStore};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use tokio::{net::TcpListener, signal};
 use tokio_util::sync::CancellationToken;
@@ -51,6 +53,16 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: KeyCommand,
+    },
+    /// Manage instance providers, which every user can use.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
+    /// Manage instance guardrails, which apply to every user's requests.
+    Guardrails {
+        #[command(subcommand)]
+        command: GuardrailsCommand,
     },
     BootstrapUser {
         #[arg(long)]
@@ -81,6 +93,84 @@ enum KeyCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ProviderCommand {
+    /// Create an instance provider.
+    Add {
+        id: String,
+        #[arg(long = "type", value_parser = clap::builder::PossibleValuesParser::new(ProviderKind::TYPE_NAMES))]
+        kind: String,
+        /// Upstream base URL; defaults to the provider type's usual upstream.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Change an instance provider's upstream. Its ID and type are fixed.
+    Update {
+        id: String,
+        #[arg(
+            long,
+            conflicts_with = "default_url",
+            required_unless_present = "default_url"
+        )]
+        base_url: Option<String>,
+        /// Go back to the provider type's usual upstream.
+        #[arg(long)]
+        default_url: bool,
+    },
+    List,
+    /// Replace an instance provider with a copy owned by each user whose
+    /// active API keys or connected apps use it, and remove it from the instance.
+    KeepForUsers {
+        id: String,
+    },
+    /// Delete an instance provider and remove it from every key and app grant.
+    Remove {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GuardrailsCommand {
+    /// Print the instance guardrails as TOML.
+    Show,
+    Set {
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["observe", "mask"]))]
+        mode: Option<String>,
+    },
+    /// Turn secret detection on or off, or choose its detectors.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
+    /// Manage custom regex detectors.
+    Regex {
+        #[command(subcommand)]
+        command: RegexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretsCommand {
+    /// With no names, turns secret detection on with its current detectors.
+    /// With names, adds those detectors.
+    Enable { detectors: Vec<String> },
+    /// With no names, turns secret detection off. With names, stops running
+    /// those detectors.
+    Disable { detectors: Vec<String> },
+    /// Runs every built-in detector.
+    All,
+}
+
+#[derive(Subcommand)]
+enum RegexCommand {
+    Add { name: String, pattern: String },
+    Remove { name: String },
+    Enable,
+    Disable,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -91,9 +181,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::from_env()?;
     let database = db::connect(&config.database_url).await?;
+    SettingsStore::new(database.clone())
+        .import_config_once(&config)
+        .await?;
     let result = match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, database.clone()).await,
-        Command::Key { command } => manage_key(command, &config, database.clone()).await,
+        Command::Key { command } => manage_key(command, database.clone()).await,
+        Command::Provider { command } => manage_provider(command, database.clone()).await,
+        Command::Guardrails { command } => manage_guardrails(command, database.clone()).await,
         Command::BootstrapUser {
             email,
             password_file,
@@ -135,15 +230,26 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
         Ok(closed) => tracing::info!(closed, "closed out interrupted gateway requests"),
         Err(error) => tracing::warn!(%error, "failed to close out interrupted gateway requests"),
     }
+    let settings = SettingsStore::new(database.clone());
     let gateway = gateway::Gateway::new(
         sink,
         keys.clone(),
-        policies::pipeline(&config.guardrails, config.secret_placeholder_key),
-        config.providers,
+        Default::default(),
+        config.secret_placeholder_key,
+        Vec::new(),
         config.max_capture_bytes,
     )
     .context("failed to construct gateway")?;
+    gateway
+        .reload(&settings)
+        .await
+        .context("failed to load providers and guardrails")?;
     let cancellation = CancellationToken::new();
+    gateway.spawn_refresh(
+        settings.clone(),
+        std::time::Duration::from_secs(15),
+        cancellation.clone(),
+    );
     match pricing::load_effective_map(&database, &config.pricing).await {
         Ok(map) => {
             pricing::install(map);
@@ -156,6 +262,7 @@ async fn serve(config: Config, database: DatabaseConnection) -> Result<()> {
         domain,
         gateway,
         keys,
+        settings,
         usage,
         origin::OriginPolicy::new(config.public_url),
         cancellation.clone(),
@@ -207,22 +314,159 @@ async fn bootstrap_user(
     Ok(())
 }
 
-async fn manage_key(
-    command: KeyCommand,
-    config: &Config,
-    database: DatabaseConnection,
-) -> Result<()> {
-    let keys = KeyStore::new(database);
+fn settings_error(error: settings::SettingsError) -> anyhow::Error {
+    match error {
+        settings::SettingsError::Invalid(message) => anyhow::anyhow!(message),
+        settings::SettingsError::Backend(error) => error,
+    }
+}
+
+async fn manage_provider(command: ProviderCommand, database: DatabaseConnection) -> Result<()> {
+    let store = SettingsStore::new(database);
+    match command {
+        ProviderCommand::Add { id, kind, base_url } => {
+            let provider = ProviderConfig {
+                kind: ProviderKind::from_parts(&kind, base_url)?,
+                id,
+            };
+            store
+                .create_provider(Scope::Instance, &provider)
+                .await
+                .map_err(settings_error)?;
+            println!("added: {}", provider.id);
+        }
+        ProviderCommand::Update {
+            id,
+            base_url,
+            default_url: _,
+        } => {
+            if !store
+                .update_provider(Scope::Instance, &id, base_url)
+                .await
+                .map_err(settings_error)?
+            {
+                bail!("instance provider {id:?} was not found");
+            }
+            println!("updated: {id}");
+        }
+        ProviderCommand::List => {
+            for provider in store.providers(Scope::Instance).await? {
+                println!(
+                    "{}\t{}\t{}",
+                    provider.id,
+                    provider.kind.type_name(),
+                    provider.kind.base_url()
+                );
+            }
+        }
+        ProviderCommand::KeepForUsers { id } => {
+            let users = store.instance_provider_users(&id).await?;
+            match store.move_to_users(&id).await.map_err(settings_error)? {
+                None => bail!("instance provider {id:?} was not found"),
+                Some(_) => {
+                    for (_, email) in &users {
+                        println!("copied to: {email}");
+                    }
+                    println!("removed from instance: {id}");
+                }
+            }
+        }
+        ProviderCommand::Remove { id } => {
+            if !store
+                .delete_provider(Scope::Instance, &id)
+                .await
+                .map_err(settings_error)?
+            {
+                bail!("instance provider {id:?} was not found");
+            }
+            println!("removed: {id}");
+        }
+    }
+    Ok(())
+}
+
+async fn manage_guardrails(command: GuardrailsCommand, database: DatabaseConnection) -> Result<()> {
+    let store = SettingsStore::new(database);
+    let mut guardrails = store.instance_guardrails().await?;
+    match command {
+        GuardrailsCommand::Show => {
+            print!("{}", toml::to_string(&guardrails)?);
+            return Ok(());
+        }
+        GuardrailsCommand::Set { enabled, mode } => {
+            if let Some(enabled) = enabled {
+                guardrails.enabled = enabled;
+            }
+            if let Some(mode) = mode {
+                guardrails.mode = mode.parse::<GuardrailsMode>()?;
+            }
+        }
+        GuardrailsCommand::Secrets { command } => {
+            let all = || {
+                policies::detect::names(&policies::secrets::DETECTORS)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            let secrets = &mut guardrails.secrets;
+            match command {
+                SecretsCommand::All => {
+                    secrets.enabled = true;
+                    secrets.detectors = None;
+                }
+                SecretsCommand::Enable { detectors } if detectors.is_empty() => {
+                    secrets.enabled = true;
+                }
+                SecretsCommand::Disable { detectors } if detectors.is_empty() => {
+                    secrets.enabled = false;
+                }
+                SecretsCommand::Enable { detectors } => {
+                    if let Some(current) = &mut secrets.detectors {
+                        current.extend(detectors);
+                        current.sort();
+                        current.dedup();
+                    }
+                }
+                SecretsCommand::Disable { detectors } => {
+                    let current = secrets.detectors.get_or_insert_with(all);
+                    current.retain(|name| !detectors.contains(name));
+                }
+            }
+        }
+        GuardrailsCommand::Regex { command } => match command {
+            RegexCommand::Add { name, pattern } => {
+                guardrails.regex.enabled = true;
+                guardrails.regex.detectors.insert(name, pattern);
+            }
+            RegexCommand::Remove { name } => {
+                if guardrails.regex.detectors.remove(&name).is_none() {
+                    bail!("regex detector {name:?} was not found");
+                }
+            }
+            RegexCommand::Enable => guardrails.regex.enabled = true,
+            RegexCommand::Disable => guardrails.regex.enabled = false,
+        },
+    }
+    store
+        .set_guardrails(Scope::Instance, &guardrails)
+        .await
+        .map_err(settings_error)?;
+    print!("{}", toml::to_string(&guardrails)?);
+    Ok(())
+}
+
+async fn manage_key(command: KeyCommand, database: DatabaseConnection) -> Result<()> {
+    let keys = KeyStore::new(database.clone());
     match command {
         KeyCommand::Create {
             user,
             name,
             providers,
         } => {
-            let configured: HashSet<_> = config
-                .providers
-                .iter()
-                .map(|provider| provider.id.as_str())
+            let configured: HashSet<_> = SettingsStore::new(database.clone())
+                .visible_provider_ids(user)
+                .await?
+                .into_iter()
                 .collect();
             let unknown: Vec<_> = providers
                 .iter()

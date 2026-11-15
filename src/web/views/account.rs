@@ -61,6 +61,7 @@ pub fn page(
     apps: &[ConnectedClient],
     keys: &[KeySummary],
     providers: &[String],
+    superuser: bool,
     revealed: Option<&str>,
     key_error: Option<&str>,
     notice: Option<&str>,
@@ -68,7 +69,7 @@ pub fn page(
 ) -> Markup {
     layout_with_nav(
         "Account · Aegis",
-        Some(signed_in_nav()),
+        Some(signed_in_nav(superuser)),
         html! {
             main class="account-shell" {
                 div class="page-head" {
@@ -78,6 +79,7 @@ pub fn page(
                         button type="submit" class="secondary compact" { "Sign out" }
                     }
                 }
+                (super::settings::tabs(super::settings::Tab::Account))
                 div class="account-grid" {
                     div class="account-column" {
                         (keys_card(csrf, keys))
@@ -111,6 +113,11 @@ fn new_key_card(
                 }
             }
             @if let Some(key_error) = key_error { p class="auth-error" role="alert" { (key_error) } }
+            @if providers.is_empty() {
+                p class="auth-note" {
+                    "No provider exists yet. " a href="/settings/providers" { "Add a provider" } " first."
+                }
+            }
             form method="post" action="/account/api-keys" {
                 input type="hidden" name="csrf" value=(csrf);
                 label for="key-name" { "Name" }

@@ -1,5 +1,6 @@
 mod error;
 mod pages;
+mod settings_pages;
 pub(crate) mod views;
 
 use crate::{
@@ -7,6 +8,7 @@ use crate::{
     domain::{Domain, Principal},
     gateway::Gateway,
     origin::OriginPolicy,
+    settings::SettingsStore,
     usage::UsageStore,
 };
 use axum::{
@@ -125,15 +127,23 @@ pub struct AppState {
     session: SessionState,
     pub gateway: Gateway,
     pub keys: KeyStore,
+    pub settings: SettingsStore,
     pub usage: UsageStore,
 }
 
 impl AppState {
-    pub fn new(session: SessionState, gateway: Gateway, keys: KeyStore, usage: UsageStore) -> Self {
+    pub fn new(
+        session: SessionState,
+        gateway: Gateway,
+        keys: KeyStore,
+        settings: SettingsStore,
+        usage: UsageStore,
+    ) -> Self {
         Self {
             session,
             gateway,
             keys,
+            settings,
             usage,
         }
     }
@@ -188,6 +198,7 @@ pub fn auth_router(state: AppState) -> Router {
                 "/account/apps/{client_id}/revoke",
                 post(pages::account_app_revoke),
             )
+            .merge(settings_pages::routes())
             .layer(middleware::map_response(auth_no_store))
             .with_state(state),
     )
@@ -338,7 +349,6 @@ mod tests {
         gateway::Gateway,
         migration::Migrator,
         origin::OriginPolicy,
-        policies::Pipeline,
         telemetry::SqliteSink,
     };
     use axum::{
@@ -388,10 +398,12 @@ mod tests {
         );
         let keys = KeyStore::new(db.clone());
         let usage = crate::usage::UsageStore::new(db.clone());
+        let settings = crate::settings::SettingsStore::new(db.clone());
         let gateway = Gateway::new(
             SqliteSink::new(db),
             keys.clone(),
-            Pipeline::default(),
+            Default::default(),
+            [0; 32],
             vec![],
             1024,
         )
@@ -400,6 +412,7 @@ mod tests {
             SessionState::new(domain, OriginPolicy::new(None)),
             gateway,
             keys,
+            settings,
             usage,
         ));
         (router, mailer)
@@ -853,10 +866,12 @@ mod tests {
         .unwrap();
         let keys = KeyStore::new(db.clone());
         let usage = crate::usage::UsageStore::new(db.clone());
+        let settings = crate::settings::SettingsStore::new(db.clone());
         let gateway = Gateway::new(
             SqliteSink::new(db),
             keys.clone(),
-            Pipeline::default(),
+            Default::default(),
+            [0; 32],
             vec![],
             1024,
         )
@@ -865,6 +880,7 @@ mod tests {
             SessionState::new(domain.clone(), origin),
             gateway,
             keys,
+            settings,
             usage,
         ));
         (router, domain)

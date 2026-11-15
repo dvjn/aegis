@@ -1,18 +1,18 @@
-use anyhow::Context;
-
 use crate::{
     api_keys::{AuthenticationError, KeyStore},
-    config::{ProviderConfig, ProviderKind},
+    config::{GuardrailsConfig, ProviderConfig},
     policies::{
         Decision, Pipeline, PolicyError, PolicyFailure, RequestContext, restore::StreamRestorer,
     },
     pricing::cost,
     providers::{Provider, extract_completion, requested_model},
     request_id::RequestId,
+    settings::{SettingsStore, StoredProvider},
     telemetry::{CompletionRecord, SqliteSink, StartRecord, timestamp},
 };
 
 mod http;
+mod registry;
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -22,8 +22,14 @@ use axum::{
 };
 use futures_util::StreamExt;
 pub use http::router;
+use registry::Snapshot;
 use serde_json::json;
-use std::{collections::HashMap, io, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -52,8 +58,8 @@ pub struct Gateway {
     client: reqwest::Client,
     sink: SqliteSink,
     keys: KeyStore,
-    policies: Pipeline,
-    providers: Arc<HashMap<String, ProviderTarget>>,
+    registry: registry::Registry,
+    placeholder_key: [u8; 32],
     max_capture_bytes: usize,
 }
 
@@ -85,7 +91,8 @@ impl Gateway {
     pub fn new(
         sink: SqliteSink,
         keys: KeyStore,
-        policies: Pipeline,
+        guardrails: GuardrailsConfig,
+        placeholder_key: [u8; 32],
         providers: Vec<ProviderConfig>,
         max_capture_bytes: usize,
     ) -> anyhow::Result<Self> {
@@ -93,53 +100,83 @@ impl Gateway {
             .redirect(reqwest::redirect::Policy::none())
             .tls_backend_preconfigured(webpki_roots_tls_config()?)
             .build()?;
-        let providers = providers
-            .into_iter()
-            .map(|config| {
-                let (kind, base_url) = match config.kind {
-                    ProviderKind::ClaudeSubscription { base_url } => {
-                        (Provider::Anthropic, base_url)
-                    }
-                    ProviderKind::CodexSubscription { base_url } => (Provider::Codex, base_url),
-                    ProviderKind::TypeSafe { base_url } => (Provider::TypeSafe, base_url),
-                };
-                let parsed = url::Url::parse(&base_url)
-                    .with_context(|| format!("provider {:?} has an invalid base_url", config.id))?;
-                Ok((
-                    config.id,
-                    ProviderTarget {
-                        kind,
-                        origin: Arc::from(parsed.origin().ascii_serialization()),
-                        base_path: Arc::from(parsed.path().trim_end_matches('/')),
-                    },
-                ))
-            })
-            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+        let snapshot = Snapshot::new(
+            providers
+                .into_iter()
+                .map(|config| StoredProvider {
+                    owner: None,
+                    config,
+                })
+                .collect(),
+            guardrails,
+            HashMap::new(),
+        )?;
         Ok(Self {
             client,
             sink,
             keys,
-            policies,
-            providers: Arc::new(providers),
+            registry: Arc::new(RwLock::new(Arc::new(snapshot))),
+            placeholder_key,
             max_capture_bytes,
         })
     }
 
-    pub fn provider_ids(&self) -> Vec<String> {
-        let mut ids = self.providers.keys().cloned().collect::<Vec<_>>();
-        ids.sort();
-        ids
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.registry
+            .read()
+            .expect("provider registry poisoned")
+            .clone()
+    }
+
+    /// Reloads providers and guardrails from the database. Requests already in
+    /// flight keep the snapshot they started with. A stored row that no longer
+    /// parses is an error and leaves the current snapshot in place.
+    pub async fn reload(&self, store: &SettingsStore) -> anyhow::Result<()> {
+        let snapshot = Arc::new(Snapshot::load(store).await?);
+        *self.registry.write().expect("provider registry poisoned") = snapshot;
+        Ok(())
+    }
+
+    /// Reloads on an interval so changes made by another process, such as
+    /// `aegis provider add`, apply without a restart.
+    pub fn spawn_refresh(
+        &self,
+        store: SettingsStore,
+        every: Duration,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) {
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                if let Err(error) = gateway.reload(&store).await {
+                    tracing::warn!(%error, "failed to refresh providers and guardrails");
+                }
+            }
+        });
+    }
+
+    /// The provider IDs a user can grant: their own and the instance's.
+    pub fn provider_ids(&self, user: &str) -> Vec<String> {
+        self.snapshot()
+            .visible(user)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     pub async fn forward(&self, provider_id: &str, request: Request) -> Response {
-        let Some(target) = self.providers.get(provider_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                axum::Json(json!({"error": "provider_not_found"})),
-            )
-                .into_response();
-        };
-        match self.try_forward(provider_id, target, request).await {
+        let snapshot = self.snapshot();
+        if !snapshot.exists(provider_id) {
+            return provider_not_found();
+        }
+        match self.try_forward(provider_id, &snapshot, request).await {
             Ok(response) => response,
             Err(error) => {
                 tracing::error!(%error, %provider_id, "gateway request failed");
@@ -158,11 +195,10 @@ impl Gateway {
     async fn try_forward(
         &self,
         provider_id: &str,
-        target: &ProviderTarget,
+        snapshot: &Snapshot,
         request: Request,
     ) -> anyhow::Result<Response> {
         let started = std::time::Instant::now();
-        let provider = target.kind;
         let request_id = request
             .extensions()
             .get::<RequestId>()
@@ -178,6 +214,12 @@ impl Gateway {
             Ok(key) => key,
             Err(error) => return Ok(authentication_error(error)),
         };
+        // Another user's provider with this ID is not this user's to reach.
+        let Some(target) = snapshot.resolve(&authenticated.user_id, provider_id) else {
+            return Ok(provider_not_found());
+        };
+        let provider = target.kind;
+        let policies = snapshot.pipeline(&authenticated.user_id, self.placeholder_key);
         let body = to_bytes(body, MAX_REQUEST_BYTES).await?;
         let model = requested_model(&body);
         let context = RequestContext {
@@ -188,7 +230,7 @@ impl Gateway {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned),
         };
-        let decision = match self.evaluate_policies(context).await? {
+        let decision = match evaluate_policies(policies, context).await? {
             Ok(decision) => decision,
             Err(failure) => return Ok(policy_failure(failure)),
         };
@@ -384,17 +426,22 @@ impl Gateway {
     }
 }
 
-impl Gateway {
-    async fn evaluate_policies(
-        &self,
-        context: RequestContext,
-    ) -> anyhow::Result<Result<Decision, PolicyFailure>> {
-        if context.body.len() <= BLOCKING_POLICY_BYTES {
-            return Ok(self.policies.evaluate(context));
-        }
-        let policies = self.policies.clone();
-        Ok(tokio::task::spawn_blocking(move || policies.evaluate(context)).await?)
+async fn evaluate_policies(
+    policies: Pipeline,
+    context: RequestContext,
+) -> anyhow::Result<Result<Decision, PolicyFailure>> {
+    if context.body.len() <= BLOCKING_POLICY_BYTES {
+        return Ok(policies.evaluate(context));
     }
+    Ok(tokio::task::spawn_blocking(move || policies.evaluate(context)).await?)
+}
+
+fn provider_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(json!({"error": "provider_not_found"})),
+    )
+        .into_response()
 }
 
 fn authentication_error(error: AuthenticationError) -> Response {
@@ -562,7 +609,6 @@ mod guardrail_tests {
         migration::Migrator,
         policies::{
             mask::{PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX},
-            pipeline,
             sse::{Frame, FrameParser},
         },
         telemetry::SqliteSink,
@@ -707,7 +753,8 @@ mod guardrail_tests {
         let gateway = Gateway::new(
             SqliteSink::new(database.clone()),
             keys,
-            pipeline(&guardrails, [7; 32]),
+            guardrails,
+            [7; 32],
             vec![ProviderConfig {
                 id: PROVIDER_ID.into(),
                 kind: ProviderKind::ClaudeSubscription { base_url },
