@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -205,7 +205,8 @@ impl Gateway {
         std::fs::write(&root_key, random_bytes(32)?)?;
         set_owner_only(&root_key)?;
 
-        let port = free_port()?;
+        let reservation = reserve_port()?;
+        let port = reservation.local_addr()?.port();
         std::fs::write(
             workdir.join("aegis.toml"),
             config_file(port, upstream.base_url(), &options),
@@ -214,6 +215,7 @@ impl Gateway {
         let api_key = provision_credentials(binary, &workdir)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
+            .no_proxy()
             .build()?;
         let child = spawn_gateway(binary, &workdir)?;
         let pid = child.id();
@@ -231,7 +233,9 @@ impl Gateway {
         };
         cleanup.disarm();
 
-        if let Err(error) = gateway.wait_until_ready() {
+        let ready = gateway.wait_until_ready();
+        drop(reservation);
+        if let Err(error) = ready {
             let tail = gateway.log_tail(20);
             gateway.shut_down();
             return Err(error.context(format!("gateway did not become ready; log tail:\n{tail}")));
@@ -725,13 +729,8 @@ fn field_after(output: &str, prefix: &str) -> Option<String> {
 }
 
 fn run_cli(binary: &Path, workdir: &Path, arguments: &[&str]) -> Result<String> {
-    let mut child = Command::new(binary)
+    let mut child = aegis_command(binary, workdir)
         .args(arguments)
-        .current_dir(workdir)
-        .env("AEGIS_CONFIG", "./aegis.toml")
-        .env_remove("DATABASE_URL")
-        .env_remove("HTTP_ADDR")
-        .env_remove("PUBLIC_URL")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -762,22 +761,35 @@ fn run_cli(binary: &Path, workdir: &Path, arguments: &[&str]) -> Result<String> 
 
 fn spawn_gateway(binary: &Path, workdir: &Path) -> Result<Child> {
     let log = std::fs::File::create(workdir.join("gateway.log"))?;
-    Ok(Command::new(binary)
+    Ok(aegis_command(binary, workdir)
         .arg("serve")
-        .current_dir(workdir)
-        .env("AEGIS_CONFIG", "./aegis.toml")
         .env("RUST_LOG", "warn")
-        .env_remove("DATABASE_URL")
-        .env_remove("HTTP_ADDR")
-        .env_remove("PUBLIC_URL")
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()?)
 }
 
-pub fn free_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+/// The developer's environment must not reconfigure the binary; only diagnostics pass through.
+fn aegis_command(binary: &Path, workdir: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .current_dir(workdir)
+        .env_clear()
+        .env("AEGIS_CONFIG", "./aegis.toml");
+    for name in ["RUST_BACKTRACE", "LLVM_PROFILE_FILE"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
+/// Linux only: bound but not listening, so ephemeral binds skip the port while the gateway's reuse bind still takes it.
+fn reserve_port() -> Result<tokio::net::TcpSocket> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(([127, 0, 0, 1], 0).into())?;
+    Ok(socket)
 }
 
 fn random_bytes(count: usize) -> Result<Vec<u8>> {
