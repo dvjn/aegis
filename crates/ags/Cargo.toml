@@ -27,4 +27,6 @@ url = "2.5.8"
 libc = "0.2.189"
 
 [dev-dependencies]
+axum = { workspace = true }
+tokio = { version = "1.53.1", features = ["net"] }
 toml = { workspace = true }

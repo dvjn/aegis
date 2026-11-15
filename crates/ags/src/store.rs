@@ -91,6 +91,8 @@ impl Store {
         })();
         if written.is_err() {
             let _ = fs::remove_file(&staging);
+        } else {
+            sync_dir(&self.dir);
         }
         written
     }
@@ -120,6 +122,16 @@ fn create_private_dir(dir: &Path) -> Result<()> {
     builder
         .create(dir)
         .with_context(|| format!("creating {}", dir.display()))
+}
+
+/// Best effort: makes a rename into `dir` survive a crash, so a rotated refresh token is not lost.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(dir) = File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 enum Create {

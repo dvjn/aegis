@@ -5,7 +5,7 @@ pub mod store;
 
 use std::{fmt, time::Duration};
 
-use aegis_wire::TokenResponse;
+use aegis_wire::{Machine, TokenResponse};
 use anyhow::{Result, bail};
 use server::{Poll, Server};
 pub use store::{Login, Store};
@@ -50,29 +50,48 @@ pub enum Logout {
     },
 }
 
-/// The server revoked this machine, or its grant expired.
+/// The server refused this machine's tokens, so its login was forgotten.
 #[derive(Debug)]
-pub struct NoLongerPaired {
+pub struct LoggedOut {
     pub server: String,
+    /// Why the stored login could not be forgotten, if it could not.
+    pub kept: Option<String>,
 }
 
-impl fmt::Display for NoLongerPaired {
+impl fmt::Display for LoggedOut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let server = &self.server;
         write!(
             f,
-            "{server} no longer accepts this machine; run `ags logout`, then `ags login {server}`"
-        )
+            "{server} logged this machine out; run `ags login {server}` to pair it again"
+        )?;
+        match &self.kept {
+            Some(error) => write!(f, " (could not forget this login: {error})"),
+            None => Ok(()),
+        }
     }
 }
 
-impl std::error::Error for NoLongerPaired {}
+impl std::error::Error for LoggedOut {}
 
-fn no_longer_paired(server: &str) -> anyhow::Error {
-    NoLongerPaired {
+fn logged_out(server: &str, forgotten: Result<()>) -> anyhow::Error {
+    LoggedOut {
         server: server.to_owned(),
+        kept: forgotten.err().map(|error| format!("{error:#}")),
     }
     .into()
+}
+
+/// Forgets `login` unless another ags process replaced it meanwhile.
+fn forget(store: &Store, login: &Login) -> anyhow::Error {
+    let forgotten = (|| {
+        let _lock = store.lock()?;
+        if store.load()?.as_ref() == Some(login) {
+            store.remove()?;
+        }
+        Ok(())
+    })();
+    logged_out(&login.server, forgotten)
 }
 
 fn machine_name() -> String {
@@ -146,7 +165,10 @@ pub async fn login(
     };
     let login = login_from(server.issuer(), &client_id, token);
     store.save(&login)?;
-    status_of(&server, &login).await
+    match server.machine(&login.access_token).await? {
+        Some(machine) => Ok(status_from(&login, machine)),
+        None => Err(logged_out(&login.server, store.remove())),
+    }
 }
 
 /// The stored login, if any, with its access token refreshed shortly before it expires.
@@ -172,10 +194,10 @@ async fn fresh(store: &Store, login: Login) -> Result<Login> {
     }
     let server = Server::discover(&login.server).await?;
     let Some(refresh_token) = &login.refresh_token else {
-        return Err(no_longer_paired(&login.server));
+        return Err(logged_out(&login.server, store.remove()));
     };
     let Some(token) = server.refresh(&login.client_id, refresh_token).await? else {
-        return Err(no_longer_paired(&login.server));
+        return Err(logged_out(&login.server, store.remove()));
     };
     let mut refreshed = login_from(&login.server, &login.client_id, token);
     if refreshed.refresh_token.is_none() {
@@ -185,15 +207,12 @@ async fn fresh(store: &Store, login: Login) -> Result<Login> {
     Ok(refreshed)
 }
 
-async fn status_of(server: &Server, login: &Login) -> Result<Status> {
-    let Some(machine) = server.machine(&login.access_token).await? else {
-        return Err(no_longer_paired(&login.server));
-    };
-    Ok(Status {
+fn status_from(login: &Login, machine: Machine) -> Status {
+    Status {
         server: login.server.clone(),
         account: machine.account,
         providers: machine.providers,
-    })
+    }
 }
 
 /// `None` when this machine is not logged in.
@@ -202,7 +221,10 @@ pub async fn status(store: &Store) -> Result<Option<Status>> {
         return Ok(None);
     };
     let server = Server::discover(&login.server).await?;
-    status_of(&server, &login).await.map(Some)
+    match server.machine(&login.access_token).await? {
+        Some(machine) => Ok(Some(status_from(&login, machine))),
+        None => Err(forget(store, &login)),
+    }
 }
 
 /// Forgets the server even when it cannot be told to revoke this machine.
@@ -216,7 +238,7 @@ pub async fn logout(store: &Store) -> Result<Option<Logout>> {
         let login = match fresh(store, stored).await {
             Ok(login) => login,
             // A rejected refresh token means the grant is already gone.
-            Err(error) if error.is::<NoLongerPaired>() => return Ok(()),
+            Err(error) if error.is::<LoggedOut>() => return Ok(()),
             Err(error) => return Err(error),
         };
         Server::discover(&login.server)
@@ -288,6 +310,149 @@ mod tests {
             "already logged in to https://aegis.example; run `ags logout` first"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    use axum::http::StatusCode;
+
+    const INVALID_GRANT: (StatusCode, &str) =
+        (StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#);
+    const UNAUTHORIZED: (StatusCode, &str) = (StatusCode::UNAUTHORIZED, "");
+
+    /// A server whose token and machine endpoints always answer `token` and `machine`.
+    async fn fake_server(
+        token: (StatusCode, &'static str),
+        machine: (StatusCode, &'static str),
+    ) -> String {
+        use aegis_wire::{AuthorizationServerMetadata, MACHINE_PATH, METADATA_PATH};
+        use axum::{
+            Json, Router,
+            http::header,
+            routing::{any, get, post},
+        };
+
+        let reply = |(status, body): (StatusCode, &'static str)| {
+            move || async move { (status, [(header::CONTENT_TYPE, "application/json")], body) }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = AuthorizationServerMetadata {
+            issuer: address.clone(),
+            authorization_endpoint: format!("{address}/oauth/authorize"),
+            token_endpoint: format!("{address}/oauth/token"),
+            device_authorization_endpoint: format!("{address}/oauth/device"),
+            registration_endpoint: format!("{address}/oauth/register"),
+            response_types_supported: vec![],
+            grant_types_supported: vec![],
+            token_endpoint_auth_methods_supported: vec![],
+            code_challenge_methods_supported: vec![],
+            scopes_supported: vec![],
+            authorization_response_iss_parameter_supported: true,
+            resource_parameter_supported: true,
+        };
+        let app = Router::new()
+            .route(METADATA_PATH, get(move || async move { Json(metadata) }))
+            .route("/oauth/token", post(reply(token)))
+            .route(MACHINE_PATH, any(reply(machine)));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address
+    }
+
+    fn stored(server: &str, refresh_token: Option<&str>, expires_at: u64) -> Login {
+        Login {
+            server: server.to_owned(),
+            client_id: "client".into(),
+            access_token: "ag_at1.a.b".into(),
+            refresh_token: refresh_token.map(str::to_owned),
+            expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_is_forgotten_with_one_explanation() {
+        let expiring = store::now();
+        let valid = store::now() + 3600;
+        for (case, token, refresh_token, expires_at) in [
+            (
+                "refused refresh",
+                INVALID_GRANT,
+                Some("ag_rt1.a.b"),
+                expiring,
+            ),
+            ("no refresh token", INVALID_GRANT, None, expiring),
+            (
+                "refused access token",
+                INVALID_GRANT,
+                Some("ag_rt1.a.b"),
+                valid,
+            ),
+        ] {
+            let server = fake_server(token, UNAUTHORIZED).await;
+            let dir = store::tests::scratch();
+            let store = Store::at(&dir);
+            let login = stored(&server, refresh_token, expires_at);
+
+            store.save(&login).unwrap();
+            let error = status(&store).await.err().unwrap();
+            assert!(error.is::<LoggedOut>(), "{case}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{server} logged this machine out; run `ags login {server}` to pair it again"
+                ),
+                "{case}"
+            );
+            assert!(
+                store.load().unwrap().is_none(),
+                "{case}: `ags login` works next"
+            );
+
+            store.save(&login).unwrap();
+            assert!(
+                matches!(
+                    logout(&store).await.unwrap(),
+                    Some(Logout::Revoked { server: logged_out }) if logged_out == server
+                ),
+                "{case}"
+            );
+            assert!(store.load().unwrap().is_none(), "{case}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_fails_otherwise_keeps_the_login() {
+        for (case, token) in [
+            ("server error", (StatusCode::INTERNAL_SERVER_ERROR, "")),
+            ("unreadable success", (StatusCode::OK, "<html>")),
+            ("unreadable refusal", (StatusCode::BAD_REQUEST, "<html>")),
+            (
+                "other OAuth error",
+                (StatusCode::BAD_REQUEST, r#"{"error":"invalid_request"}"#),
+            ),
+        ] {
+            let server = fake_server(token, UNAUTHORIZED).await;
+            let dir = store::tests::scratch();
+            let store = Store::at(&dir);
+            let login = stored(&server, Some("ag_rt1.a.b"), store::now());
+
+            store.save(&login).unwrap();
+            let error = status(&store).await.err().unwrap();
+            assert!(!error.is::<LoggedOut>(), "{case}: {error:#}");
+            assert!(store.load().unwrap() == Some(login), "{case}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_login_that_could_not_be_forgotten_still_says_why_it_ended() {
+        let error = logged_out(
+            "https://aegis.example",
+            Err(anyhow::anyhow!("removing login.json: permission denied")),
+        );
+        assert_eq!(
+            error.to_string(),
+            "https://aegis.example logged this machine out; run `ags login https://aegis.example` to pair it again (could not forget this login: removing login.json: permission denied)"
+        );
     }
 
     #[tokio::test]
