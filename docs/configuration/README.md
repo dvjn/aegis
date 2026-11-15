@@ -144,7 +144,7 @@ For local development:
 mise run pricing:update
 ```
 
-This task refreshes the bundled model catalog. The running server automatically backfills unknown costs on startup and after adopting refreshed prices. Already calculated costs are preserved; updated dashboard totals are queued for rebuilding. Models with no matching price remain unknown.
+This task refreshes the bundled model catalog. Prices follow [LiteLLM](https://github.com/BerriAI/litellm), keyed as LiteLLM keys them, and a request is priced within the cloud that served it, the way LiteLLM does: a Bedrock request uses Bedrock's regional and model prices, a Vertex request Vertex's, and either falls back to the first-party price of the model inside the cloud's model ID. Prices fetched at runtime layer over the bundled ones. The running server automatically backfills unknown costs on startup and after adopting refreshed prices. Already calculated costs are preserved; updated dashboard totals are queued for rebuilding. Models with no matching price remain unknown.
 
 ### Logs
 

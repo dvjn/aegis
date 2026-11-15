@@ -1,9 +1,9 @@
-use super::{ModelPrice, PriceMap, install, store};
+use super::{PriceMap, install, store};
 use crate::{config::PricingConfig, gateway::webpki_roots_tls_config};
 use anyhow::{Context, Result, bail};
 use sea_orm::DatabaseConnection;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const MINIMUM_PRICED_MODELS: usize = 50;
@@ -97,7 +97,11 @@ async fn refresh_once(
     )
     .await?;
     let models = candidate.model_count();
-    let effective = candidate.with_overrides(&pricing.overrides);
+    // The fetched prices layer over the vendored ones, so a model only this
+    // release prices keeps its price until the published map has it too.
+    let effective = candidate
+        .over(PriceMap::vendored())
+        .with_overrides(&pricing.overrides);
     install(effective.clone());
     if let Err(error) = super::backfill_costs(database, &effective).await {
         tracing::warn!(%error, "failed to backfill historical request costs");
@@ -145,8 +149,7 @@ async fn fetch(
 }
 
 fn parse(body: &[u8]) -> Result<PriceMap> {
-    let models: HashMap<String, ModelPrice> = serde_json::from_slice(body)?;
-    Ok(PriceMap { models })
+    Ok(PriceMap::from_json(body)?)
 }
 
 fn adoption_rejection(candidate: &PriceMap, current: &PriceMap) -> Option<String> {
@@ -174,6 +177,7 @@ fn adoption_rejection(candidate: &PriceMap, current: &PriceMap) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::ModelPrice;
 
     const CURATED: &str = r#"{
         "claude-sonnet-4-5": {
@@ -204,6 +208,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 

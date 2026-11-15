@@ -48,6 +48,19 @@ impl MigrationTrait for Migration {
             config TEXT NOT NULL, updated_at TEXT NOT NULL)",
         )
         .await?;
+        // Each request remembers the cloud it was priced in, and each price its
+        // LiteLLM provider, so a model is priced per cloud now and on re-pricing.
+        if !manager
+            .has_column("gateway_requests", "price_scope")
+            .await?
+        {
+            db.execute_unprepared("ALTER TABLE gateway_requests ADD COLUMN price_scope TEXT")
+                .await?;
+        }
+        if !manager.has_column("model_prices", "provider").await? {
+            db.execute_unprepared("ALTER TABLE model_prices ADD COLUMN provider TEXT")
+                .await?;
+        }
         db.execute_unprepared(
             "INSERT OR IGNORE INTO settings (key, value, updated_at)
             SELECT 'config_import_pending', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')

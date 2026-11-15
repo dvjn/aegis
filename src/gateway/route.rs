@@ -9,6 +9,10 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct ProviderTarget {
     pub upstream: Upstream,
+    /// Whose prices apply to this provider's requests, as LiteLLM names the
+    /// provider: `anthropic`, `openai`, `typesafe`, `vertex_ai`, or `bedrock`
+    /// with its region.
+    pub price_scope: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -214,12 +218,14 @@ mod tests {
         };
         ProviderTarget {
             upstream: Upstream::Bedrock { runtime, openai },
+            price_scope: Arc::from("bedrock"),
         }
     }
 
     fn vertex() -> ProviderTarget {
         ProviderTarget {
             upstream: Upstream::Vertex { custom: None },
+            price_scope: Arc::from("vertex_ai"),
         }
     }
 

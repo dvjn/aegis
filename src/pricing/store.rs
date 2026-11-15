@@ -1,10 +1,9 @@
-use super::{ModelPrice, PriceMap};
+use super::{ModelPrice, PriceMap, SCOPE_FROM_PROTOCOL};
 use crate::config::PricingConfig;
 use crate::providers::Usage;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
-use std::collections::HashMap;
 
 const BACKFILL_BATCH_SIZE: u64 = 32;
 
@@ -18,9 +17,10 @@ pub async fn load_effective_map(
     database: &DatabaseConnection,
     pricing: &PricingConfig,
 ) -> Result<PriceMap> {
-    let fetched = load_fetched(database).await?;
-    let base = match fetched {
-        Some(map) => map,
+    // Fetched prices layer over the vendored ones, so a model only this
+    // release prices keeps its price until the published map has it too.
+    let base = match load_fetched(database).await? {
+        Some(map) => map.over(PriceMap::vendored()),
         None => PriceMap::vendored(),
     };
     Ok(base.with_overrides(&pricing.overrides))
@@ -30,25 +30,25 @@ pub async fn load_fetched(database: &DatabaseConnection) -> Result<Option<PriceM
     let rows = database
         .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT model, input_per_token, output_per_token, cache_read_per_token, cache_write_per_token FROM model_prices",
+            "SELECT model, input_per_token, output_per_token, cache_read_per_token, cache_write_per_token, provider FROM model_prices",
         ))
         .await
         .context("failed to read stored model prices")?;
 
-    let mut models = HashMap::with_capacity(rows.len());
+    let mut map = PriceMap::default();
     for row in rows {
-        let model: String = row.try_get("", "model")?;
-        models.insert(
-            model,
+        map.insert(
+            row.try_get("", "model")?,
             ModelPrice {
                 input: row.try_get("", "input_per_token")?,
                 output: row.try_get("", "output_per_token")?,
                 cache_read: row.try_get("", "cache_read_per_token")?,
                 cache_write: row.try_get("", "cache_write_per_token")?,
             },
+            row.try_get("", "provider")?,
         );
     }
-    Ok((!models.is_empty()).then_some(PriceMap { models }))
+    Ok((map.model_count() > 0).then_some(map))
 }
 
 pub async fn store_snapshot(
@@ -65,17 +65,18 @@ pub async fn store_snapshot(
             "DELETE FROM model_prices",
         ))
         .await?;
-    for (model, price) in map.entries() {
+    for (model, price, provider) in map.entries() {
         transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO model_prices (model, input_per_token, output_per_token, cache_read_per_token, cache_write_per_token) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO model_prices (model, input_per_token, output_per_token, cache_read_per_token, cache_write_per_token, provider) VALUES (?, ?, ?, ?, ?, ?)",
                 [
                     model.into(),
                     price.input.into(),
                     price.output.into(),
                     price.cache_read.into(),
                     price.cache_write.into(),
+                    provider.into(),
                 ],
             ))
             .await?;
@@ -127,6 +128,7 @@ pub async fn backfill_unknown_costs(
                 format!(
                     "SELECT u.request_id, \
                      COALESCE(r.resolved_model, r.requested_model) requested_model, \
+                     COALESCE(r.price_scope, {SCOPE_FROM_PROTOCOL}) price_scope, \
                      u.input_tokens, u.output_tokens, \
                      u.cache_read_tokens, u.cache_write_tokens \
                      FROM gateway_usage u JOIN gateway_requests r ON r.id = u.request_id \
@@ -152,6 +154,7 @@ pub async fn backfill_unknown_costs(
         for row in rows {
             let request_id: String = row.try_get("", "request_id")?;
             let model: Option<String> = row.try_get("", "requested_model")?;
+            let scope: Option<String> = row.try_get("", "price_scope")?;
             let usage = Usage {
                 input_tokens: row.try_get("", "input_tokens")?,
                 output_tokens: row.try_get("", "output_tokens")?,
@@ -160,7 +163,10 @@ pub async fn backfill_unknown_costs(
                 reasoning_tokens: None,
                 raw_json: None,
             };
-            if let Some(cost) = map.cost(model.as_deref(), &usage).nanodollars {
+            if let Some(cost) = map
+                .cost(scope.as_deref(), model.as_deref(), &usage)
+                .nanodollars
+            {
                 updates.push((request_id, cost));
             }
         }
@@ -198,6 +204,7 @@ mod tests {
     use crate::migration::Migrator;
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
+    use std::collections::HashMap;
 
     async fn database() -> DatabaseConnection {
         let database = Database::connect("sqlite::memory:")
@@ -262,7 +269,10 @@ mod tests {
                 cache_write: None,
             },
         );
-        let replacement = PriceMap { models };
+        let replacement = PriceMap {
+            models,
+            ..Default::default()
+        };
         store_snapshot(
             &database,
             &replacement,
@@ -345,6 +355,7 @@ mod tests {
                     cache_write: None,
                 },
             )]),
+            ..Default::default()
         };
         assert_eq!(
             backfill_unknown_costs(&database, &map)

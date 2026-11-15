@@ -34,6 +34,9 @@ pub struct StartRecord<'a> {
     pub method: &'a str,
     pub endpoint: &'a str,
     pub requested_model: Option<&'a str>,
+    /// The cloud whose prices apply, as LiteLLM names it: `anthropic`,
+    /// `openai`, `typesafe`, `vertex_ai`, `bedrock` or `bedrock/<region>`.
+    pub price_scope: Option<&'a str>,
     pub request_body: &'a [u8],
 }
 
@@ -351,7 +354,7 @@ impl SqliteSink {
         let inserted = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+                "INSERT INTO gateway_requests (id, request_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, price_scope, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
                 [
                     id.to_string().into(),
                     record.request_id.to_owned().into(),
@@ -362,6 +365,7 @@ impl SqliteSink {
                     record.method.to_owned().into(),
                     record.endpoint.to_owned().into(),
                     record.requested_model.map(str::to_owned).into(),
+                    record.price_scope.map(str::to_owned).into(),
                     timestamp().into(),
                     (record.request_body.len() as i64).into(),
                 ],

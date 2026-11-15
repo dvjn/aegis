@@ -283,6 +283,7 @@ impl Gateway {
                         method: parts.method.as_str(),
                         endpoint,
                         requested_model: model.as_deref(),
+                        price_scope: Some(&target.price_scope),
                         request_body: &body,
                     })
                     .await?;
@@ -339,6 +340,7 @@ impl Gateway {
             response_headers.remove(header::CONTENT_LENGTH);
         }
         let sink = self.sink.clone();
+        let price_scope = target.price_scope.clone();
         let max_capture_bytes = self.max_capture_bytes;
         let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(16);
 
@@ -421,7 +423,7 @@ impl Gateway {
             // Price what actually ran: an alias resolves to a dated or versioned
             // id, and only the response knows which one.
             let priced_model = completion.model.as_deref().or(model.as_deref());
-            let cost = cost(priced_model, &usage);
+            let cost = cost(Some(&price_scope), priced_model, &usage);
             for (field, value) in [
                 ("input_tokens", usage.input_tokens),
                 ("output_tokens", usage.output_tokens),
@@ -597,6 +599,7 @@ mod tests {
                 protocol: Provider::Codex,
                 base: Base::parse(base_url).expect("valid base_url"),
             },
+            price_scope: std::sync::Arc::from("openai"),
         }
     }
 

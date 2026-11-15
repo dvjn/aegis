@@ -160,6 +160,7 @@ pub(crate) mod tests {
                 method: "POST",
                 endpoint: "/v1/messages",
                 requested_model: None,
+                price_scope: None,
                 request_body: body,
             })
             .await

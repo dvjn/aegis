@@ -51,7 +51,7 @@ impl MigrationTrait for Migration {
             let Cost {
                 nanodollars,
                 source,
-            } = cost(model.as_deref(), &usage);
+            } = cost(None, model.as_deref(), &usage);
             database
                 .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,

@@ -1826,7 +1826,7 @@ mod tests {
             reasoning_tokens: None,
             raw_json: None,
         };
-        let cost = crate::pricing::cost(Some("claude-sonnet-4-5"), &usage);
+        let cost = crate::pricing::cost(None, Some("claude-sonnet-4-5"), &usage);
         let nanodollars = cost.nanodollars.expect("a current model is priced");
         store
             .database

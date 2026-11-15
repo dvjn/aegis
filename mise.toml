@@ -155,27 +155,34 @@ trap 'rm -f "$upstream" "$upstream.filtered"' EXIT
 curl --fail --silent --show-error --location --output "$upstream" "$url"
 
 jq -S '
+  # LiteLLM keys stay as they are: first-party names (`claude-haiku-4-5`,
+  # `gemini/gemini-3.8-flash`, `typesafe/jev-1.13.0`), cloud-prefixed and
+  # regional keys (`bedrock/us-east-1/zai.glm-5`,
+  # `bedrock_mantle/openai.gpt-5.6-luna`, `vertex_ai/claude-haiku-4-5@20251001`)
+  # and Converse model IDs (`zai.glm-4.7`). Each entry keeps its provider, so a
+  # request is priced within the cloud that served it, the way LiteLLM does.
   to_entries
   | map(select(
       (.value | type == "object")
-      and (.value.litellm_provider == "anthropic"
-           or .value.litellm_provider == "openai"
-           or .value.litellm_provider == "gemini"
-           or .value.litellm_provider == "typesafe")
       and (.value.input_cost_per_token != null)
+      and ((.value.litellm_provider // "")
+           | test("^(anthropic|openai|gemini|typesafe|bedrock|bedrock_converse|bedrock_mantle|vertex_ai(-.*)?)$"))
     ))
   | map({
-      key: (if .value.litellm_provider == "typesafe" or .value.litellm_provider == "gemini"
-            then (.key | sub("^(typesafe|gemini)/"; "")) else .key end),
+      key,
       value: (
         { input: .value.input_cost_per_token,
-          output: (.value.output_cost_per_token // 0) }
+          output: (.value.output_cost_per_token // 0),
+          provider: .value.litellm_provider }
         + (if .value.cache_read_input_token_cost == null then {}
            else { cache_read: .value.cache_read_input_token_cost } end)
         + (if .value.cache_creation_input_token_cost == null then {}
            else { cache_write: .value.cache_creation_input_token_cost } end)
       )
     })
+  # Releases before LiteLLM keys were kept look TypeSafe models up by their
+  # bare names, and they still fetch this file, so those names stay too.
+  | . + map(select(.value.provider == "typesafe") | .key |= sub("^typesafe/"; ""))
   | from_entries
 ' "$upstream" > "$upstream.filtered"
 

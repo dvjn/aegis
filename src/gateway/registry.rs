@@ -125,5 +125,19 @@ fn target(config: ProviderConfig) -> anyhow::Result<(String, ProviderTarget)> {
                 .with_context(invalid)?,
         },
     };
-    Ok((config.id, ProviderTarget { upstream }))
+    let price_scope = match (&config.kind, region) {
+        (ProviderKind::ClaudeSubscription { .. }, _) => "anthropic".to_owned(),
+        (ProviderKind::CodexSubscription { .. }, _) => "openai".to_owned(),
+        (ProviderKind::TypeSafe { .. }, _) => "typesafe".to_owned(),
+        (ProviderKind::Bedrock { .. }, Some(region)) => format!("bedrock/{region}"),
+        (ProviderKind::Bedrock { .. }, None) => "bedrock".to_owned(),
+        (ProviderKind::Vertex { .. }, _) => "vertex_ai".to_owned(),
+    };
+    Ok((
+        config.id,
+        ProviderTarget {
+            upstream,
+            price_scope: Arc::from(price_scope),
+        },
+    ))
 }
