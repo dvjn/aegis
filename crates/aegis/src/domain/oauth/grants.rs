@@ -132,48 +132,40 @@ impl OAuthService {
         let user_id = principal.user_id().to_string();
         let auth_version = principal.identity.auth_version;
         let now = self.clock.now();
-        let mut connected: BTreeMap<String, ConnectedClient> = BTreeMap::new();
-        let mut record =
-            |client_id: String, scope: String, created_at: DateTime<Utc>, used: bool| {
-                let entry = connected
-                    .entry(client_id.clone())
-                    .or_insert(ConnectedClient {
-                        client_id,
-                        client_name: None,
-                        scope: scope.clone(),
-                        created_at,
-                        last_used_at: None,
-                        providers: None,
-                    });
-                if created_at < entry.created_at {
-                    entry.created_at = created_at;
-                    entry.scope = scope;
-                }
-                if used && entry.last_used_at.is_none_or(|last| created_at > last) {
-                    entry.last_used_at = Some(created_at);
-                }
-            };
-
-        let families = oauth_refresh_token_families::Entity::find()
-            .filter(oauth_refresh_token_families::Column::UserId.eq(user_id.clone()))
-            .filter(oauth_refresh_token_families::Column::Issuer.eq(issuer))
-            .filter(oauth_refresh_token_families::Column::AuthVersion.eq(auth_version))
-            .filter(oauth_refresh_token_families::Column::RevokedAt.is_null())
-            .all(&self.db)
+        let grants = self
+            .load_grants(&self.db, vec![user_id.clone()], None, now)
             .await?;
-        for family in families {
-            let (Ok(created_at), Ok(expires_at)) = (
-                parse_stored_date(&family.created_at),
-                parse_stored_date(&family.absolute_expires_at),
-            ) else {
+        let any_use = self.token_use(issuer, None, now);
+        let mut connected: BTreeMap<String, ConnectedClient> = BTreeMap::new();
+        let usable = grants
+            .usable_families(&user_id, &any_use)
+            .map(|family| (&family.client_id, &family.scope, &family.created_at))
+            .chain(
+                grants
+                    .usable_access_tokens(&user_id, &any_use)
+                    .map(|token| (&token.client_id, &token.scope, &token.created_at)),
+            );
+        for (client_id, scope, created_at) in usable {
+            let Ok(created_at) = parse_stored_date(created_at) else {
                 continue;
             };
-            if now >= expires_at {
-                continue;
+            let entry = connected
+                .entry(client_id.clone())
+                .or_insert_with(|| ConnectedClient {
+                    client_id: client_id.clone(),
+                    client_name: None,
+                    scope: scope.clone(),
+                    created_at,
+                    last_used_at: None,
+                    providers: None,
+                });
+            if created_at < entry.created_at {
+                entry.created_at = created_at;
+                entry.scope = scope.clone();
             }
-            record(family.client_id, family.scope, created_at, false);
         }
 
+        // Every token a connected client was issued counts as a use, expired or not.
         let tokens = oauth_access_tokens::Entity::find()
             .filter(oauth_access_tokens::Column::UserId.eq(user_id.clone()))
             .filter(oauth_access_tokens::Column::Issuer.eq(issuer))
@@ -182,16 +174,14 @@ impl OAuthService {
             .all(&self.db)
             .await?;
         for token in tokens {
-            let (Ok(created_at), Ok(expires_at)) = (
-                parse_stored_date(&token.created_at),
-                parse_stored_date(&token.expires_at),
-            ) else {
+            let Some(entry) = connected.get_mut(&token.client_id) else {
                 continue;
             };
-            if token.family_id.is_none() && now >= expires_at {
-                continue;
+            if let Ok(used) = parse_stored_date(&token.created_at)
+                && entry.last_used_at.is_none_or(|last| used > last)
+            {
+                entry.last_used_at = Some(used);
             }
-            record(token.client_id, token.scope, created_at, true);
         }
 
         if connected.is_empty() {
@@ -207,12 +197,19 @@ impl OAuthService {
                 entry.client_name = client.client_name;
             }
         }
-        for (client_id, providers, last_used_at) in self.machine_grants(&user_id, issuer).await? {
-            let Some(entry) = connected.get_mut(&client_id) else {
+        let live = self
+            .live_machine_ids(&self.db, Some(principal.user_id()))
+            .await?;
+        for machine in self.machine_grants(&user_id, issuer).await? {
+            let Some(entry) = connected.get_mut(&machine.client_id) else {
                 continue;
             };
-            entry.providers = Some(providers);
-            if let Some(used) = last_used_at
+            if !live.contains(&machine.id) {
+                continue;
+            }
+            entry.providers = Some(machine.providers);
+            if let Some(used) = machine
+                .last_used_at
                 .as_deref()
                 .and_then(|v| parse_stored_date(v).ok())
                 && entry.last_used_at.is_none_or(|last| used > last)

@@ -9,8 +9,9 @@ use zeroize::Zeroizing;
 
 use super::{
     GrantContext, IssuedAccessToken, OAuthConfig, OAuthService, add_duration, keep_earliest,
-    new_opaque_value, parse_opaque_value, parse_stored_date, validate_client_id, validate_issuer,
-    validate_resource,
+    new_opaque_value, parse_opaque_value, parse_stored_date,
+    usable::{refresh_family_usable, refresh_token_bound, refresh_token_usable},
+    validate_client_id, validate_issuer, validate_resource,
 };
 use crate::domain::{
     entity::{oauth_access_tokens, oauth_refresh_token_families, oauth_refresh_tokens, users},
@@ -137,30 +138,22 @@ impl OAuthService {
         );
         let family_id =
             Uuid::parse_str(&token.family_id).map_err(|_| DomainError::InvalidCredentials)?;
+        let now = self.clock.now();
+        let token_use = self.token_use(request.issuer, Some(request.resource), now);
         if stored_digest.len() != 32
             || expected_digest.ct_eq(stored_digest.as_slice()).unwrap_u8() != 1
-            || token.key_id != self.config.key_id
             || family.client_id != request.client_id
-            || family.issuer != request.issuer
-            || family.resource != request.resource
+            || !refresh_token_bound(&token_use, &token, &family)
         {
             return Err(DomainError::InvalidCredentials);
         }
-        let now = self.clock.now();
         if token.rotated_at.is_some() {
             let tx = crate::db::begin_immediate(&self.db).await?;
             Self::revoke_refresh_family(&tx, family_id, now).await?;
             tx.commit().await?;
             return Err(DomainError::InvalidCredentials);
         }
-        let auth_version = family.auth_version;
-        if token.revoked_at.is_some()
-            || family.revoked_at.is_some()
-            || user.status != "active"
-            || auth_version != user.auth_version
-            || now >= parse_stored_date(&token.idle_expires_at)?
-            || now >= parse_stored_date(&family.absolute_expires_at)?
-        {
+        if !refresh_token_usable(&token_use, &token, &family, &user) {
             return Err(DomainError::InvalidCredentials);
         }
 
@@ -190,15 +183,11 @@ impl OAuthService {
             .one(&tx)
             .await?
             .ok_or(DomainError::InvalidCredentials)?;
-        let auth_version = family.auth_version;
-        if family.revoked_at.is_some()
-            || user.status != "active"
-            || auth_version != user.auth_version
-            || now >= parse_stored_date(&token.idle_expires_at)?
-            || now >= parse_stored_date(&family.absolute_expires_at)?
-        {
+        // The token is rotated now, so only its family and user can have changed.
+        if !refresh_family_usable(&token_use, &family, &user) {
             return Err(DomainError::InvalidCredentials);
         }
+        let auth_version = family.auth_version;
         let generation = token.generation;
         let absolute_expires_at = parse_stored_date(&family.absolute_expires_at)?;
         let refresh_token = self

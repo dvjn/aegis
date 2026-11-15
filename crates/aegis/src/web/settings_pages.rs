@@ -133,14 +133,14 @@ async fn render_providers(
         Layer::Instance => Vec::new(),
     };
     let grants = settings
-        .grant_counts(scope)
+        .grant_counts(scope, state.domain.oauth())
         .await
         .map_err(WebError::internal)?;
     let new = messages.new.unwrap_or_default();
     // An instance provider's users can get a copy instead of losing it.
     let users_of_deleting: Vec<String> = match (layer, messages.deleting) {
         (Layer::Instance, Some(id)) if providers.iter().any(|p| p.id == id) => settings
-            .instance_provider_users(id)
+            .instance_provider_users(id, state.domain.oauth())
             .await
             .map_err(WebError::internal)?
             .into_iter()
@@ -332,7 +332,11 @@ async fn provider_move(
     if scope != Scope::Instance {
         return Err(WebError::not_found());
     }
-    match state.settings.move_to_users(&id).await {
+    match state
+        .settings
+        .move_to_users(&id, state.domain.oauth())
+        .await
+    {
         Ok(Some(_)) => {
             state.keys.clear_cache().await;
             apply(&state).await;

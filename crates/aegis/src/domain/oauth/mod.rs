@@ -5,6 +5,7 @@ mod grants;
 mod machines;
 mod refresh;
 mod tokens;
+mod usable;
 
 pub use clients::ClientRegistration;
 #[cfg(test)]
@@ -164,6 +165,11 @@ impl OAuthService {
             config: Arc::new(config),
             clock,
         })
+    }
+
+    /// For commands that run without the server.
+    pub fn standalone(db: DatabaseConnection, config: OAuthConfig) -> Result<Self, DomainError> {
+        Self::new(db, config, Arc::new(super::SystemClock))
     }
 
     pub(super) async fn begin_immediate(&self) -> Result<crate::db::WriteTransaction, DomainError> {

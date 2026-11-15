@@ -191,7 +191,7 @@ async fn main() -> Result<()> {
     let result = match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, database.clone()).await,
         Command::Key { command } => manage_key(command, database.clone()).await,
-        Command::Provider { command } => manage_provider(command, database.clone()).await,
+        Command::Provider { command } => manage_provider(command, database.clone(), &config).await,
         Command::Guardrails { command } => manage_guardrails(command, database.clone()).await,
         Command::BootstrapUser {
             email,
@@ -325,7 +325,12 @@ fn settings_error(error: settings::SettingsError) -> anyhow::Error {
     }
 }
 
-async fn manage_provider(command: ProviderCommand, database: DatabaseConnection) -> Result<()> {
+async fn manage_provider(
+    command: ProviderCommand,
+    database: DatabaseConnection,
+    config: &Config,
+) -> Result<()> {
+    let oauth = domain::OAuthService::standalone(database.clone(), config.oauth.clone())?;
     let store = SettingsStore::new(database);
     match command {
         ProviderCommand::Add {
@@ -379,8 +384,12 @@ async fn manage_provider(command: ProviderCommand, database: DatabaseConnection)
             }
         }
         ProviderCommand::KeepForUsers { id } => {
-            let users = store.instance_provider_users(&id).await?;
-            match store.move_to_users(&id).await.map_err(settings_error)? {
+            let users = store.instance_provider_users(&id, &oauth).await?;
+            match store
+                .move_to_users(&id, &oauth)
+                .await
+                .map_err(settings_error)?
+            {
                 None => bail!("instance provider {id:?} was not found"),
                 Some(_) => {
                     for (_, email) in &users {

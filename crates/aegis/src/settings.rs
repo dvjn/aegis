@@ -11,6 +11,7 @@ use crate::{
         Config, GuardrailConfig, GuardrailsConfig, GuardrailsMode, ProviderConfig, ProviderKind,
         RegexGuardrailConfig, validate_detectors, validate_providers,
     },
+    domain::OAuthService,
     telemetry::timestamp,
 };
 use anyhow::Context;
@@ -20,10 +21,25 @@ use uuid::Uuid;
 
 const IMPORT_PENDING: &str = "config_import_pending";
 const INSTANCE_GUARDRAILS: &str = "guardrails";
-/// Users with an active API key or connected app granted provider `?`.
-const GRANT_HOLDERS: &str = "SELECT c.user_id FROM gateway_clients c
+/// The provider grants of active API keys and of the paired machines whose
+/// gateway client IDs are in the JSON array `?`.
+const ACTIVE_GRANTS: &str = "SELECT c.user_id, c.kind, j.value provider FROM gateway_clients c
     JOIN json_each(c.allowed_providers) j LEFT JOIN gateway_keys k ON k.id = c.id
-    WHERE j.value = ? AND (c.kind = 'oauth' OR k.revoked_at IS NULL)";
+    WHERE (c.kind = 'api_key' AND k.revoked_at IS NULL) OR c.id IN (SELECT value FROM json_each(?))";
+
+/// The machines that can still authenticate, as [`ACTIVE_GRANTS`] takes them.
+async fn live_machines(
+    db: &impl ConnectionTrait,
+    oauth: &OAuthService,
+    user: Option<Uuid>,
+) -> anyhow::Result<Value> {
+    let ids: Vec<String> = oauth
+        .live_machine_ids(db, user)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(serde_json::to_string(&ids)?.into())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -300,9 +316,13 @@ impl SettingsStore {
         Ok(deleted)
     }
 
-    /// The users holding an active API key or connected app grant to an
+    /// The users holding an active API key or live machine grant to an
     /// instance provider, as (user ID, email), sorted by email.
-    pub async fn instance_provider_users(&self, id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    pub async fn instance_provider_users(
+        &self,
+        id: &str,
+        oauth: &OAuthService,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         #[derive(FromQueryResult)]
         struct Row {
             id: String,
@@ -311,9 +331,11 @@ impl SettingsStore {
         Ok(Row::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
-                "SELECT u.id, u.email_display email FROM users u WHERE u.id IN ({GRANT_HOLDERS}) ORDER BY u.email_display"
+                "SELECT u.id, u.email_display email FROM users u
+                WHERE u.id IN (SELECT user_id FROM ({ACTIVE_GRANTS}) WHERE provider = ?)
+                ORDER BY u.email_display"
             ),
-            [id.into()],
+            [live_machines(&self.database, oauth, None).await?, id.into()],
         ))
         .all(&self.database)
         .await?
@@ -322,11 +344,15 @@ impl SettingsStore {
         .collect())
     }
 
-    /// Replaces an instance provider with a copy owned by each user who holds
-    /// a grant to it, so their keys and apps keep working, and removes it from
-    /// everyone else's grants. Returns how many users got a copy, or `None`
-    /// when no such instance provider exists.
-    pub async fn move_to_users(&self, id: &str) -> Result<Option<usize>, SettingsError> {
+    /// Replaces an instance provider with a copy owned by each of its
+    /// [users](Self::instance_provider_users), so their keys and machines keep
+    /// working, and removes it from everyone else's grants. Returns how many
+    /// users got a copy, or `None` when no such instance provider exists.
+    pub async fn move_to_users(
+        &self,
+        id: &str,
+        oauth: &OAuthService,
+    ) -> Result<Option<usize>, SettingsError> {
         let tx = crate::db::begin_immediate(&self.database).await?;
         let Some(row) = tx
             .query_one_raw(Statement::from_sql_and_values(
@@ -352,7 +378,8 @@ impl SettingsStore {
                 DbBackend::Sqlite,
                 format!(
                     "INSERT INTO providers (id, user_id, kind, base_url, created_at, updated_at)
-                    SELECT ?, u.id, ?, ?, ?, ? FROM users u WHERE u.id IN ({GRANT_HOLDERS})"
+                    SELECT ?, u.id, ?, ?, ?, ? FROM users u
+                    WHERE u.id IN (SELECT user_id FROM ({ACTIVE_GRANTS}) WHERE provider = ?)"
                 ),
                 [
                     id.into(),
@@ -360,6 +387,7 @@ impl SettingsStore {
                     base_url.into(),
                     now.clone().into(),
                     now.into(),
+                    live_machines(&tx, oauth, None).await?,
                     id.into(),
                 ],
             ))
@@ -386,36 +414,40 @@ impl SettingsStore {
         Ok(Some(moved))
     }
 
-    /// How many active API keys and connected apps hold a grant to each
+    /// How many active API keys and live machines hold a grant to each
     /// provider ID of this layer. Instance grants are counted across users.
-    pub async fn grant_counts(&self, scope: Scope) -> anyhow::Result<HashMap<String, (i64, i64)>> {
+    pub async fn grant_counts(
+        &self,
+        scope: Scope,
+        oauth: &OAuthService,
+    ) -> anyhow::Result<HashMap<String, (i64, i64)>> {
         #[derive(FromQueryResult)]
         struct Row {
             id: String,
             keys: i64,
-            apps: i64,
+            machines: i64,
         }
-        let (filter, values) = match scope {
-            Scope::Instance => ("", Vec::new()),
-            Scope::User(user) => (" AND c.user_id = ?", vec![Value::from(user.to_string())]),
+        let (user, filter) = match scope {
+            Scope::Instance => (None, ""),
+            Scope::User(user) => (Some(user), " WHERE user_id = ?"),
         };
+        let mut values = vec![live_machines(&self.database, oauth, user).await?];
+        values.extend(user.map(|user| Value::from(user.to_string())));
         Ok(Row::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
-                "SELECT j.value id,
-                    SUM(CASE WHEN c.kind = 'api_key' THEN 1 ELSE 0 END) keys,
-                    SUM(CASE WHEN c.kind = 'oauth' THEN 1 ELSE 0 END) apps
-                FROM gateway_clients c JOIN json_each(c.allowed_providers) j
-                LEFT JOIN gateway_keys k ON k.id = c.id
-                WHERE (c.kind = 'oauth' OR k.revoked_at IS NULL){filter}
-                GROUP BY j.value"
+                "SELECT provider id,
+                    SUM(CASE WHEN kind = 'api_key' THEN 1 ELSE 0 END) keys,
+                    SUM(CASE WHEN kind = 'oauth' THEN 1 ELSE 0 END) machines
+                FROM ({ACTIVE_GRANTS}){filter}
+                GROUP BY provider"
             ),
             values,
         ))
         .all(&self.database)
         .await?
         .into_iter()
-        .map(|row| (row.id, (row.keys, row.apps)))
+        .map(|row| (row.id, (row.keys, row.machines)))
         .collect())
     }
 
@@ -820,10 +852,24 @@ mod tests {
             .unwrap();
         keys.revoke(carol, &revoked).await.unwrap();
 
-        let users = store.instance_provider_users("shared").await.unwrap();
+        let oauth = crate::domain::OAuthService::standalone(
+            database.clone(),
+            crate::domain::OAuthConfig {
+                hmac_key: [8; 32],
+                key_id: "v1".into(),
+            },
+        )
+        .unwrap();
+        let users = store
+            .instance_provider_users("shared", &oauth)
+            .await
+            .unwrap();
         assert_eq!(users.len(), 2);
-        assert_eq!(store.move_to_users("shared").await.unwrap(), Some(2));
-        assert_eq!(store.move_to_users("shared").await.unwrap(), None);
+        assert_eq!(
+            store.move_to_users("shared", &oauth).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(store.move_to_users("shared", &oauth).await.unwrap(), None);
 
         assert_eq!(store.providers(Scope::Instance).await.unwrap().len(), 1);
         for owner in [alice, bob] {

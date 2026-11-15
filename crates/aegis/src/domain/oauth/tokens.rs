@@ -4,7 +4,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    OAuthService, TOKEN_DOMAIN, TOKEN_PREFIX, parse_opaque_value, parse_stored_date,
+    OAuthService, TOKEN_DOMAIN, TOKEN_PREFIX, parse_opaque_value,
+    usable::{TokenUse, access_token_usable},
     validate_issuer, validate_resource,
 };
 use crate::domain::{
@@ -23,6 +24,19 @@ impl OAuthService {
     ) -> Result<Principal, DomainError> {
         validate_issuer(issuer).map_err(|_| DomainError::InvalidCredentials)?;
         validate_resource(resource).map_err(|_| DomainError::InvalidCredentials)?;
+        self.authenticate_token(
+            token,
+            &self.token_use(issuer, Some(resource), self.clock.now()),
+        )
+        .await
+    }
+
+    /// An access token checked for `token_use`, whose issuer and resource are valid.
+    pub(super) async fn authenticate_token(
+        &self,
+        token: &str,
+        token_use: &TokenUse<'_>,
+    ) -> Result<Principal, DomainError> {
         let (id, selector, secret) = parse_opaque_value(token, TOKEN_PREFIX)?;
         let secret = Zeroizing::new(secret);
         let row = oauth_access_tokens::Entity::find_by_id(id.to_string())
@@ -32,11 +46,12 @@ impl OAuthService {
         let Some((token, Some(user))) = row else {
             return Err(DomainError::InvalidCredentials);
         };
-        let family_revoked_at = match &token.family_id {
-            Some(family_id) => oauth_refresh_token_families::Entity::find_by_id(family_id.clone())
-                .one(&self.db)
-                .await?
-                .and_then(|family| family.revoked_at),
+        let family = match &token.family_id {
+            Some(family_id) => {
+                oauth_refresh_token_families::Entity::find_by_id(family_id.clone())
+                    .one(&self.db)
+                    .await?
+            }
             None => None,
         };
         let stored_digest = token.secret_digest.clone();
@@ -46,17 +61,9 @@ impl OAuthService {
             &selector,
             secret.as_slice(),
         );
-        let auth_version = token.auth_version;
         if stored_digest.len() != 32
             || expected_digest.ct_eq(stored_digest.as_slice()).unwrap_u8() != 1
-            || token.key_id != self.config.key_id
-            || token.issuer != issuer
-            || token.resource != resource
-            || token.revoked_at.is_some()
-            || family_revoked_at.is_some()
-            || user.status != "active"
-            || auth_version != user.auth_version
-            || self.clock.now() >= parse_stored_date(&token.expires_at)?
+            || !access_token_usable(token_use, &token, family.as_ref(), &user)
         {
             return Err(DomainError::InvalidCredentials);
         }
@@ -66,14 +73,14 @@ impl OAuthService {
             identity: Identity {
                 user_id,
                 role: user.role,
-                auth_version,
+                auth_version: token.auth_version,
             },
             transport: PrincipalTransport::OAuthAccessToken {
                 token_id: id,
                 context: OAuthPrincipal {
                     client_id: token.client_id,
-                    issuer: issuer.to_owned(),
-                    resource: resource.to_owned(),
+                    issuer: token.issuer,
+                    resource: token.resource,
                     scope: token.scope,
                 },
             },

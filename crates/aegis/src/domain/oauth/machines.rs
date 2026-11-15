@@ -3,10 +3,12 @@ use chrono::TimeDelta;
 use sea_orm::{
     ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, FromQueryResult, Statement,
 };
+use std::collections::HashSet;
+use uuid::Uuid;
 
 use super::{
     GATEWAY_SCOPE, GrantContext, OAuthService, gateway_resource, parse_stored_date, scope_allows,
-    validate_client_id, validate_issuer,
+    validate_client_id, validate_issuer, validate_resource,
 };
 use crate::domain::{
     auth::{Principal, PrincipalTransport},
@@ -22,6 +24,13 @@ const LAST_USED_PRECISION: TimeDelta = TimeDelta::minutes(1);
 pub struct MachineClient {
     pub id: String,
     pub user_id: String,
+}
+
+pub(super) struct MachineGrant {
+    pub id: String,
+    pub client_id: String,
+    pub providers: Vec<String>,
+    pub last_used_at: Option<String>,
 }
 
 #[derive(FromQueryResult)]
@@ -112,11 +121,57 @@ impl OAuthService {
         token: &str,
         issuer: &str,
     ) -> Result<Principal, DomainError> {
-        let principal = self
-            .authenticate_access_token(token, issuer, &gateway_resource(issuer))
+        validate_issuer(issuer).map_err(|_| DomainError::InvalidCredentials)?;
+        let resource = gateway_resource(issuer);
+        validate_resource(&resource).map_err(|_| DomainError::InvalidCredentials)?;
+        self.authenticate_token(
+            token,
+            &self.machine_use(issuer, &resource, self.clock.now()),
+        )
+        .await
+    }
+
+    /// The gateway clients of paired machines, of `user` or of everyone, that can still authenticate.
+    pub async fn live_machine_ids(
+        &self,
+        db: &impl ConnectionTrait,
+        user: Option<Uuid>,
+    ) -> Result<HashSet<String>, DomainError> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: String,
+            user_id: String,
+            oauth_client_id: String,
+            oauth_issuer: String,
+        }
+        let user = user.map(|user| user.to_string());
+        let rows = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id, user_id, oauth_client_id, oauth_issuer FROM gateway_clients
+            WHERE kind = 'oauth' AND oauth_client_id IS NOT NULL AND oauth_issuer IS NOT NULL
+            AND (?1 IS NULL OR user_id = ?1)",
+            [user.into()],
+        ))
+        .all(db)
+        .await?;
+        if rows.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let now = self.clock.now();
+        let user_ids = rows.iter().map(|row| row.user_id.clone()).collect();
+        let client_ids = rows.iter().map(|row| row.oauth_client_id.clone()).collect();
+        let grants = self
+            .load_grants(db, user_ids, Some(client_ids), now)
             .await?;
-        oauth_client_id(&principal)?;
-        Ok(principal)
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                let resource = gateway_resource(&row.oauth_issuer);
+                let machine_use = self.machine_use(&row.oauth_issuer, &resource, now);
+                grants.usable(&row.user_id, &row.oauth_client_id, &machine_use)
+            })
+            .map(|row| row.id)
+            .collect())
     }
 
     /// The gateway client of a machine's token. `Forbidden` when `provider` is not granted to it.
@@ -236,21 +291,22 @@ impl OAuthService {
         Ok(())
     }
 
-    /// Providers and last use of the user's paired machines, by OAuth client ID.
+    /// The user's paired machines at `issuer`, whether or not they can still authenticate.
     pub(super) async fn machine_grants(
         &self,
         user_id: &str,
         issuer: &str,
-    ) -> Result<Vec<(String, Vec<String>, Option<String>)>, DomainError> {
+    ) -> Result<Vec<MachineGrant>, DomainError> {
         #[derive(FromQueryResult)]
         struct Row {
+            id: String,
             oauth_client_id: String,
             allowed_providers: String,
             last_used_at: Option<String>,
         }
         Row::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT oauth_client_id, allowed_providers, last_used_at FROM gateway_clients
+            "SELECT id, oauth_client_id, allowed_providers, last_used_at FROM gateway_clients
             WHERE user_id = ? AND kind = 'oauth' AND oauth_issuer = ? AND oauth_client_id IS NOT NULL",
             [user_id.to_owned().into(), issuer.to_owned().into()],
         ))
@@ -258,11 +314,12 @@ impl OAuthService {
         .await?
         .into_iter()
         .map(|row| {
-            Ok((
-                row.oauth_client_id,
-                parse_providers(&row.allowed_providers)?,
-                row.last_used_at,
-            ))
+            Ok(MachineGrant {
+                id: row.id,
+                client_id: row.oauth_client_id,
+                providers: parse_providers(&row.allowed_providers)?,
+                last_used_at: row.last_used_at,
+            })
         })
         .collect()
     }
@@ -271,10 +328,16 @@ impl OAuthService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::oauth::{
-        ClientRegistration, DEVICE_GRANT_TYPE, DeviceAuthorizationRequest, DeviceTokenRequest,
-        RefreshTokenRequest, tests::setup,
+    use crate::domain::{
+        Clock,
+        auth::Identity,
+        oauth::{
+            ClientRegistration, DEVICE_GRANT_TYPE, DeviceAuthorizationRequest, DeviceTokenRequest,
+            OAuthConfig, RefreshTokenRequest, tests::setup,
+        },
     };
+    use crate::settings::{Scope, SettingsStore};
+    use sea_orm::DatabaseConnection;
 
     const ISSUER: &str = "https://aegis.example";
     const GATEWAY: &str = "https://aegis.example/providers";
@@ -421,7 +484,7 @@ mod tests {
                 .machine_grants(&identity.user_id.to_string(), ISSUER)
                 .await
                 .unwrap()[0]
-                .1
+                .providers
                 .is_empty(),
             "a revoked machine holds no provider"
         );
@@ -482,5 +545,449 @@ mod tests {
                 .await,
             Err(DomainError::InvalidInput(_))
         ));
+    }
+
+    /// A machine paired for `claude`, and the tokens it holds now.
+    struct Paired {
+        id: String,
+        client_id: String,
+        access: String,
+        refresh: Option<String>,
+    }
+
+    async fn pair(oauth: &OAuthService, identity: &Identity, offline: bool) -> Paired {
+        let client = machine_client(oauth).await;
+        pair_client(oauth, identity, client.client_id(), offline).await
+    }
+
+    async fn pair_client(
+        oauth: &OAuthService,
+        identity: &Identity,
+        client_id: &str,
+        offline: bool,
+    ) -> Paired {
+        let issued = oauth
+            .issue_device_authorization(DeviceAuthorizationRequest {
+                client_id,
+                issuer: ISSUER,
+                resource: GATEWAY,
+                scope: None,
+            })
+            .await
+            .unwrap();
+        let scope = if offline {
+            "gateway:use offline_access"
+        } else {
+            "gateway:use"
+        };
+        oauth
+            .decide_device_authorization(
+                issued.user_code(),
+                identity,
+                Some(scope),
+                Some(&["claude".to_owned()]),
+            )
+            .await
+            .unwrap();
+        let token = oauth
+            .redeem_device_code(DeviceTokenRequest {
+                device_code: issued.device_code(),
+                client_id,
+                issuer: ISSUER,
+                resource: Some(GATEWAY),
+            })
+            .await
+            .unwrap();
+        let machine = oauth
+            .authenticate_machine(token.expose(), ISSUER, "claude")
+            .await
+            .unwrap();
+        Paired {
+            id: machine.id,
+            client_id: client_id.to_owned(),
+            access: token.expose().to_owned(),
+            refresh: token.refresh_token().map(str::to_owned),
+        }
+    }
+
+    impl Paired {
+        async fn refresh(&mut self, oauth: &OAuthService) -> bool {
+            let Some(refresh) = &self.refresh else {
+                return false;
+            };
+            let Ok(token) = oauth
+                .refresh_access_token(RefreshTokenRequest {
+                    refresh_token: refresh,
+                    client_id: &self.client_id,
+                    issuer: ISSUER,
+                    resource: GATEWAY,
+                })
+                .await
+            else {
+                return false;
+            };
+            self.access = token.expose().to_owned();
+            self.refresh = token.refresh_token().map(str::to_owned);
+            true
+        }
+    }
+
+    /// Which of the user's machines are live, checked against authenticating,
+    /// refreshing, the provider settings and the account page.
+    async fn live_each(
+        db: &DatabaseConnection,
+        oauth: &OAuthService,
+        identity: &Identity,
+        machines: &mut [Paired],
+    ) -> Vec<bool> {
+        let all = oauth.live_machine_ids(db, None).await.unwrap();
+        let mine = oauth
+            .live_machine_ids(db, Some(identity.user_id))
+            .await
+            .unwrap();
+        let settings = SettingsStore::new(db.clone());
+        let counted = settings
+            .grant_counts(Scope::Instance, oauth)
+            .await
+            .unwrap()
+            .get("claude")
+            .map_or(0, |&(_, machines)| machines);
+        let users = settings
+            .instance_provider_users("claude", oauth)
+            .await
+            .unwrap()
+            .len();
+        let principal = Principal {
+            identity: identity.clone(),
+            transport: PrincipalTransport::BrowserSession {
+                session_id: Uuid::nil(),
+            },
+        };
+        let apps = oauth
+            .list_connected_clients(&principal, ISSUER)
+            .await
+            .unwrap();
+        let mut each = Vec::new();
+        for machine in machines {
+            let live = all.contains(&machine.id);
+            let shown = apps
+                .iter()
+                .any(|app| app.client_id == machine.client_id && app.providers.is_some());
+            let editable = oauth
+                .set_machine_providers(&principal, ISSUER, &machine.client_id, &["claude".into()])
+                .await
+                .is_ok();
+            let authenticates = oauth
+                .authenticate_machine(&machine.access, ISSUER, "claude")
+                .await
+                .is_ok();
+            let refreshes = machine.refresh(oauth).await;
+            assert_eq!(live, mine.contains(&machine.id));
+            assert_eq!(live, authenticates || refreshes);
+            assert_eq!(shown, live);
+            assert_eq!(editable, live);
+            each.push(live);
+        }
+        let live = each.iter().filter(|&&live| live).count();
+        assert_eq!(counted, live as i64);
+        assert_eq!(users, usize::from(live > 0));
+        each
+    }
+
+    async fn live(
+        db: &DatabaseConnection,
+        oauth: &OAuthService,
+        identity: &Identity,
+        machine: &mut Paired,
+    ) -> bool {
+        live_each(db, oauth, identity, std::slice::from_mut(machine)).await[0]
+    }
+
+    enum Ending {
+        Disconnected,
+        AccessExpired,
+        AccessRevoked,
+        AccessRevokedRefreshKept,
+        RefreshIdle,
+        RefreshAbsolute,
+        RefreshReused,
+        AuthVersionChanged,
+        UserInactive,
+    }
+
+    /// Ends a machine's grant in one way and checks every view agrees on whether it is live.
+    async fn end(ending: Ending) {
+        let day = chrono::Duration::days(1);
+        let two_hours = chrono::Duration::hours(2);
+        let (db, oauth, _, clock, identity, _) = setup().await;
+        let offline = !matches!(ending, Ending::AccessExpired | Ending::AccessRevoked);
+        let mut machine = pair(&oauth, &identity, offline).await;
+        assert!(live(&db, &oauth, &identity, &mut machine).await);
+        let still_live = matches!(ending, Ending::AccessRevokedRefreshKept);
+        match ending {
+            Ending::Disconnected => {
+                let principal = oauth
+                    .authenticate_machine_token(&machine.access, ISSUER)
+                    .await
+                    .unwrap();
+                oauth.unpair_machine(&principal, ISSUER).await.unwrap();
+            }
+            Ending::AccessExpired => clock.advance(two_hours),
+            Ending::AccessRevoked | Ending::AccessRevokedRefreshKept => {
+                db.execute_unprepared(
+                    "UPDATE oauth_access_tokens SET revoked_at = '2026-08-16T12:00:00+00:00'",
+                )
+                .await
+                .unwrap();
+            }
+            Ending::RefreshIdle => {
+                clock.advance(two_hours);
+                assert!(live(&db, &oauth, &identity, &mut machine).await);
+                clock.advance(day * 180);
+            }
+            Ending::RefreshAbsolute => {
+                for _ in 0..2 {
+                    clock.advance(day * 170);
+                    assert!(live(&db, &oauth, &identity, &mut machine).await);
+                }
+                clock.advance(day * 24);
+                assert!(live(&db, &oauth, &identity, &mut machine).await);
+                clock.advance(day * 2);
+            }
+            Ending::RefreshReused => reuse_refresh_token(&oauth, &mut machine).await,
+            Ending::AuthVersionChanged => {
+                db.execute_unprepared("UPDATE users SET auth_version=auth_version+1")
+                    .await
+                    .unwrap();
+            }
+            Ending::UserInactive => {
+                db.execute_unprepared("UPDATE users SET status='disabled'")
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(live(&db, &oauth, &identity, &mut machine).await, still_live);
+        assert_eq!(
+            oauth
+                .machine_grants(&identity.user_id.to_string(), ISSUER)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the machine stays for its recorded usage"
+        );
+    }
+
+    /// Refreshes, then presents the replaced refresh token again, which revokes the family.
+    async fn reuse_refresh_token(oauth: &OAuthService, machine: &mut Paired) {
+        let replaced = machine.refresh.clone().unwrap();
+        assert!(machine.refresh(oauth).await);
+        assert!(
+            oauth
+                .refresh_access_token(RefreshTokenRequest {
+                    refresh_token: &replaced,
+                    client_id: &machine.client_id,
+                    issuer: ISSUER,
+                    resource: GATEWAY,
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_machine_is_not_live() {
+        end(Ending::Disconnected).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_without_a_refresh_token_ends_with_its_access_token() {
+        end(Ending::AccessExpired).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_only_access_token_is_revoked_is_not_live() {
+        end(Ending::AccessRevoked).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_access_token_is_revoked_stays_live_through_its_refresh_token() {
+        end(Ending::AccessRevokedRefreshKept).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_ends_when_its_refresh_token_goes_idle() {
+        end(Ending::RefreshIdle).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_ends_when_its_refresh_family_reaches_its_absolute_lifetime() {
+        end(Ending::RefreshAbsolute).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_ends_when_refresh_token_reuse_revokes_its_family() {
+        end(Ending::RefreshReused).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_ends_when_the_user_auth_version_changes() {
+        end(Ending::AuthVersionChanged).await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_ends_when_its_user_is_inactive() {
+        end(Ending::UserInactive).await;
+    }
+
+    #[tokio::test]
+    async fn one_machine_ending_leaves_the_users_other_machine_live() {
+        let (db, oauth, _, _, identity, _) = setup().await;
+        let mut machines = [
+            pair(&oauth, &identity, true).await,
+            pair(&oauth, &identity, true).await,
+        ];
+        assert_eq!(
+            live_each(&db, &oauth, &identity, &mut machines).await,
+            [true, true]
+        );
+        reuse_refresh_token(&oauth, &mut machines[0]).await;
+        assert_eq!(
+            live_each(&db, &oauth, &identity, &mut machines).await,
+            [false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connected_app_dates_from_its_usable_grant() {
+        let (db, oauth, _, clock, identity, _) = setup().await;
+        let mut first = pair(&oauth, &identity, true).await;
+        clock.advance(chrono::Duration::days(200));
+        assert!(!live(&db, &oauth, &identity, &mut first).await);
+        let paired_again_at = clock.now();
+        let again = pair_client(&oauth, &identity, &first.client_id, true).await;
+        assert_eq!(again.id, first.id);
+        let principal = Principal {
+            identity: identity.clone(),
+            transport: PrincipalTransport::BrowserSession {
+                session_id: Uuid::nil(),
+            },
+        };
+        let apps = oauth
+            .list_connected_clients(&principal, ISSUER)
+            .await
+            .unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].created_at, paired_again_at);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_refresh_token_for_another_use_is_refused_without_revoking_its_family() {
+        let (db, oauth, _, clock, identity, _) = setup().await;
+        let mut machine = pair(&oauth, &identity, true).await;
+        let replaced = machine.refresh.clone().unwrap();
+        assert!(machine.refresh(&oauth).await);
+        let other_client = machine_client(&oauth).await;
+        let other_key = OAuthService::new(
+            db.clone(),
+            OAuthConfig {
+                hmac_key: [8; 32],
+                key_id: "oauth-2".into(),
+            },
+            clock.clone(),
+        )
+        .unwrap();
+        let other_issuer = "https://other.example";
+        for (service, client_id, issuer, resource) in [
+            (&other_key, machine.client_id.as_str(), ISSUER, GATEWAY),
+            (
+                &oauth,
+                machine.client_id.as_str(),
+                other_issuer,
+                "https://other.example/providers",
+            ),
+            (
+                &oauth,
+                machine.client_id.as_str(),
+                ISSUER,
+                "https://aegis.example/mcp",
+            ),
+            (&oauth, other_client.client_id(), ISSUER, GATEWAY),
+        ] {
+            assert!(
+                service
+                    .refresh_access_token(RefreshTokenRequest {
+                        refresh_token: &replaced,
+                        client_id,
+                        issuer,
+                        resource,
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(machine.refresh(&oauth).await, "the family is not revoked");
+    }
+
+    #[tokio::test]
+    async fn keeping_an_instance_provider_skips_users_whose_machines_ended() {
+        let (db, oauth, _, _, admin, _) = setup().await;
+        let bob = Uuid::now_v7();
+        db.execute_unprepared(&format!(
+            "INSERT INTO users(id,email_normalized,email_display,role,status,auth_version,created_at,updated_at) VALUES('{bob}','bob@example.com','bob@example.com','user','active',0,'2026-01-01','2026-01-01')"
+        ))
+        .await
+        .unwrap();
+        let bob_identity = Identity {
+            user_id: bob,
+            role: "user".into(),
+            auth_version: 0,
+        };
+        pair(&oauth, &admin, true).await;
+        pair(&oauth, &bob_identity, true).await;
+        let settings = SettingsStore::new(db.clone());
+        settings
+            .create_provider(
+                Scope::Instance,
+                &crate::config::ProviderConfig {
+                    id: "claude".into(),
+                    kind: crate::config::ProviderKind::from_parts("claude_subscription", None)
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE users SET auth_version=auth_version+1 WHERE id='{bob}'"
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            settings.move_to_users("claude", &oauth).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            settings
+                .providers(Scope::User(admin.user_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            settings
+                .providers(Scope::User(bob))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for (user, providers) in [(admin.user_id, vec!["claude"]), (bob, vec![])] {
+            let machines = oauth
+                .machine_grants(&user.to_string(), ISSUER)
+                .await
+                .unwrap();
+            assert_eq!(machines[0].providers, providers);
+        }
     }
 }
