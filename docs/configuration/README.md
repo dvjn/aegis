@@ -1,6 +1,6 @@
 # Configuration
 
-Aegis reads server settings from `config.toml` in the working directory. Environment variables select the file, override selected settings, and configure mail and logs. Providers and guardrails are stored in the database; see [Providers and guardrails](#providers-and-guardrails).
+Aegis reads server settings from `config.toml` in the working directory. Environment variables select the file, override selected settings, and configure mail and logs. Providers, guardrails and API keys are stored in the database; see [Providers, guardrails and API keys](../providers.md).
 
 ## Config file
 
@@ -15,7 +15,8 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # Default: "sqlite://data/aegis.db?mode=rwc".
 # database_url = "sqlite://data/aegis.db?mode=rwc"
 
-# Optional. Maximum captured request or response body in bytes. Must be greater than zero.
+# Optional. Maximum response body kept in usage records, in bytes. Request bodies are
+# kept whole. Must be greater than zero.
 # Default: 16777216.
 # max_capture_bytes = 16777216
 
@@ -43,63 +44,11 @@ Create `config.toml` from this block. Uncomment settings that need non-default v
 # cache_write_per_mtok = 1.25 # Optional. Default: unset.
 ```
 
-Aegis creates `data/root.key` on first start. The file must contain 32 bytes and must not be accessible by group or other users.
+Aegis creates `data/root.key` under its working directory on first start (`/data/data/root.key` in the container). The file must contain 32 bytes and must not be accessible by group or other users.
 
-## Providers and guardrails
+## Settings from earlier releases
 
-Providers and guardrails live in the database at two layers:
-
-- **Instance:** set by superusers under **Instance settings** (the gear button in the top bar, shown only to superusers), or with the `aegis provider` and `aegis guardrails` commands. Every user can use instance providers, and instance guardrails apply to every request.
-- **User:** each user adds their own under **Providers** and **Guardrails** in their account settings (the person button in the top bar). Nobody else sees or edits them.
-
-A running server picks up changes made in the web interface immediately, and changes made with the CLI within 15 seconds.
-
-### Providers
-
-A provider has an ID, a type, and an optional upstream base URL. Clients send requests to `/providers/<id>/...` with an `x-aegis-api-key` header, and the key must allow that provider.
-
-- IDs contain only letters, digits, `-` or `_`, up to 64 characters. A user's provider cannot reuse an instance provider's ID, and an instance provider cannot take an ID a user already has.
-- Types: `claude_subscription`, `codex_subscription`, `typesafe`, `bedrock`, `vertex`. Each type has a default upstream.
-- `bedrock` is Amazon Bedrock in one region, set with the **Region** field or `--region` (default `us-east-1`). It serves InvokeModel (Claude Code) and Converse (pi, any Bedrock model) on the runtime endpoint, and Bedrock's OpenAI-compatible endpoint: Responses for OpenAI models under `/openai/v1` (Codex), Anthropic Messages for Claude under `/anthropic/v1`, and Chat Completions for partner models such as GLM under `/v1`. Clients must authenticate with a [Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) in `AWS_BEARER_TOKEN_BEDROCK`: AWS credentials that sign requests cover the host and body, which Aegis changes, so Bedrock rejects them.
-- `vertex` is Google Vertex AI. Each request goes to the Google host for the location in its path, so one provider serves every project and location the client's own Google credentials can reach. It serves Anthropic models (Claude Code), OpenAI models over Responses (Codex), Gemini (pi), and partner models such as GLM over its OpenAI-compatible Chat Completions endpoint.
-- The ID and type cannot change after creation, because client URLs and usage history refer to them. Only the upstream can be edited.
-- Deleting a provider removes it from every API key that was granted it. Usage history stays.
-- Deleting an instance provider that users' active API keys use offers two choices: **Delete for everyone**, or **Keep for users**, which gives each of those users a copy of their own with the same ID, type and upstream, then removes it from the instance. Their keys keep working, and they can edit or delete their copy. Other users lose access.
-
-```sh
-aegis provider add claude --type claude_subscription
-aegis provider add work --type codex_subscription --base-url https://proxy.example/codex
-aegis provider add aws --type bedrock --region eu-west-1
-aegis provider add gcp --type vertex
-aegis provider update work --default-url
-aegis provider list
-aegis provider keep-for-users work   # delete from the instance, keeping a copy for each user of it
-aegis provider remove work
-```
-
-### Guardrails
-
-Guardrails scan request bodies before they reach a provider. Each layer turns on secret detection (built-in detectors) and custom regex patterns, and chooses a mode: `observe` records matches; `mask` replaces them before forwarding and restores them in the response.
-
-Every request to a provider is scanned except `GET`, `HEAD` and `OPTIONS` requests, which carry no body, such as model listings. That includes calls in a format Aegis does not record, such as token counts: they are masked and restored but do not appear in usage.
-
-The instance layer is a minimum that users can only add to. On a user's request, a layer that is on stays on, `mask` wins over `observe`, and the detectors and patterns of both layers run. A user's pattern cannot reuse the name of an instance pattern. The **Guardrails** page has a test box that shows what the saved settings would find in a sample.
-
-```sh
-aegis guardrails show
-aegis guardrails set --enabled true --mode mask
-aegis guardrails secrets all                   # every built-in detector
-aegis guardrails secrets disable jwt           # all except jwt
-aegis guardrails secrets disable               # secret detection off
-aegis guardrails regex add employee_id '\bEMP-\d{6}\b'
-aegis guardrails regex remove employee_id
-```
-
-Built-in secret detectors: `anthropic_api_key`, `openai_api_key`, `github_token`, `gitlab_token`, `aws_access_key_id`, `slack_token`, `google_api_key`, `stripe_key`, `npm_token`, `jwt`, `pem_private_key`, `aegis_api_key`. Pattern names are unique lowercase snake_case.
-
-### Upgrading from configuration-file settings
-
-Earlier releases read `[[providers]]` and `[guardrails]` from `config.toml`, with `GUARDRAILS_ENABLED`, `GUARDRAILS_MODE` and `GUARDRAILS_SECRETS_ENABLED` as overrides. On the first start after upgrading, Aegis copies those settings once into the instance layer. After that, and on any new installation, those sections and variables are ignored, and Aegis logs a warning if they are still set. Remove them once the import is done.
+Earlier releases read `[[providers]]` and `[guardrails]` from this file, and the `GUARDRAILS_ENABLED`, `GUARDRAILS_MODE` and `GUARDRAILS_SECRETS_ENABLED` variables. On the first start after upgrading, Aegis imports them once as instance providers and guardrails. After that they are ignored, and Aegis logs a warning while they are still set. New installations never import them.
 
 ## Environment variables
 
@@ -114,6 +63,7 @@ Earlier releases read `[[providers]]` and `[guardrails]` from `config.toml`, wit
 | Variable | Required | Default | Overrides |
 | --- | --- | --- | --- |
 | `HTTP_ADDR` | no | config file | `http_addr` |
+| `PUBLIC_URL` | no | config file | `public_url` |
 | `DATABASE_URL` | no | config file | `database_url` |
 | `MAX_CAPTURE_BYTES` | no | config file | `max_capture_bytes` |
 
@@ -144,7 +94,7 @@ For local development:
 mise run pricing:update
 ```
 
-This task refreshes the bundled model catalog. Prices follow [LiteLLM](https://github.com/BerriAI/litellm), keyed as LiteLLM keys them, and a request is priced within the cloud that served it, the way LiteLLM does: a Bedrock request uses Bedrock's regional and model prices, a Vertex request Vertex's, and either falls back to the first-party price of the model inside the cloud's model ID. Prices fetched at runtime layer over the bundled ones. The running server automatically backfills unknown costs on startup and after adopting refreshed prices. Already calculated costs are preserved; updated dashboard totals are queued for rebuilding. Models with no matching price remain unknown.
+This task refreshes the bundled model catalog from [LiteLLM](https://github.com/BerriAI/litellm). Each request is priced with its provider's own prices, falling back to the model's first-party price. Prices fetched at runtime layer over the bundled ones. The running server automatically backfills unknown costs on startup and after adopting refreshed prices. Already calculated costs are preserved; updated dashboard totals are queued for rebuilding. Models with no matching price remain unknown.
 
 ### Logs
 

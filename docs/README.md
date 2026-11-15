@@ -12,4 +12,5 @@
 
 ## Reference
 
+- [Providers, guardrails and API keys](providers.md) - provider types, guardrails, keys, and their commands.
 - [Configuration](configuration/README.md) - config file fields and environment variables.

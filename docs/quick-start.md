@@ -45,9 +45,7 @@ podman run --rm --name aegis \
 
 Open <http://127.0.0.1:8765> and sign in. The first account is a superuser.
 
-Add the providers this instance will route under **Instance settings** (the gear button in the top bar), or add your own under **Account** → **Providers**. Provider IDs become part of the gateway URL. See [Providers and guardrails](configuration/README.md#providers-and-guardrails).
-
-Create an API key under **Account** and grant it access to the provider the client will use.
+Add a provider and create an API key granted to it. Provider IDs become part of the gateway URL. See [Providers, guardrails and API keys](providers.md).
 
 ## 4. Connect a client
 
