@@ -4,6 +4,8 @@ Aegis is bring your own credentials. Provider credentials stay in the client and
 
 Create an Aegis API key in the web interface before configuring a client. Grant the key access to the provider ID used in the gateway URL.
 
+To change a key later, use the buttons next to it under **Account**. **Edit** renames the key or changes its providers; the change applies to its current secret from the next request. **Rotate** issues a new secret with the same name and providers. After a rotation, the previous secret keeps working for one hour so clients can be updated, unless **Revoke the old secret now** is checked.
+
 ## Claude Code
 
 Set the gateway URL and Aegis header, then run Claude Code with its existing provider authentication:

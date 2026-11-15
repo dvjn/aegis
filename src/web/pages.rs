@@ -1,9 +1,11 @@
 use super::{AppState, authenticate, csrf_from_token, error::WebError, new_csrf_value, views};
 use crate::{
+    api_keys::{KeyChanges, KeyEditError},
     domain::role_allows_scope,
     domain::{DomainError, Password, Principal},
     policies::EVALUATION_METADATA_SCOPE,
     usage::Range,
+    web::views::account::{KeyAction, KeyPage},
 };
 use axum::{
     Form,
@@ -613,17 +615,20 @@ pub(super) struct ApiKeyForm {
     csrf: String,
     name: String,
     providers: Vec<String>,
+    revoke_now: bool,
 }
 
 fn parse_api_key_form(body: &[u8]) -> Result<ApiKeyForm, DomainError> {
     let mut csrf = None;
     let mut name = None;
     let mut providers = Vec::new();
+    let mut revoke_now = false;
     for (key, value) in url::form_urlencoded::parse(body) {
         match key.as_ref() {
             "csrf" => csrf = Some(value.into_owned()),
             "name" => name = Some(value.into_owned()),
             "providers" => providers.push(value.into_owned()),
+            "revoke_now" => revoke_now = true,
             _ => {}
         }
     }
@@ -631,6 +636,7 @@ fn parse_api_key_form(body: &[u8]) -> Result<ApiKeyForm, DomainError> {
         csrf: csrf.ok_or(DomainError::InvalidInput("missing CSRF token"))?,
         name: name.ok_or(DomainError::InvalidInput("missing key name"))?,
         providers,
+        revoke_now,
     })
 }
 
@@ -713,25 +719,125 @@ async fn key_failure(
     Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
 }
 
+async fn key_form_page(
+    action: KeyAction,
+    id: String,
+    state: AppState,
+    jar: CookieJar,
+) -> Result<Response, WebError> {
+    let Some((principal, csrf)) = account_principal(&state, &jar).await else {
+        return Ok(to_login());
+    };
+    let key = match state.keys.active(principal.user_id(), &id).await {
+        Ok(key) => key,
+        Err(KeyEditError::NotFound) => return Err(DomainError::NotFound.into()),
+        Err(error) => return Err(WebError::internal(error)),
+    };
+    let selected: Vec<String> = serde_json::from_str(&key.allowed_providers).unwrap_or_default();
+    let available = state.gateway.provider_ids(&principal.user_id().to_string());
+    Ok(views::account::key_page(&KeyPage {
+        csrf: &csrf,
+        superuser: is_superuser(&principal),
+        action,
+        key: &key,
+        available: &available,
+        name: &key.name,
+        selected: &selected,
+        error: None,
+    })
+    .into_response())
+}
+
+pub(super) async fn api_key_edit_page(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Response, WebError> {
+    key_form_page(KeyAction::Edit, id, state, jar).await
+}
+
+pub(super) async fn api_key_rotate_page(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Response, WebError> {
+    key_form_page(KeyAction::Rotate, id, state, jar).await
+}
+
+pub(super) async fn api_key_edit(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    RawForm(body): RawForm,
+) -> Result<Response, WebError> {
+    key_change(KeyAction::Edit, id, state, headers, jar, body).await
+}
+
 pub(super) async fn api_key_rotate(
     Path(id): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
     jar: CookieJar,
-    Form(input): Form<AccountActionForm>,
+    RawForm(body): RawForm,
 ) -> Result<Response, WebError> {
+    key_change(KeyAction::Rotate, id, state, headers, jar, body).await
+}
+
+async fn key_change(
+    action: KeyAction,
+    id: String,
+    state: AppState,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: axum::body::Bytes,
+) -> Result<Response, WebError> {
+    let input = parse_api_key_form(&body)?;
     csrf_from_token(&state, &input.csrf, &jar)?;
     let Ok(principal) = authenticate(&state, &jar, Some(&input.csrf)).await else {
         return Ok(to_login());
     };
-    let secret = state
-        .keys
-        .rotate(principal.user_id(), &id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "API key rotation failed");
-            DomainError::NotFound
-        })?;
+    let user = principal.user_id();
+    let available = state.gateway.provider_ids(&user.to_string());
+    let changes = KeyChanges {
+        name: &input.name,
+        providers: &input.providers,
+    };
+    let result = match action {
+        KeyAction::Edit if input.providers.iter().any(|id| !available.contains(id)) => {
+            Err(KeyEditError::Invalid("Select only providers that exist."))
+        }
+        KeyAction::Edit => state.keys.update(user, &id, changes).await.map(|()| None),
+        KeyAction::Rotate => state
+            .keys
+            .rotate(user, &id, input.revoke_now)
+            .await
+            .map(Some),
+    };
+    let secret = match result {
+        Ok(None) => return Ok(Redirect::to("/account").into_response()),
+        Ok(Some(secret)) => secret,
+        Err(KeyEditError::NotFound) => return Err(DomainError::NotFound.into()),
+        Err(KeyEditError::Invalid(message)) => {
+            let key = state
+                .keys
+                .active(user, &id)
+                .await
+                .map_err(WebError::internal)?;
+            let page = views::account::key_page(&KeyPage {
+                csrf: &input.csrf,
+                superuser: is_superuser(&principal),
+                action,
+                key: &key,
+                available: &available,
+                name: &input.name,
+                selected: &input.providers,
+                error: Some(message),
+            });
+            return Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
+        }
+        Err(error) => return Err(WebError::internal(error)),
+    };
     let page = render_account(
         &state,
         &headers,

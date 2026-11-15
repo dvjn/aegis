@@ -1432,6 +1432,13 @@ input:disabled {
   margin: 0;
 }
 
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
 .danger-card {
   border-color: var(--danger-line);
   background: var(--danger-surface);

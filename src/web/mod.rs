@@ -187,7 +187,14 @@ pub fn auth_router(state: AppState) -> Router {
                 "/account/api-keys",
                 get(pages::api_keys_page).post(pages::api_key_create),
             )
-            .route("/account/api-keys/{id}/rotate", post(pages::api_key_rotate))
+            .route(
+                "/account/api-keys/{id}/edit",
+                get(pages::api_key_edit_page).post(pages::api_key_edit),
+            )
+            .route(
+                "/account/api-keys/{id}/rotate",
+                get(pages::api_key_rotate_page).post(pages::api_key_rotate),
+            )
             .route("/account/api-keys/{id}/revoke", post(pages::api_key_revoke))
             .route("/account/password", post(pages::account_password_submit))
             .route(

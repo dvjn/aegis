@@ -164,14 +164,19 @@ fn keys_card(csrf: &str, keys: &[KeySummary]) -> Markup {
                             tr {
                                 th scope="row" class="cell-title" { (key_name_text(&key.name)) }
                                 td { (provider_chips(&key.allowed_providers)) }
-                                td class="cell-moment" { (last_used_text(key.last_used_at.as_deref())) }
+                                td class="cell-moment" {
+                                    (last_used_text(key.last_used_at.as_deref()))
+                                    @if let Some(until) = &key.previous_expires_at {
+                                        span class="cell-subtitle" { "Previous secret works until " (last_used_text(Some(until))) }
+                                    }
+                                }
                                 td class="col-actions" {
                                     @if key.revoked_at.is_none() {
                                         div class="cell-actions" {
-                                            form method="post" action=(format!("/account/api-keys/{}/rotate", key.id)) {
-                                                input type="hidden" name="csrf" value=(csrf);
-                                                button class="secondary compact" type="submit" { "Rotate" }
-                                            }
+                                            a href=(format!("/account/api-keys/{}/edit", key.id))
+                                                role="button" class="secondary compact" { "Edit" }
+                                            a href=(format!("/account/api-keys/{}/rotate", key.id))
+                                                role="button" class="secondary compact" { "Rotate" }
                                             form method="post" action=(format!("/account/api-keys/{}/revoke", key.id)) {
                                                 input type="hidden" name="csrf" value=(csrf);
                                                 button class="secondary compact" type="submit" { "Revoke" }
@@ -189,6 +194,107 @@ fn keys_card(csrf: &str, keys: &[KeySummary]) -> Markup {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Rename the key or change its providers.
+    Edit,
+    /// Issue a new secret.
+    Rotate,
+}
+
+pub struct KeyPage<'a> {
+    pub csrf: &'a str,
+    pub superuser: bool,
+    pub action: KeyAction,
+    pub key: &'a KeySummary,
+    /// Provider IDs the user can grant.
+    pub available: &'a [String],
+    pub name: &'a str,
+    pub selected: &'a [String],
+    pub error: Option<&'a str>,
+}
+
+pub fn key_page(page: &KeyPage<'_>) -> Markup {
+    let key = page.key;
+    let granted: Vec<String> = serde_json::from_str(&key.allowed_providers).unwrap_or_default();
+    // A granted provider stays listed even if it can no longer be selected.
+    let mut options: Vec<&String> = page.available.iter().chain(granted.iter()).collect();
+    options.sort();
+    options.dedup();
+    let grace = match crate::api_keys::ROTATION_GRACE.num_minutes() {
+        60 => "1 hour".to_owned(),
+        minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
+        minutes => format!("{minutes} minutes"),
+    };
+    let (verb, path) = match page.action {
+        KeyAction::Edit => ("Edit", "edit"),
+        KeyAction::Rotate => ("Rotate", "rotate"),
+    };
+    layout_with_nav(
+        &format!("{verb} API key · Aegis"),
+        Some(signed_in_nav(page.superuser)),
+        html! {
+            main class="account-shell" {
+                div class="page-head" {
+                    h1 class="page-title" { (verb) " " (key_name_text(&key.name)) }
+                }
+                div class="account-grid" {
+                    div class="account-column" {
+                        article class="auth-card account-card" {
+                            @match page.action {
+                                KeyAction::Edit => {
+                                    h2 { "Name and providers" }
+                                    p { "Changes apply to the key's current secret from its next request." }
+                                }
+                                KeyAction::Rotate => {
+                                    h2 { "New secret" }
+                                    p { "Issues a new secret with the same name and providers, and shows it once." }
+                                }
+                            }
+                            @if let Some(error) = page.error { p class="auth-error" role="alert" { (error) } }
+                            form method="post" action=(format!("/account/api-keys/{}/{path}", key.id)) {
+                                input type="hidden" name="csrf" value=(page.csrf);
+                                @match page.action {
+                                    KeyAction::Edit => {
+                                        label for="key-name" { "Name" }
+                                        input id="key-name" name="name" required maxlength="100" value=(page.name);
+                                        fieldset class="field-group" {
+                                            legend { "Providers" }
+                                            div class="checkbox-grid" {
+                                                @for provider in options {
+                                                    label class="checkbox-row" {
+                                                        input type="checkbox" name="providers" value=(provider)
+                                                            checked[page.selected.contains(provider)];
+                                                        span { (provider) }
+                                                        @if !page.available.contains(provider) {
+                                                            span class="status-tag" { "Unavailable" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyAction::Rotate => {
+                                        input type="hidden" name="name" value=(key.name);
+                                        label class="checkbox-row toggle-row" {
+                                            input type="checkbox" name="revoke_now";
+                                            span { "Revoke the old secret now. Otherwise it keeps working for " (grace) "." }
+                                        }
+                                    }
+                                }
+                                div class="form-actions" {
+                                    button type="submit" { @if page.action == KeyAction::Edit { "Save" } @else { "Rotate" } }
+                                    a href="/account" role="button" class="secondary" { "Cancel" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
 }
 
 fn sessions_card(csrf: &str, sessions: &[SessionSummary]) -> Markup {
