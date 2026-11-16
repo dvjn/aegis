@@ -1,6 +1,6 @@
-# ags
+# Client
 
-`ags` runs Claude Code, Codex and pi through Aegis. It pairs a machine with one Aegis server, and each provider gets its own sign-in. There is nothing to configure.
+The Aegis client, `ags`, runs Claude Code, Codex and pi through Aegis. It pairs a machine with one Aegis server, and each provider gets its own sign-in. There is nothing to configure.
 
 ## Install
 

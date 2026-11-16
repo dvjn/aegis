@@ -3,7 +3,7 @@
 ## Start here
 
 - [Quick start](quick-start.md) - run one container and run a CLI through it.
-- [ags](ags.md) - run Claude Code, Codex and pi through Aegis.
+- [Client](client.md) - `ags`, which runs Claude Code, Codex and pi through Aegis.
 
 ## Deployment
 

@@ -50,15 +50,16 @@ Add a provider. Provider IDs become part of the gateway URL. See [Providers, gua
 
 ## 4. Run a CLI through Aegis
 
-Install [ags](ags.md#install), then pair this machine:
+Install the client, `ags` ([other ways](client.md#install)), and pair this machine:
 
 ```sh
+mise use -g "github:dvjn/aegis[matching=ags-]"
 ags login http://127.0.0.1:8765
 ```
 
 Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
 
-To run plain `claude`, `codex` and `pi` through ags, run this line and add it to `~/.bashrc` ([other shells](ags.md#init)):
+To run plain `claude`, `codex` and `pi` through ags, run this line and add it to `~/.bashrc` ([other shells](client.md#init)):
 
 ```sh
 eval "$(ags init bash)"
@@ -74,6 +75,6 @@ Aegis is bring your own credentials. Provider credentials stay on the machine, a
 
 ## Next steps
 
-- [Use ags](ags.md).
+- [Use the client](client.md).
 - [Configure Aegis](configuration/README.md).
 - [Operate the container](deployment/container.md).
