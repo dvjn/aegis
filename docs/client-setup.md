@@ -77,10 +77,8 @@ cargo install --locked --git https://github.com/dvjn/aegis ags
   - ChatGPT subscription
   - AWS Bedrock
   - GCP Vertex AI
-- pi (`pi`)
+- pi (`pi`), with models from all its providers at once
   - Claude subscription
   - ChatGPT subscription
   - AWS Bedrock
   - GCP Vertex AI
-
-`ags pi` reaches every granted provider in one launch, each under its own name. pi's other providers are off during it.
