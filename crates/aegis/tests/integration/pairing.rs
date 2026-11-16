@@ -28,7 +28,7 @@ fn cookie_value<'a>(pairs: &'a [String], name: &str) -> &'a str {
 }
 
 /// Signs in on the web and approves the device page for `providers`.
-async fn approve(base: String, page: String, providers: &[&str]) {
+pub(crate) async fn approve(base: String, page: String, providers: &[&str]) {
     let browser = reqwest::Client::builder()
         .redirect(Policy::none())
         .build()

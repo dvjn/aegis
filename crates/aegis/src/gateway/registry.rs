@@ -17,6 +17,8 @@ use std::{
 pub(super) struct Snapshot {
     /// Keyed by owner (`None` for the instance) and provider ID.
     providers: HashMap<(Option<String>, String), ProviderTarget>,
+    /// Each provider's type, keyed as `providers` is.
+    types: HashMap<(Option<String>, String), &'static str>,
     instance_guardrails: GuardrailsConfig,
     user_guardrails: HashMap<String, GuardrailsConfig>,
     /// Built on first use per user; compiling detectors is not free.
@@ -29,15 +31,19 @@ impl Snapshot {
         instance_guardrails: GuardrailsConfig,
         user_guardrails: HashMap<String, GuardrailsConfig>,
     ) -> anyhow::Result<Self> {
+        let mut types = HashMap::new();
         let providers = providers
             .into_iter()
             .map(|stored| {
+                let type_name = stored.config.kind.type_name();
                 let (id, target) = target(stored.config)?;
+                types.insert((stored.owner.clone(), id.clone()), type_name);
                 Ok(((stored.owner, id), target))
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             providers,
+            types,
             instance_guardrails,
             user_guardrails,
             pipelines: Mutex::default(),
@@ -63,6 +69,14 @@ impl Snapshot {
             .get(&(Some(user.to_owned()), id.to_owned()))
             .or_else(|| self.providers.get(&(None, id.to_owned())))
             .cloned()
+    }
+
+    /// The type of the provider `resolve` would pick.
+    pub(super) fn type_name(&self, user: &str, id: &str) -> Option<&'static str> {
+        self.types
+            .get(&(Some(user.to_owned()), id.to_owned()))
+            .or_else(|| self.types.get(&(None, id.to_owned())))
+            .copied()
     }
 
     /// The user's own providers and the instance's, sorted by ID.

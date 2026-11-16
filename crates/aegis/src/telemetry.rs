@@ -35,13 +35,22 @@ pub enum RequestClient<'a> {
     /// A paired machine, by its `gateway_clients` row.
     Machine {
         id: &'a str,
+        /// The `ags` launch the request came from, when it named one.
+        launch_id: Option<&'a str>,
     },
 }
 
 impl<'a> RequestClient<'a> {
     pub fn id(self) -> &'a str {
         match self {
-            Self::ApiKey { id, .. } | Self::Machine { id } => id,
+            Self::ApiKey { id, .. } | Self::Machine { id, .. } => id,
+        }
+    }
+
+    fn launch_id(self) -> Option<&'a str> {
+        match self {
+            Self::ApiKey { .. } => None,
+            Self::Machine { launch_id, .. } => launch_id,
         }
     }
 }
@@ -375,7 +384,7 @@ impl SqliteSink {
         let inserted = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO gateway_requests (id, request_id, client_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, price_scope, session_id, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+                "INSERT INTO gateway_requests (id, request_id, client_id, key_id, key_version_id, provider, protocol, method, endpoint, requested_model, price_scope, session_id, launch_id, started_at, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
                 [
                     id.to_string().into(),
                     record.request_id.to_owned().into(),
@@ -397,6 +406,7 @@ impl SqliteSink {
                     record.requested_model.map(str::to_owned).into(),
                     record.price_scope.map(str::to_owned).into(),
                     record.session_id.map(str::to_owned).into(),
+                    record.client.launch_id().map(str::to_owned).into(),
                     timestamp().into(),
                     (record.request_body.len() as i64).into(),
                 ],

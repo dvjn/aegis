@@ -1,5 +1,7 @@
 //! The contract shared by the Aegis server and the `ags` CLI.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,6 +19,26 @@ pub const REFRESH_TOKEN_GRANT_TYPE: &str = "refresh_token";
 pub const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
 /// The paired machine's own view of its grant; `DELETE` unpairs it.
 pub const MACHINE_PATH: &str = "/api/machine";
+
+/// The type names of providers, as the server stores and reports them.
+pub mod provider_type {
+    pub const CLAUDE_SUBSCRIPTION: &str = "claude_subscription";
+    pub const CODEX_SUBSCRIPTION: &str = "codex_subscription";
+    pub const TYPESAFE: &str = "typesafe";
+    pub const BEDROCK: &str = "bedrock";
+    pub const VERTEX: &str = "vertex";
+}
+
+/// Names the `ags` launch that a paired machine's gateway request belongs to.
+pub const LAUNCH_ID_HEADER: &str = "x-aegis-launch-id";
+pub const MAX_LAUNCH_ID_LEN: usize = 128;
+
+/// A launch ID is 1 to 128 printable ASCII characters; `ags` sends a random UUID.
+pub fn is_launch_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_LAUNCH_ID_LEN
+        && value.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthorizationServerMetadata {
@@ -100,6 +122,9 @@ pub struct Machine {
     pub account: String,
     pub name: String,
     pub providers: Vec<String>,
+    /// The type of each granted provider that still exists, by ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_types: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -119,6 +144,25 @@ mod tests {
         let slow: OAuthError =
             serde_json::from_str(r#"{"error":"slow_down","interval":10}"#).unwrap();
         assert_eq!(slow.interval, Some(10));
+    }
+
+    #[test]
+    fn a_launch_id_is_short_printable_ascii() {
+        assert!(is_launch_id("0b6f0c3e-8d1a-4c47-9e0f-2f7d3c1a5b9e"));
+        assert!(is_launch_id(&"a".repeat(MAX_LAUNCH_ID_LEN)));
+        let too_long = "a".repeat(MAX_LAUNCH_ID_LEN + 1);
+        for bad in ["", "tab\there", "caf\u{e9}", too_long.as_str()] {
+            assert!(!is_launch_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_machine_from_a_server_without_provider_types_still_reads() {
+        let machine: Machine = serde_json::from_str(
+            r#"{"account":"me@example.com","name":"ags","providers":["claude"]}"#,
+        )
+        .unwrap();
+        assert!(machine.provider_types.is_empty());
     }
 
     #[test]

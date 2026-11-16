@@ -35,7 +35,7 @@ pub use http::router;
 use registry::Snapshot;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
     sync::{Arc, RwLock},
     time::Duration,
@@ -84,14 +84,17 @@ struct Machines {
 
 enum Caller {
     Key(AuthenticatedKey),
-    Machine(MachineClient),
+    Machine {
+        client: MachineClient,
+        launch_id: Option<String>,
+    },
 }
 
 impl Caller {
     fn user_id(&self) -> &str {
         match self {
             Self::Key(key) => &key.user_id,
-            Self::Machine(machine) => &machine.user_id,
+            Self::Machine { client, .. } => &client.user_id,
         }
     }
 
@@ -101,9 +104,22 @@ impl Caller {
                 id: &key.id,
                 version_id: &key.version_id,
             },
-            Self::Machine(machine) => RequestClient::Machine { id: &machine.id },
+            Self::Machine { client, launch_id } => RequestClient::Machine {
+                id: &client.id,
+                launch_id: launch_id.as_deref(),
+            },
         }
     }
+}
+
+/// Removes the launch header, which never reaches the upstream, and returns a usable value.
+fn take_launch_id(headers: &mut HeaderMap) -> Option<String> {
+    let value = headers.remove(aegis_wire::LAUNCH_ID_HEADER)?;
+    value
+        .to_str()
+        .ok()
+        .filter(|value| aegis_wire::is_launch_id(value))
+        .map(str::to_owned)
 }
 
 impl Gateway {
@@ -152,6 +168,7 @@ impl Gateway {
         headers: &mut HeaderMap,
         provider_id: &str,
     ) -> Result<Caller, AuthenticationError> {
+        let launch_id = take_launch_id(headers);
         let token = headers
             .get(&API_KEY_HEADER)
             .and_then(|value| value.to_str().ok())
@@ -175,7 +192,7 @@ impl Gateway {
             .authenticate_machine(&token, &issuer, provider_id)
             .await
         {
-            Ok(machine) => Ok(Caller::Machine(machine)),
+            Ok(client) => Ok(Caller::Machine { client, launch_id }),
             Err(DomainError::Forbidden) => Err(AuthenticationError::ProviderNotAllowed(
                 provider_id.to_owned(),
             )),
@@ -234,6 +251,14 @@ impl Gateway {
             .visible(user)
             .into_iter()
             .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The type of each of `ids` that the user can reach, by ID.
+    pub fn provider_types(&self, user: &str, ids: &[String]) -> BTreeMap<String, String> {
+        let snapshot = self.snapshot();
+        ids.iter()
+            .filter_map(|id| Some((id.clone(), snapshot.type_name(user, id)?.to_owned())))
             .collect()
     }
 

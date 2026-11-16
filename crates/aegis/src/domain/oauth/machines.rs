@@ -240,6 +240,7 @@ impl OAuthService {
             account,
             name: row.name,
             providers: parse_providers(&row.allowed_providers)?,
+            provider_types: Default::default(),
         })
     }
 

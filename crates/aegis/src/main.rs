@@ -29,6 +29,7 @@ mod usage_hourly;
 mod usage_json;
 mod web;
 
+use aegis_wire::provider_type;
 use anyhow::{Context, Result, bail};
 use api_keys::KeyStore;
 use clap::{Parser, Subcommand};
@@ -341,10 +342,12 @@ async fn manage_provider(
         } => {
             let base_url = match region {
                 None => base_url,
-                Some(region) if kind == "bedrock" && config::is_cloud_region(&region) => {
+                Some(region)
+                    if kind == provider_type::BEDROCK && config::is_cloud_region(&region) =>
+                {
                     Some(config::bedrock_runtime_url(&region))
                 }
-                Some(_) if kind == "bedrock" => {
+                Some(_) if kind == provider_type::BEDROCK => {
                     bail!("a region contains only lowercase letters, digits and hyphens")
                 }
                 Some(_) => bail!("--region applies only to bedrock providers"),

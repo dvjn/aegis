@@ -1,5 +1,9 @@
-//! Pairs this machine with one Aegis server and keeps its tokens fresh.
+//! Pairs this machine with one Aegis server, keeps its tokens fresh, and launches CLIs through it.
 
+mod clis;
+mod defaults;
+mod launch;
+mod proxy;
 mod server;
 pub mod store;
 
@@ -7,6 +11,10 @@ use std::{fmt, time::Duration};
 
 use aegis_wire::{Machine, TokenResponse};
 use anyhow::{Result, bail};
+pub use clis::Cli;
+pub use launch::{
+    CliDefault, Launched, Offer, Pick, cli_defaults, launch, pick, remember, use_provider,
+};
 use server::{Poll, Server};
 pub use store::{Login, Store};
 
@@ -83,14 +91,15 @@ fn logged_out(server: &str, forgotten: Result<()>) -> anyhow::Error {
 }
 
 /// Forgets `login` unless another ags process replaced it meanwhile.
-fn forget(store: &Store, login: &Login) -> anyhow::Error {
-    let forgotten = (|| {
-        let _lock = store.lock()?;
+async fn forget(store: &Store, login: &Login) -> anyhow::Error {
+    let forgotten = async {
+        let _lock = store.lock_async().await?;
         if store.load()?.as_ref() == Some(login) {
             store.remove()?;
         }
         Ok(())
-    })();
+    }
+    .await;
     logged_out(&login.server, forgotten)
 }
 
@@ -179,7 +188,7 @@ pub async fn current_login(store: &Store) -> Result<Option<Login>> {
     if !login.expires_soon() {
         return Ok(Some(login));
     }
-    let _lock = store.lock()?;
+    let _lock = store.lock_async().await?;
     // Another ags process may have refreshed while this one waited for the lock.
     match store.load()? {
         Some(login) => fresh(store, login).await.map(Some),
@@ -223,7 +232,7 @@ pub async fn status(store: &Store) -> Result<Option<Status>> {
     let server = Server::discover(&login.server).await?;
     match server.machine(&login.access_token).await? {
         Some(machine) => Ok(Some(status_from(&login, machine))),
-        None => Err(forget(store, &login)),
+        None => Err(forget(store, &login).await),
     }
 }
 

@@ -1,4 +1,7 @@
 use crate::domain::{AuthConfig, OAuthConfig, SmtpSettings};
+use aegis_wire::provider_type::{
+    BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, TYPESAFE, VERTEX,
+};
 use anyhow::{Context, Result, bail};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -162,20 +165,20 @@ pub enum ProviderKind {
 
 impl ProviderKind {
     pub const TYPE_NAMES: [&'static str; 5] = [
-        "claude_subscription",
-        "codex_subscription",
-        "typesafe",
-        "bedrock",
-        "vertex",
+        CLAUDE_SUBSCRIPTION,
+        CODEX_SUBSCRIPTION,
+        TYPESAFE,
+        BEDROCK,
+        VERTEX,
     ];
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::ClaudeSubscription { .. } => "claude_subscription",
-            Self::CodexSubscription { .. } => "codex_subscription",
-            Self::TypeSafe { .. } => "typesafe",
-            Self::Bedrock { .. } => "bedrock",
-            Self::Vertex { .. } => "vertex",
+            Self::ClaudeSubscription { .. } => CLAUDE_SUBSCRIPTION,
+            Self::CodexSubscription { .. } => CODEX_SUBSCRIPTION,
+            Self::TypeSafe { .. } => TYPESAFE,
+            Self::Bedrock { .. } => BEDROCK,
+            Self::Vertex { .. } => VERTEX,
         }
     }
 
@@ -192,19 +195,19 @@ impl ProviderKind {
     /// that type's default upstream.
     pub fn from_parts(type_name: &str, base_url: Option<String>) -> Result<Self> {
         Ok(match type_name {
-            "claude_subscription" => Self::ClaudeSubscription {
+            CLAUDE_SUBSCRIPTION => Self::ClaudeSubscription {
                 base_url: base_url.unwrap_or_else(default_anthropic_base_url),
             },
-            "codex_subscription" => Self::CodexSubscription {
+            CODEX_SUBSCRIPTION => Self::CodexSubscription {
                 base_url: base_url.unwrap_or_else(default_codex_base_url),
             },
-            "typesafe" => Self::TypeSafe {
+            TYPESAFE => Self::TypeSafe {
                 base_url: base_url.unwrap_or_else(default_typesafe_base_url),
             },
-            "bedrock" => Self::Bedrock {
+            BEDROCK => Self::Bedrock {
                 base_url: base_url.unwrap_or_else(default_bedrock_base_url),
             },
-            "vertex" => Self::Vertex {
+            VERTEX => Self::Vertex {
                 base_url: base_url.unwrap_or_else(default_vertex_base_url),
             },
             other => bail!(

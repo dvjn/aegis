@@ -713,7 +713,8 @@ mod tests {
     fn claude(id: &str) -> ProviderConfig {
         ProviderConfig {
             id: id.into(),
-            kind: ProviderKind::from_parts("claude_subscription", None).unwrap(),
+            kind: ProviderKind::from_parts(aegis_wire::provider_type::CLAUDE_SUBSCRIPTION, None)
+                .unwrap(),
         }
     }
 
@@ -830,9 +831,11 @@ mod tests {
             user(&database).await,
         );
         let mut shared = claude("shared");
-        shared.kind =
-            ProviderKind::from_parts("claude_subscription", Some("https://proxy.example".into()))
-                .unwrap();
+        shared.kind = ProviderKind::from_parts(
+            aegis_wire::provider_type::CLAUDE_SUBSCRIPTION,
+            Some("https://proxy.example".into()),
+        )
+        .unwrap();
         store
             .create_provider(Scope::Instance, &shared)
             .await

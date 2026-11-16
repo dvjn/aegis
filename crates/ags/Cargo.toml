@@ -15,18 +15,20 @@ path = "src/main.rs"
 [dependencies]
 aegis-wire = { workspace = true }
 anyhow = "1.0.104"
-clap = { workspace = true }
-reqwest = { version = "0.13.4", default-features = false, features = ["form", "http2", "json", "rustls-no-provider"] }
+axum = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+getrandom = "0.4.3"
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "http2", "json", "rustls-no-provider", "stream"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
+subtle = { workspace = true }
+tokio = { version = "1.53.1", features = ["macros", "net", "process", "rt", "signal", "sync", "time"] }
 url = "2.5.8"
+uuid = { version = "1.26.0", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
 [dev-dependencies]
-axum = { workspace = true }
-tokio = { version = "1.53.1", features = ["net"] }
 toml = { workspace = true }

@@ -29,16 +29,19 @@ pub(crate) enum Poll {
     Expired,
 }
 
-fn http() -> Result<reqwest::Client> {
+/// Never follows redirects: ags checks that each request stays on the server's origin.
+pub(crate) fn client() -> reqwest::ClientBuilder {
     static PROVIDER: Once = Once::new();
     PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-    reqwest::Client::builder()
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+}
+
+fn http() -> Result<reqwest::Client> {
+    client()
         .user_agent(format!("ags/{}", aegis_wire::VERSION))
         .timeout(TIMEOUT)
-        // Every endpoint is checked to be on the server's origin, so a redirect could only leave it.
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("starting the HTTP client")
 }

@@ -222,3 +222,33 @@ async fn an_unusable_session_is_not_recorded_but_still_forwarded() {
         too_long.as_str()
     );
 }
+
+#[tokio::test]
+async fn an_api_key_cannot_name_a_launch_and_the_header_never_reaches_the_upstream() {
+    let harness = harness().await;
+
+    harness
+        .send(
+            "/providers/claude/v1/messages",
+            &[(aegis_wire::LAUNCH_ID_HEADER, "0b6f0c3e-launch")],
+        )
+        .await;
+
+    let launch: Option<String> = harness
+        .database
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT launch_id FROM gateway_requests ORDER BY seq DESC LIMIT 1",
+        ))
+        .await
+        .unwrap()
+        .expect("the request is recorded")
+        .try_get("", "launch_id")
+        .unwrap();
+    assert_eq!(launch, None);
+    assert!(
+        !harness
+            .last_upstream_headers()
+            .contains_key(aegis_wire::LAUNCH_ID_HEADER)
+    );
+}

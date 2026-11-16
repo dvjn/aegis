@@ -1,5 +1,6 @@
 //! Provider and guardrail settings, for a user's own layer and, for
 //! superusers, the instance layer.
+use aegis_wire::provider_type;
 use maud::{Markup, html};
 use std::collections::HashMap;
 
@@ -63,11 +64,11 @@ pub fn tabs(active: Tab) -> Markup {
 
 pub fn type_label(type_name: &str) -> &'static str {
     match type_name {
-        "claude_subscription" => "Claude subscription",
-        "codex_subscription" => "Codex subscription",
-        "typesafe" => "TypeSafe",
-        "bedrock" => "Amazon Bedrock",
-        "vertex" => "Google Vertex AI",
+        provider_type::CLAUDE_SUBSCRIPTION => "Claude subscription",
+        provider_type::CODEX_SUBSCRIPTION => "Codex subscription",
+        provider_type::TYPESAFE => "TypeSafe",
+        provider_type::BEDROCK => "Amazon Bedrock",
+        provider_type::VERTEX => "Google Vertex AI",
         _ => "Unknown",
     }
 }

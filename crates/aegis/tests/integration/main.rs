@@ -5,4 +5,5 @@
 mod shared;
 
 mod cases;
+mod launch;
 mod pairing;

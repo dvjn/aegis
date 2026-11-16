@@ -74,7 +74,10 @@ async fn authenticate(
 
 async fn read(state: &AppState, headers: &HeaderMap) -> Result<Response, Failure> {
     let (principal, issuer) = authenticate(state, headers).await?;
-    let machine = state.domain.oauth().machine(&principal, &issuer).await?;
+    let mut machine = state.domain.oauth().machine(&principal, &issuer).await?;
+    machine.provider_types = state
+        .gateway
+        .provider_types(&principal.user_id().to_string(), &machine.providers);
     Ok(Json(machine).into_response())
 }
 

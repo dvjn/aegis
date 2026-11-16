@@ -1,6 +1,8 @@
 //! Provider and guardrail settings pages. Every route exists twice: under
 //! `/settings` for the signed-in user's own layer, and under `/admin` for the
 //! instance layer, which only superusers reach.
+use aegis_wire::provider_type;
+
 use super::{
     AppState, authenticate, csrf_from_token,
     error::WebError,
@@ -216,7 +218,7 @@ async fn provider_create(
     let id = input.id.trim().to_owned();
     // The region field is hidden for other types, but a value typed before
     // switching type is still submitted, so only Bedrock reads it.
-    let region = (input.kind == "bedrock")
+    let region = (input.kind == provider_type::BEDROCK)
         .then(|| optional(&input.region))
         .flatten();
     let base_url = match region {

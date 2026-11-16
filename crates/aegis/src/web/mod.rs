@@ -3500,6 +3500,7 @@ mod tests {
                 "account": "admin@example.com",
                 "name": "ags on laptop",
                 "providers": ["claude"],
+                "provider_types": {"claude": "claude_subscription"},
             })
         );
 

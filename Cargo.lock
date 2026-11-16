@@ -79,14 +79,17 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "getrandom 0.4.3",
  "libc",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "toml",
  "url",
+ "uuid",
 ]
 
 [[package]]

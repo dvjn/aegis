@@ -58,6 +58,10 @@ impl Store {
             .ok_or_else(|| anyhow!("could not find a configuration directory for this user"))
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn path(&self) -> PathBuf {
         self.dir.join(FILE_NAME)
     }
@@ -75,26 +79,7 @@ impl Store {
     }
 
     pub fn save(&self, login: &Login) -> Result<()> {
-        create_private_dir(&self.dir)?;
-        let path = self.path();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let staging = self
-            .dir
-            .join(format!("{FILE_NAME}.{}-{nanos}.tmp", std::process::id()));
-        let written = (|| {
-            let mut file = private_file(&staging, Create::New)?;
-            file.write_all(&serde_json::to_vec_pretty(login)?)?;
-            file.sync_all()?;
-            fs::rename(&staging, &path).with_context(|| format!("writing {}", path.display()))
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&staging);
-        } else {
-            sync_dir(&self.dir);
-        }
-        written
+        write_private(&self.dir, FILE_NAME, &serde_json::to_vec_pretty(login)?).map(|_| ())
     }
 
     pub fn remove(&self) -> Result<()> {
@@ -112,6 +97,36 @@ impl Store {
         file.lock().context("locking the login file")?;
         Ok(StoreLock { _file: file })
     }
+
+    /// `lock` on a blocking thread, so waiting for another ags process stalls no async task.
+    pub async fn lock_async(&self) -> Result<StoreLock> {
+        let store = Self::at(&self.dir);
+        tokio::task::spawn_blocking(move || store.lock())
+            .await
+            .context("locking the login file")?
+    }
+}
+
+/// Replaces `dir/name` whole, so a reader never sees part of it.
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    create_private_dir(dir)?;
+    let path = dir.join(name);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let staging = dir.join(format!("{name}.{}-{nanos}.tmp", std::process::id()));
+    let written = (|| {
+        let mut file = private_file(&staging, Create::New)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&staging, &path).with_context(|| format!("writing {}", path.display()))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&staging);
+    } else {
+        sync_dir(dir);
+    }
+    written.map(|()| path)
 }
 
 fn create_private_dir(dir: &Path) -> Result<()> {
@@ -199,9 +214,10 @@ pub(crate) mod tests {
         let root = scratch();
         let store = Store::at(root.join("ags"));
         assert!(store.load().unwrap().is_none());
-        store.save(&login()).unwrap();
-        store.save(&login()).unwrap();
-        assert!(store.load().unwrap() == Some(login()));
+        let saved = login();
+        store.save(&saved).unwrap();
+        store.save(&saved).unwrap();
+        assert!(store.load().unwrap() == Some(saved));
         assert_eq!(
             fs::read_dir(root.join("ags")).unwrap().count(),
             1,
