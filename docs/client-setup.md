@@ -1,16 +1,19 @@
 # Client Setup
 
-The Aegis client, `ags`, runs Claude Code, Codex and pi through Aegis. It pairs a machine with one Aegis server, and each provider gets its own sign-in. There is nothing to configure.
+The Aegis client, `ags`, runs Claude Code, Codex and pi through Aegis. It pairs
+a machine with one Aegis server, and each provider gets its own sign-in. There
+is nothing to configure.
 
 ## Install
-
-With [mise](https://mise.jdx.dev):
 
 ```sh
 mise use -g "github:dvjn/aegis[matching=ags-]"
 ```
 
-Or from the GitHub release, for Linux on `x86_64` and `aarch64`:
+<details>
+<summary>Without mise</summary>
+
+From the GitHub release, for Linux on `x86_64` and `aarch64`:
 
 ```sh
 tag=vX.Y.Z                         # the release
@@ -22,52 +25,41 @@ sha256sum -c "$name.tar.gz.sha256" && tar -xzf "$name.tar.gz"
 install -Dm755 "$name/ags" ~/.local/bin/ags
 ```
 
-On other systems, build it from source:
+From source, on any system:
 
 ```sh
 cargo install --locked --git https://github.com/dvjn/aegis ags
 ```
 
-## Commands
+</details>
 
-| Command | Does |
-| --- | --- |
-| `ags login <URL>` | Pair this machine with an Aegis server |
-| `ags logout` | Unpair this machine |
-| `ags status` | Show the server, account and providers |
-| `ags setup [provider]` | Sign in to providers that need it, or again to one |
-| `ags use [cli [provider]]` | Set the provider a CLI uses, or list them |
-| `ags [-p provider] <claude\|codex\|pi> [args…]` | Run the CLI through Aegis |
-| `ags init <bash\|zsh\|fish>` | Print the shell line that runs plain `claude`, `codex` and `pi` through ags |
+## Set up
 
-### login
+1. Pair this machine with your Aegis server:
 
-```sh
-ags login https://aegis.example
-```
+   ```sh
+   ags login https://aegis.example
+   ```
 
-Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal. Change a machine's providers later under **Connected apps** on your account page.
+   Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
 
-### Choosing a provider
+2. Add the line for your shell to its startup file, then open a new shell:
 
-```sh
-ags -p aws claude
-ags use claude aws   # from now on
-```
+   ```sh
+   eval "$(ags init bash)"    # ~/.bashrc
+   eval "$(ags init zsh)"     # ~/.zshrc
+   ags init fish | source     # ~/.config/fish/config.fish
+   ```
 
-Without `-p`, ags uses the CLI's remembered provider, or the only one that fits. When several fit, it asks once.
+3. Run the CLI as usual:
 
-### init
+   ```sh
+   claude
+   ```
 
-Add the line for your shell to its startup file:
+   When several providers fit, ags asks once which to use. Change it with `ags use claude <provider>`, or pick one for a single run with `ags -p <provider> claude`.
 
-```sh
-eval "$(ags init bash)"    # ~/.bashrc
-eval "$(ags init zsh)"     # ~/.zshrc
-ags init fish | source     # ~/.config/fish/config.fish
-```
-
-Plain `claude`, `codex` and `pi` then run through ags. If a launch can't go through Aegis, ags offers a fix, then offers to run the CLI without it. `AGS_BYPASS=1 claude` skips Aegis for one run.
+`AGS_BYPASS=1 claude` runs the CLI without Aegis. `ags help` lists every command.
 
 ## Providers
 
