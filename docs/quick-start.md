@@ -59,10 +59,12 @@ ags login http://127.0.0.1:8765
 
 Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
 
-To run plain `claude`, `codex` and `pi` through ags, run this line and add it to `~/.bashrc` ([other shells](client.md#init)):
+To run plain `claude`, `codex` and `pi` through ags, add the line for your shell to its startup file, then open a new shell:
 
 ```sh
-eval "$(ags init bash)"
+eval "$(ags init bash)"    # ~/.bashrc
+eval "$(ags init zsh)"     # ~/.zshrc
+ags init fish | source     # ~/.config/fish/config.fish
 ```
 
 Then run the CLI as usual:

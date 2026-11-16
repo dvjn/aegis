@@ -61,11 +61,11 @@ Without `-p`, ags uses the CLI's remembered provider, or the only one that fits.
 
 Add the line for your shell to its startup file:
 
-| Shell | Line |
-| --- | --- |
-| bash | `eval "$(ags init bash)"` |
-| zsh | `eval "$(ags init zsh)"` |
-| fish | `ags init fish \| source` |
+```sh
+eval "$(ags init bash)"    # ~/.bashrc
+eval "$(ags init zsh)"     # ~/.zshrc
+ags init fish | source     # ~/.config/fish/config.fish
+```
 
 Plain `claude`, `codex` and `pi` then run through ags. If a launch can't go through Aegis, ags offers a fix, then offers to run the CLI without it. `AGS_BYPASS=1 claude` skips Aegis for one run.
 
