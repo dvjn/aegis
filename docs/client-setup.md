@@ -11,9 +11,9 @@ mise use -g "github:dvjn/aegis[matching=ags-]"
 ```
 
 <details>
-<summary>Without mise</summary>
+<summary>Direct Binary Install</summary>
 
-From the GitHub release, for Linux on `x86_64` and `aarch64`:
+For Linux on `x86_64` and `aarch64`:
 
 ```sh
 tag=vX.Y.Z                         # the release
@@ -25,7 +25,10 @@ sha256sum -c "$name.tar.gz.sha256" && tar -xzf "$name.tar.gz"
 install -Dm755 "$name/ags" ~/.local/bin/ags
 ```
 
-From source, on any system:
+</details>
+
+<details>
+<summary>Using Cargo</summary>
 
 ```sh
 cargo install --locked --git https://github.com/dvjn/aegis ags
@@ -35,21 +38,26 @@ cargo install --locked --git https://github.com/dvjn/aegis ags
 
 ## Set up
 
-1. Pair this machine with your Aegis server:
+1. Add the line for your shell to its startup file, then open a new shell:
+
+   ```sh
+   # Fish Shell, ~/.config/fish/config.fish
+   ags init fish | source
+
+   # Zsh, ~/.zshrc
+   eval "$(ags init zsh)"
+
+   # Bash, ~/.bashrc
+   eval "$(ags init bash)"
+   ```
+
+2. Pair this machine with your Aegis server:
 
    ```sh
    ags login https://aegis.example
    ```
 
    Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
-
-2. Add the line for your shell to its startup file, then open a new shell:
-
-   ```sh
-   eval "$(ags init bash)"    # ~/.bashrc
-   eval "$(ags init zsh)"     # ~/.zshrc
-   ags init fish | source     # ~/.config/fish/config.fish
-   ```
 
 3. Run the CLI as usual:
 

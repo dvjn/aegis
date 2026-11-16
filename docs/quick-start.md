@@ -29,22 +29,32 @@ Add a provider. Provider IDs become part of the gateway URL. See [Providers, gua
 
 ## 3. Run a CLI through Aegis
 
-Install the client, `ags` ([other ways](client-setup.md#install)), and pair this machine:
+Install the client, `ags` ([other ways](client-setup.md#install)):
 
 ```sh
 mise use -g "github:dvjn/aegis[matching=ags-]"
-ags login http://127.0.0.1:8765
 ```
-
-Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
 
 To run plain `claude`, `codex` and `pi` through ags, add the line for your shell to its startup file, then open a new shell:
 
 ```sh
-eval "$(ags init bash)"    # ~/.bashrc
-eval "$(ags init zsh)"     # ~/.zshrc
-ags init fish | source     # ~/.config/fish/config.fish
+# Fish Shell, ~/.config/fish/config.fish
+ags init fish | source
+
+# Zsh, ~/.zshrc
+eval "$(ags init zsh)"
+
+# Bash, ~/.bashrc
+eval "$(ags init bash)"
 ```
+
+Pair this machine:
+
+```sh
+ags login http://127.0.0.1:8765
+```
+
+Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
 
 Then run the CLI as usual:
 
