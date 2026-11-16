@@ -35,3 +35,28 @@ Without `SMTP_HOST`, Aegis writes emails like password-reset links to the log.
 ## Logs
 
 - `RUST_LOG`: log filter, such as `aegis=debug`; default logs Aegis at `info` and its HTTP dependencies at `warn`
+
+## Example config file
+
+Every key is optional; the values shown are the defaults.
+
+```toml
+http_addr = "127.0.0.1:8765"
+database_url = "sqlite://data/aegis.db?mode=rwc"
+max_capture_bytes = 16777216
+# public_url = "https://aegis.example.com"
+registration_enabled = false   # allow sign-up through the web form
+
+[pricing]
+enabled = true
+refresh_hours = 12
+url = "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json"
+
+# One table per model whose price Aegis should override.
+# [[pricing.overrides]]
+# model = "example-model"
+# input_per_mtok = 1.0
+# output_per_mtok = 5.0
+# cache_read_per_mtok = 0.1
+# cache_write_per_mtok = 1.25
+```
