@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-/// An access token this close to expiry is refreshed before use.
+/// An access token this close to expiry is refreshed before use, unless its lifetime is shorter than four times this.
 const REFRESH_MARGIN_SECS: u64 = 60;
 const FILE_NAME: &str = "login.json";
 const LOCK_NAME: &str = "login.lock";
@@ -23,11 +23,22 @@ pub struct Login {
     pub refresh_token: Option<String>,
     /// Seconds since the Unix epoch.
     pub expires_at: u64,
+    /// Seconds the access token was issued for.
+    #[serde(default = "default_lifetime")]
+    pub lifetime: u64,
+}
+
+fn default_lifetime() -> u64 {
+    3600
 }
 
 impl Login {
+    pub fn refresh_margin(&self) -> u64 {
+        REFRESH_MARGIN_SECS.min(self.lifetime / 4)
+    }
+
     pub fn expires_soon(&self) -> bool {
-        now() + REFRESH_MARGIN_SECS >= self.expires_at
+        now() + self.refresh_margin() >= self.expires_at
     }
 }
 
@@ -217,6 +228,7 @@ pub(crate) mod tests {
             access_token: "ag_at1.a.b".into(),
             refresh_token: Some("ag_rt1.a.b".into()),
             expires_at: now() + 3600,
+            lifetime: 3600,
         }
     }
 
@@ -253,5 +265,16 @@ pub(crate) mod tests {
         assert!(!login.expires_soon());
         login.expires_at = now() + REFRESH_MARGIN_SECS;
         assert!(login.expires_soon());
+    }
+
+    #[test]
+    fn a_short_lived_token_is_refreshed_only_in_its_last_quarter() {
+        let mut login = login();
+        login.lifetime = 60;
+        login.expires_at = now() + 40;
+        assert!(!login.expires_soon());
+        login.expires_at = now() + 15;
+        assert!(login.expires_soon());
+        assert_eq!(login.refresh_margin(), 15);
     }
 }

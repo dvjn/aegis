@@ -74,13 +74,14 @@ impl OAuthService {
         } else {
             (None, None)
         };
-        let (token_id, value) = self.insert_access_token(tx, grant, family_id).await?;
+        let (token_id, value, expires_in) = self.insert_access_token(tx, grant, family_id).await?;
         Ok((
             token_id,
             IssuedAccessToken {
                 value,
                 refresh_token,
                 scope: grant.scope.to_owned(),
+                expires_in,
             },
         ))
     }
@@ -90,7 +91,7 @@ impl OAuthService {
         tx: &DatabaseTransaction,
         grant: GrantContext<'_>,
         family_id: Option<Uuid>,
-    ) -> Result<(Uuid, String), DomainError> {
+    ) -> Result<(Uuid, String, u64), DomainError> {
         let (token_id, selector, secret, value) = new_opaque_value(TOKEN_PREFIX);
         let secret = Zeroizing::new(secret);
         let digest = hmac_digest(
@@ -99,7 +100,13 @@ impl OAuthService {
             &selector,
             secret.as_slice(),
         );
-        let expires_at = add_duration(grant.now, OAuthConfig::ACCESS_TOKEN_LIFETIME)?;
+        // Only tokens that come with a refresh token follow the configured lifetime.
+        let lifetime = if family_id.is_some() {
+            self.config.access_token_lifetime
+        } else {
+            OAuthConfig::UNREFRESHABLE_ACCESS_TOKEN_LIFETIME
+        };
+        let expires_at = add_duration(grant.now, lifetime)?;
         oauth_access_tokens::ActiveModel {
             id: Set(token_id.to_string()),
             secret_digest: Set(digest.to_vec()),
@@ -118,7 +125,7 @@ impl OAuthService {
         }
         .insert(tx)
         .await?;
-        Ok((token_id, value))
+        Ok((token_id, value, lifetime.as_secs()))
     }
 }
 

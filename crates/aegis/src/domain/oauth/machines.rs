@@ -896,6 +896,7 @@ mod tests {
             OAuthConfig {
                 hmac_key: [8; 32],
                 key_id: "oauth-2".into(),
+                access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
             },
             clock.clone(),
         )

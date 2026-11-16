@@ -3,6 +3,7 @@ use aegis_wire::provider_type::{
     BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, TYPESAFE, VERTEX,
 };
 use anyhow::{Context, Result, bail};
+use chrono::Datelike;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -295,6 +296,7 @@ impl Config {
             oauth: OAuthConfig {
                 hmac_key: [3; 32],
                 key_id: "v1".into(),
+                access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
             },
             pricing: PricingConfig::default(),
             guardrails: GuardrailsConfig::default(),
@@ -354,6 +356,8 @@ impl Config {
         apply_guardrails_env(&mut guardrails)?;
         validate_detectors(&guardrails)?;
 
+        let access_token_lifetime = access_token_lifetime(optional_var("ACCESS_TOKEN_MINUTES")?)?;
+
         let smtp = smtp_config()?;
         let root_key = root_key()?;
         Ok(Self {
@@ -376,6 +380,7 @@ impl Config {
             oauth: OAuthConfig {
                 hmac_key: derive_key(&root_key, b"aegis/v1/oauth-hmac"),
                 key_id: "v1".into(),
+                access_token_lifetime,
             },
             pricing,
             guardrails,
@@ -444,6 +449,30 @@ fn optional_var(name: &str) -> Result<Option<String>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("{name} must be valid Unicode")),
     }
+}
+
+fn access_token_lifetime(minutes: Option<String>) -> Result<Duration> {
+    let Some(minutes) = minutes else {
+        return Ok(OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME);
+    };
+    let minutes: u64 = minutes
+        .parse()
+        .context("ACCESS_TOKEN_MINUTES must be a positive integer")?;
+    if minutes == 0 {
+        bail!("ACCESS_TOKEN_MINUTES must be greater than zero");
+    }
+    let lifetime = minutes
+        .checked_mul(60)
+        .map(Duration::from_secs)
+        .context("ACCESS_TOKEN_MINUTES is too large")?;
+    let expires = chrono::Duration::from_std(lifetime)
+        .ok()
+        .and_then(|lifetime| chrono::Utc::now().checked_add_signed(lifetime))
+        .filter(|expires| expires.year() <= 9999);
+    if expires.is_none() {
+        bail!("ACCESS_TOKEN_MINUTES is too large");
+    }
+    Ok(lifetime)
 }
 
 fn root_key() -> Result<[u8; 32]> {
@@ -706,6 +735,34 @@ fn is_snake_case_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_tokens_last_five_minutes_unless_overridden() {
+        assert_eq!(access_token_lifetime(None).unwrap().as_secs(), 300);
+        assert_eq!(
+            access_token_lifetime(Some("15".into())).unwrap().as_secs(),
+            900
+        );
+    }
+
+    #[test]
+    fn access_token_minutes_must_be_a_positive_integer() {
+        for value in [
+            "0",
+            "-5",
+            "abc",
+            "",
+            "1.5",
+            "99999999999999999999",
+            "9999999999999",
+        ] {
+            let error = access_token_lifetime(Some(value.into())).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("ACCESS_TOKEN_MINUTES"),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn a_vertex_host_for_one_location_names_it() {

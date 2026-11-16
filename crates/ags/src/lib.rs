@@ -140,6 +140,7 @@ fn login_from(server: &str, client_id: &str, token: TokenResponse) -> Login {
         server: server.to_owned(),
         client_id: client_id.to_owned(),
         expires_at: store::now() + token.expires_in,
+        lifetime: token.expires_in,
         access_token: token.access_token,
         refresh_token: token.refresh_token,
     }
@@ -370,6 +371,7 @@ mod tests {
                 access_token: "token".into(),
                 refresh_token: None,
                 expires_at: store::now() + 3600,
+                lifetime: 3600,
             })
             .unwrap();
         let error = login(&store, "https://other.example", |_| {})
@@ -435,6 +437,7 @@ mod tests {
             access_token: "ag_at1.a.b".into(),
             refresh_token: refresh_token.map(str::to_owned),
             expires_at,
+            lifetime: 3600,
         }
     }
 

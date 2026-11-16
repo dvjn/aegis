@@ -194,7 +194,7 @@ impl OAuthService {
             .insert_refresh_token(&tx, family_id, generation + 1, now, absolute_expires_at)
             .await?;
         let scope = family.scope.clone();
-        let (_, value) = self
+        let (_, value, expires_in) = self
             .insert_access_token(
                 &tx,
                 GrantContext {
@@ -215,15 +215,41 @@ impl OAuthService {
             value,
             refresh_token: Some(refresh_token),
             scope,
+            expires_in,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{code_with_scope, redemption, refresh_request, setup};
+    use super::super::tests::{code_with_scope, redemption, refresh_request, setup, with_lifetime};
     use super::*;
     use sea_orm::{ConnectionTrait, DbBackend, QueryResult, Statement};
+
+    #[tokio::test]
+    async fn refreshed_tokens_follow_the_configured_lifetime() {
+        let (db, _, _, clock, identity, client) = setup().await;
+        let lifetime = std::time::Duration::from_secs(15 * 60);
+        let oauth = with_lifetime(&db, &clock, lifetime);
+        let verifier = "correct-verifier-with-at-least-forty-three-characters-123";
+        let code = code_with_scope(
+            &oauth,
+            &identity,
+            &client,
+            verifier,
+            "usage:read offline_access",
+        )
+        .await;
+        let first = oauth
+            .redeem_authorization_code(redemption(code.expose(), &client, verifier))
+            .await
+            .unwrap();
+        let refreshed = oauth
+            .refresh_access_token(refresh_request(first.refresh_token().unwrap(), &client))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.expires_in(), lifetime.as_secs());
+    }
 
     #[tokio::test]
     async fn refresh_tokens_rotate_and_reuse_revokes_the_entire_family() {

@@ -404,6 +404,7 @@ mod tests {
                 access_token: "token".into(),
                 refresh_token: None,
                 expires_at: 0,
+                lifetime: 3600,
             }),
             refused: AtomicBool::new(false),
             logged_out: std::sync::Mutex::new(None),
@@ -619,6 +620,7 @@ mod tests {
             access_token: token.into(),
             refresh_token: None,
             expires_at: crate::store::now() + 3600,
+            lifetime: 3600,
         };
         let mut target = target("");
         target.store = Store::at(&dir);

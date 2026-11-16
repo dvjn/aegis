@@ -546,6 +546,7 @@ mod tests {
                 OAuthConfig {
                     hmac_key: [6; 32],
                     key_id: "oauth".into(),
+                    access_token_lifetime: OAuthConfig::UNREFRESHABLE_ACCESS_TOKEN_LIFETIME,
                 },
                 DomainOptions {
                     registration_enabled,

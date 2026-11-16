@@ -90,8 +90,41 @@ impl OAuthService {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{code, redemption, setup};
+    use super::super::OAuthConfig;
+    use super::super::tests::{code, code_with_scope, redemption, setup, with_lifetime};
     use sea_orm::ConnectionTrait;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn access_token_lifetime_follows_the_config_only_with_a_refresh_token() {
+        let (db, oauth, _, clock, identity, client) = setup().await;
+        let verifier = "correct-verifier-with-at-least-forty-three-characters-123";
+        let custom = with_lifetime(&db, &clock, Duration::from_secs(15 * 60));
+        for (service, scope, expected) in [
+            (
+                &oauth,
+                "usage:read offline_access",
+                OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+            ),
+            (
+                &custom,
+                "usage:read offline_access",
+                Duration::from_secs(900),
+            ),
+            (
+                &custom,
+                "usage:read",
+                OAuthConfig::UNREFRESHABLE_ACCESS_TOKEN_LIFETIME,
+            ),
+        ] {
+            let issued = code_with_scope(service, &identity, &client, verifier, scope).await;
+            let token = service
+                .redeem_authorization_code(redemption(issued.expose(), &client, verifier))
+                .await
+                .unwrap();
+            assert_eq!(token.expires_in(), expected.as_secs());
+        }
+    }
 
     #[tokio::test]
     async fn token_authentication_binds_audience_expiry_and_user_auth_version() {
@@ -150,7 +183,9 @@ mod tests {
         db.execute_unprepared("UPDATE users SET auth_version=auth_version-1")
             .await
             .unwrap();
-        clock.advance(chrono::Duration::hours(1));
+        clock.advance(
+            chrono::Duration::from_std(OAuthConfig::UNREFRESHABLE_ACCESS_TOKEN_LIFETIME).unwrap(),
+        );
         assert!(
             oauth
                 .authenticate_access_token(

@@ -92,6 +92,7 @@ impl Fixture {
                 access_token: token.to_owned(),
                 refresh_token: Some(format!("{token}-refresh")),
                 expires_at: now + 3600,
+                lifetime: 3600,
             })
             .unwrap();
     }

@@ -554,7 +554,10 @@ pub fn normalize_user_code(value: &str) -> Result<String, DomainError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::oauth::{ClientRegistration, tests::setup};
+    use crate::domain::oauth::{
+        ClientRegistration,
+        tests::{setup, with_lifetime},
+    };
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
     async fn device_client(oauth: &OAuthService) -> super::super::RegisteredClient {
@@ -627,10 +630,54 @@ mod tests {
         clock.advance(chrono::Duration::seconds(10));
         let token = oauth.redeem_device_code(request()).await.unwrap();
         assert!(token.refresh_token().is_some());
+        assert_eq!(
+            token.expires_in(),
+            OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME.as_secs()
+        );
         assert!(matches!(
             oauth.redeem_device_code(request()).await,
             Err(DevicePollError::InvalidGrant)
         ));
+    }
+
+    #[tokio::test]
+    async fn device_grant_tokens_follow_the_configured_lifetime() {
+        let (db, oauth, _, clock, identity, _) = setup().await;
+        let client = device_client(&oauth).await;
+        let lifetime = std::time::Duration::from_secs(15 * 60);
+        let custom = with_lifetime(&db, &clock, lifetime);
+        for (scope, expected) in [
+            ("usage:read offline_access", lifetime),
+            (
+                "usage:read",
+                OAuthConfig::UNREFRESHABLE_ACCESS_TOKEN_LIFETIME,
+            ),
+        ] {
+            let issued = custom
+                .issue_device_authorization(DeviceAuthorizationRequest {
+                    client_id: client.client_id(),
+                    issuer: "https://aegis.example",
+                    resource: "https://aegis.example/mcp",
+                    scope: None,
+                })
+                .await
+                .unwrap();
+            custom
+                .decide_device_authorization(issued.user_code(), &identity, Some(scope), None)
+                .await
+                .unwrap();
+            clock.advance(chrono::Duration::seconds(10));
+            let token = custom
+                .redeem_device_code(DeviceTokenRequest {
+                    device_code: issued.device_code(),
+                    client_id: client.client_id(),
+                    issuer: "https://aegis.example",
+                    resource: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(token.expires_in(), expected.as_secs(), "{scope}");
+        }
     }
 
     #[tokio::test]

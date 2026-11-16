@@ -399,6 +399,7 @@ mod tests {
                 OAuthConfig {
                     hmac_key: [4; 32],
                     key_id: "oauth".into(),
+                    access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
                 },
                 crate::domain::DomainOptions {
                     registration_enabled,
@@ -869,6 +870,7 @@ mod tests {
                 OAuthConfig {
                     hmac_key: [8; 32],
                     key_id: "oauth".into(),
+                    access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
                 },
             )
             .await
@@ -2058,7 +2060,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(issued["token_type"], "Bearer");
-        assert_eq!(issued["expires_in"], 3600);
+        assert_eq!(
+            issued["expires_in"],
+            OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME.as_secs()
+        );
         let refresh = issued["refresh_token"].as_str().unwrap();
 
         let refresh_body = url::form_urlencoded::Serializer::new(String::new())

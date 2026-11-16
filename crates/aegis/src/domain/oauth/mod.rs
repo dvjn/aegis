@@ -101,12 +101,14 @@ const MAX_SCOPE_LEN: usize = 512;
 pub struct OAuthConfig {
     pub hmac_key: [u8; 32],
     pub key_id: String,
+    pub access_token_lifetime: Duration,
 }
 impl OAuthConfig {
     pub const CODE_LIFETIME: Duration = Duration::from_secs(5 * 60);
     pub const DEVICE_LIFETIME: Duration = Duration::from_secs(10 * 60);
     pub const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-    pub const ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
+    pub const DEFAULT_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
+    pub const UNREFRESHABLE_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
     pub const REFRESH_IDLE_LIFETIME: Duration = Duration::from_secs(180 * 24 * 60 * 60);
     pub const REFRESH_ABSOLUTE_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 }
@@ -127,6 +129,7 @@ pub struct IssuedAccessToken {
     value: String,
     refresh_token: Option<String>,
     scope: String,
+    expires_in: u64,
 }
 impl IssuedAccessToken {
     pub fn expose(&self) -> &str {
@@ -139,7 +142,7 @@ impl IssuedAccessToken {
         self.refresh_token.as_deref()
     }
     pub fn expires_in(&self) -> u64 {
-        OAuthConfig::ACCESS_TOKEN_LIFETIME.as_secs()
+        self.expires_in
     }
 }
 impl Drop for IssuedAccessToken {
@@ -453,7 +456,26 @@ pub(super) mod tests {
         OAuthConfig {
             hmac_key: [8; 32],
             key_id: "oauth-1".into(),
+            access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
         }
+    }
+
+    /// A second service over the same database and keys, issuing tokens for `lifetime`.
+    pub(super) fn with_lifetime(
+        db: &DatabaseConnection,
+        clock: &Arc<MutableClock>,
+        lifetime: Duration,
+    ) -> OAuthService {
+        OAuthService::new(
+            db.clone(),
+            OAuthConfig {
+                hmac_key: [8; 32],
+                key_id: "oauth-1".into(),
+                access_token_lifetime: lifetime,
+            },
+            clock.clone(),
+        )
+        .unwrap()
     }
 
     pub(super) async fn setup() -> (

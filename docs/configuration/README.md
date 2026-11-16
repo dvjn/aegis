@@ -78,6 +78,12 @@ Earlier releases read `[[providers]]` and `[guardrails]` from this file, and the
 
 Without `SMTP_HOST`, Aegis writes password-reset links to the log.
 
+### Tokens
+
+| Variable | Required | Default | Sets |
+| --- | --- | --- | --- |
+| `ACCESS_TOKEN_MINUTES` | no | `5` | lifetime in minutes of access tokens issued with a refresh token; others last 1 hour |
+
 ### Pricing overrides
 
 | Variable | Required | Default | Overrides |
