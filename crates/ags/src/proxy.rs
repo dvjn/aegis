@@ -241,6 +241,19 @@ impl Target {
     }
 }
 
+impl Target {
+    /// The stored token, when another ags replaced the `used` one, as by pairing again.
+    async fn newer_token(&self, used: &str) -> Option<String> {
+        let stored = self.store.load().ok()??;
+        if stored.server != self.server || stored.access_token == used {
+            return None;
+        }
+        let mut login = self.login.lock().await;
+        *login = stored;
+        Some(login.access_token.clone())
+    }
+}
+
 async fn forward(State(target): State<Arc<Target>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     if !target.is_from_launch(&parts.uri, &parts.headers) {
@@ -271,19 +284,43 @@ async fn forward(State(target): State<Arc<Target>>, request: Request) -> Respons
         Ok(token) => token,
         Err((status, message)) => return failure(status, &message),
     };
-    let mut outbound = target.http.request(parts.method, url);
-    for (name, value) in &parts.headers {
-        if passes(name, &parts.headers) {
-            outbound = outbound.header(name, value);
+    // Kept whole, so that a request refused with a replaced token can be sent again.
+    let body = match body.size_hint().exact() {
+        Some(0) => None,
+        _ => match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(body) => Some(body),
+            Err(error) => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    &format!("could not read the request: {error}"),
+                );
+            }
+        },
+    };
+    let send = |token: String| {
+        let mut outbound = target.http.request(parts.method.clone(), url.clone());
+        for (name, value) in &parts.headers {
+            if passes(name, &parts.headers) {
+                outbound = outbound.header(name, value);
+            }
         }
+        outbound = outbound
+            .header(CREDENTIAL_HEADER, token)
+            .header(LAUNCH_ID_HEADER, target.launch_id.clone());
+        if let Some(body) = &body {
+            outbound = outbound.body(body.clone());
+        }
+        outbound.send()
+    };
+    let mut sent = send(token.clone()).await;
+    if sent
+        .as_ref()
+        .is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+        && let Some(newer) = target.newer_token(&token).await
+    {
+        sent = send(newer).await;
     }
-    outbound = outbound
-        .header(CREDENTIAL_HEADER, token)
-        .header(LAUNCH_ID_HEADER, target.launch_id.clone());
-    if body.size_hint().exact() != Some(0) {
-        outbound = outbound.body(reqwest::Body::wrap_stream(body.into_data_stream()));
-    }
-    let response = match outbound.send().await {
+    let response = match sent {
         Ok(response) => response,
         Err(error) => {
             return failure(
@@ -555,6 +592,69 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["message"],
             "ags: no vertex provider"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_is_sent_again_once_with_a_replaced_login() {
+        use axum::routing::post;
+        let gateway = Router::new().route(
+            "/providers/claude/v1/messages",
+            post(|headers: HeaderMap, body: String| async move {
+                match headers
+                    .get(CREDENTIAL_HEADER)
+                    .and_then(|token| token.to_str().ok())
+                {
+                    Some("new") => (StatusCode::OK, body),
+                    _ => (StatusCode::UNAUTHORIZED, String::new()),
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, gateway).await.unwrap() });
+        let dir = crate::store::tests::scratch();
+        let login = |token: &str| Login {
+            server: server.clone(),
+            client_id: "client".into(),
+            access_token: token.into(),
+            refresh_token: None,
+            expires_at: crate::store::now() + 3600,
+        };
+        let mut target = target("");
+        target.store = Store::at(&dir);
+        target.server = server.clone();
+        target.login = Mutex::new(login("old"));
+        let target = Arc::new(target);
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header(header::HOST, "127.0.0.1:4000")
+                .header(SECRET_HEADER, SECRET)
+                .body(Body::from("hello"))
+                .unwrap()
+        };
+
+        target.store.save(&login("old")).unwrap();
+        let refused = forward(State(target.clone()), request()).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNAUTHORIZED,
+            "the same login is not retried"
+        );
+        assert!(target.refused.load(Ordering::Relaxed));
+
+        target.refused.store(false, Ordering::Relaxed);
+        target.store.save(&login("new")).unwrap();
+        let response = forward(State(target.clone()), request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, "hello", "the request is sent again whole");
+        assert!(!target.refused.load(Ordering::Relaxed));
+        assert_eq!(target.login.lock().await.access_token, "new");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -93,7 +93,7 @@ impl Store {
 
     pub fn lock(&self) -> Result<StoreLock> {
         create_private_dir(&self.dir)?;
-        let file = private_file(&self.dir.join(LOCK_NAME), Create::OrOpen)?;
+        let file = private_file(&self.dir.join(LOCK_NAME), Create::OrOpen, 0o600)?;
         file.lock().context("locking the login file")?;
         Ok(StoreLock { _file: file })
     }
@@ -109,6 +109,15 @@ impl Store {
 
 /// Replaces `dir/name` whole, so a reader never sees part of it.
 pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    write_whole(dir, name, bytes, 0o600)
+}
+
+/// `write_private` for a program only this user can run.
+pub(crate) fn write_executable(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    write_whole(dir, name, bytes, 0o700)
+}
+
+fn write_whole(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf> {
     create_private_dir(dir)?;
     let path = dir.join(name);
     let nanos = SystemTime::now()
@@ -116,7 +125,7 @@ pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<Path
         .map_or(0, |elapsed| elapsed.subsec_nanos());
     let staging = dir.join(format!("{name}.{}-{nanos}.tmp", std::process::id()));
     let written = (|| {
-        let mut file = private_file(&staging, Create::New)?;
+        let mut file = private_file(&staging, Create::New, mode)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&staging, &path).with_context(|| format!("writing {}", path.display()))
@@ -154,14 +163,16 @@ enum Create {
     OrOpen,
 }
 
-fn private_file(path: &Path, create: Create) -> Result<File> {
+fn private_file(path: &Path, create: Create, mode: u32) -> Result<File> {
     let mut options = OpenOptions::new();
     match create {
         Create::New => options.write(true).create_new(true),
         Create::OrOpen => options.write(true).create(true).truncate(false),
     };
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    #[cfg(not(unix))]
+    let _ = mode;
     options
         .open(path)
         .with_context(|| format!("opening {}", path.display()))

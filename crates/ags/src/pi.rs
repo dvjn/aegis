@@ -4,6 +4,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fmt,
     path::{Path, PathBuf},
 };
 
@@ -67,6 +68,22 @@ struct Reach {
     again: String,
 }
 
+/// pi can reach none of this machine's providers, each for its reason.
+#[derive(Debug)]
+pub struct Unreachable(pub Vec<String>);
+
+impl fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "pi can reach none of this machine's providers: {}",
+            self.0.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
 /// The pi providers of one launch.
 pub(crate) struct Launch {
     routes: Vec<PiRoute>,
@@ -100,6 +117,11 @@ impl Launch {
             && let Some(Err(why)) = reached.get(requested.id.as_str())
         {
             bail!("{why}");
+        }
+        if !reached.is_empty() && !reached.values().any(Result::is_ok) {
+            return Err(
+                Unreachable(reached.into_values().filter_map(Result::err).collect()).into(),
+            );
         }
         let mut refusals = vec![];
         let route = |id: &str, offer: &Offer, builtin: &'static str, refusals: &mut Vec<Route>| {
@@ -585,7 +607,25 @@ mod tests {
     fn a_vertex_provider_without_its_account_is_refused_with_how_to_set_it_up() {
         let fixture = Fixture::new();
         let gcp = offer("gcp", VERTEX, Some("europe-west4"));
-        let plan = plan(only(3, TypeDefault::Use(gcp.clone())), vec![gcp], None);
+        let alone = plan(
+            only(3, TypeDefault::Use(gcp.clone())),
+            vec![gcp.clone()],
+            None,
+        );
+        let error = Launch::new(&alone, &fixture.credentials, |_| None)
+            .err()
+            .unwrap();
+        assert!(error.is::<Unreachable>());
+        assert_eq!(
+            error.to_string(),
+            "pi can reach none of this machine's providers: gcp has no Vertex service account; run `ags setup gcp`"
+        );
+        let work = offer("work", CLAUDE_SUBSCRIPTION, None);
+        let plan = plan(
+            only(3, TypeDefault::Use(gcp.clone())),
+            vec![gcp, work],
+            None,
+        );
         let (setup, _) = fixture.launch(&plan);
         assert_eq!(
             routes(&setup)["gcp"]["refusal"],

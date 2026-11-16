@@ -7,6 +7,7 @@ mod launch;
 mod pi;
 mod proxy;
 mod server;
+pub mod shims;
 pub mod store;
 
 use std::{fmt, time::Duration};
@@ -14,11 +15,14 @@ use std::{fmt, time::Duration};
 use aegis_wire::{Machine, TokenResponse};
 use anyhow::{Result, bail};
 pub use clis::Cli;
-pub use credentials::{Credentials, Home, Need, Step, StepStatus, installed, product, setup_steps};
-pub use launch::{
-    CliDefault, Launched, Offer, PiPlan, Pick, TypeDefault, cli_defaults, launch, launch_pi, pick,
-    plan_pi, remember, use_provider,
+pub use credentials::{
+    Credentials, EnvChanges, Home, Need, Step, StepStatus, installed, product, setup_steps,
 };
+pub use launch::{
+    CliDefault, Launched, NoProvider, NotLoggedIn, Offer, PiPlan, Pick, Started, TypeDefault,
+    cli_defaults, launch, launch_pi, pick, plan_pi, remember, use_provider,
+};
+pub use pi::Unreachable;
 use server::{Poll, Server};
 pub use store::{Login, Store};
 
@@ -154,6 +158,64 @@ pub async fn login(
             existing.server
         );
     }
+    let (server, login) = pair(url, approve).await?;
+    store.save(&login)?;
+    machine_status(store, &server, &login).await
+}
+
+/// A pairing that replaced an earlier one.
+pub struct Paired {
+    pub status: Status,
+    /// Why the earlier pairing could not be revoked, if it could not.
+    pub kept: Option<String>,
+}
+
+/// Pairs this machine with `url` again, revoking its current pairing once the new one is approved.
+pub async fn pair_again(
+    store: &Store,
+    url: &str,
+    approve: impl FnOnce(&Approval<'_>),
+) -> Result<Paired> {
+    let _lock = store.lock()?;
+    let earlier = store.load()?;
+    let (server, login) = pair(url, approve).await?;
+    store.save(&login)?;
+    let kept = match earlier {
+        Some(earlier) => revoke(&earlier)
+            .await
+            .err()
+            .map(|error| format!("{error:#}")),
+        None => None,
+    };
+    let status = machine_status(store, &server, &login).await?;
+    Ok(Paired { status, kept })
+}
+
+/// Revokes the pairing of `login`, which is no longer stored.
+async fn revoke(login: &Login) -> Result<()> {
+    let server = Server::discover(&login.server).await?;
+    let mut token = login.access_token.clone();
+    if login.expires_soon()
+        && let Some(refresh_token) = &login.refresh_token
+    {
+        match server.refresh(&login.client_id, refresh_token).await? {
+            Some(fresh) => token = fresh.access_token,
+            // A refused refresh token means the grant is already gone.
+            None => return Ok(()),
+        }
+    }
+    server.unpair(&token).await.map(|_| ())
+}
+
+async fn machine_status(store: &Store, server: &Server, login: &Login) -> Result<Status> {
+    match server.machine(&login.access_token).await? {
+        Some(machine) => Ok(status_from(login, machine)),
+        None => Err(logged_out(&login.server, store.remove())),
+    }
+}
+
+/// Runs the device flow with the server at `url`, until the user approves this machine.
+async fn pair(url: &str, approve: impl FnOnce(&Approval<'_>)) -> Result<(Server, Login)> {
     let server = Server::discover(url).await?;
     let client_id = server.register(&machine_name()).await?;
     let device = server.start_device(&client_id).await?;
@@ -177,11 +239,7 @@ pub async fn login(
         }
     };
     let login = login_from(server.issuer(), &client_id, token);
-    store.save(&login)?;
-    match server.machine(&login.access_token).await? {
-        Some(machine) => Ok(status_from(&login, machine)),
-        None => Err(logged_out(&login.server, store.remove())),
-    }
+    Ok((server, login))
 }
 
 /// The stored login, if any, with its access token refreshed shortly before it expires.

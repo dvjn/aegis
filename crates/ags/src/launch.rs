@@ -2,11 +2,12 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    fmt,
     process::ExitStatus,
 };
 
 use aegis_wire::{Machine, provider_type::VERTEX};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use tokio::process::Command;
 
 use clap::ValueEnum;
@@ -19,6 +20,7 @@ use crate::{
     forget, pi,
     proxy::{Proxy, Route},
     server::Server,
+    shims::{self, Entered},
 };
 
 /// A provider granted to this machine that a CLI can run on.
@@ -135,8 +137,53 @@ impl PiPlan {
 }
 
 pub(crate) fn not_logged_in() -> anyhow::Error {
-    anyhow!("not logged in; run `ags login <URL>` first")
+    NotLoggedIn.into()
 }
+
+/// This machine is paired with no server.
+#[derive(Debug)]
+pub struct NotLoggedIn;
+
+impl fmt::Display for NotLoggedIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not logged in; run `ags login <URL>` first")
+    }
+}
+
+impl std::error::Error for NotLoggedIn {}
+
+/// No provider granted to this machine is one a CLI can run on.
+#[derive(Debug)]
+pub struct NoProvider {
+    pub cli: Cli,
+    pub server: String,
+}
+
+impl fmt::Display for NoProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cli = self.cli;
+        write!(
+            f,
+            "this machine has no provider that {cli} can run on ({}); run `ags logout`, then `ags login {}` to grant one",
+            cli.provider_types().join(" or "),
+            self.server
+        )
+    }
+}
+
+impl std::error::Error for NoProvider {}
+
+/// The CLI started, then ags could not wait for it to end.
+#[derive(Debug)]
+pub struct Started(std::io::Error);
+
+impl fmt::Display for Started {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "waiting for the CLI: {}", self.0)
+    }
+}
+
+impl std::error::Error for Started {}
 
 pub(crate) async fn granted(store: &Store) -> Result<Option<(Login, Machine)>> {
     let Some(login) = current_login(store).await? else {
@@ -200,11 +247,11 @@ pub async fn pick(store: &Store, cli: Cli, requested: Option<&str>) -> Result<Pi
         return Ok(Pick::Use(offers.swap_remove(index)));
     }
     match offers.len() {
-        0 => bail!(
-            "this machine has no provider that {cli} can run on ({}); run `ags logout`, then `ags login {}` to grant one",
-            cli.provider_types().join(" or "),
-            login.server
-        ),
+        0 => Err(NoProvider {
+            cli,
+            server: login.server,
+        }
+        .into()),
         1 => Ok(Pick::Use(offers.remove(0))),
         _ => Ok(Pick::Ask(offers)),
     }
@@ -303,6 +350,13 @@ pub async fn plan_pi(store: &Store, requested: Option<&str>) -> Result<PiPlan> {
         .map(|id| offer(&machine, &login.server, Cli::Pi, id, path.as_deref()))
         .transpose()?;
     let offers = offers(&machine, Cli::Pi, path.as_deref());
+    if offers.is_empty() {
+        return Err(NoProvider {
+            cli: Cli::Pi,
+            server: login.server,
+        }
+        .into());
+    }
     let remembered = pi_defaults(
         defaults::load(store.dir())?.get(&Cli::Pi.to_string()),
         &machine,
@@ -357,7 +411,7 @@ pub struct Launched {
 }
 
 /// Runs `cli` with `args` on `offer`, in the provider's own config dir, until it exits.
-/// `program` replaces the CLI's name on `PATH`.
+/// `program` replaces the real CLI on `PATH`.
 pub async fn launch(
     store: &Store,
     credentials: &Credentials,
@@ -366,8 +420,11 @@ pub async fn launch(
     args: Vec<OsString>,
     program: Option<&OsStr>,
 ) -> Result<Launched> {
+    let chain = shims::chain();
+    shims::check_depth(&chain, cli)?;
     let login = current_login(store).await?.ok_or_else(not_logged_in)?;
     let server = login.server.clone();
+    let program = resolve(store, cli, program)?;
     let isolation = credentials.isolate(&offer.id, &offer.provider_type, cli)?;
     // A random UUID carries nothing about the launch, such as when it started.
     let launch_id = uuid::Uuid::new_v4().to_string();
@@ -392,9 +449,8 @@ pub async fn launch(
         |name| std::env::var(name).ok(),
     )?;
     let setup_notes = setup.notes;
-    let name = OsString::from(cli.to_string());
-    let program = program.unwrap_or(&name);
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program);
+    outside(&mut command, credentials, &chain, cli);
     command
         .args(isolation.args)
         .args(setup.args)
@@ -419,11 +475,24 @@ pub async fn launch(
     for note in &setup_notes {
         eprintln!("ags: {note}");
     }
-    run(store, &server, command, program, proxy).await
+    run(store, &server, command, &program, proxy).await
+}
+
+/// Starts `command` free of any launch this one runs inside, as a launch of `cli` in `chain`.
+fn outside(command: &mut Command, credentials: &Credentials, chain: &[Entered], cli: Cli) {
+    credentials.outside_launch().apply(command.as_std_mut());
+    command.env(shims::LAUNCHED, shims::entered(chain, cli));
+}
+
+fn resolve(store: &Store, cli: Cli, program: Option<&OsStr>) -> Result<OsString> {
+    match program {
+        Some(program) => Ok(program.to_owned()),
+        None => Ok(shims::program(store, cli)?.into_os_string()),
+    }
 }
 
 /// Runs pi with `args` on the providers of `plan`, in the dir of pi launches, until it exits.
-/// `program` replaces pi's name on `PATH`.
+/// `program` replaces the real pi on `PATH`.
 pub async fn launch_pi(
     store: &Store,
     credentials: &Credentials,
@@ -431,16 +500,18 @@ pub async fn launch_pi(
     args: Vec<OsString>,
     program: Option<&OsStr>,
 ) -> Result<Launched> {
+    let chain = shims::chain();
+    shims::check_depth(&chain, Cli::Pi)?;
     let login = current_login(store).await?.ok_or_else(not_logged_in)?;
     let server = login.server.clone();
+    let program = resolve(store, Cli::Pi, program)?;
     let isolation = credentials.isolate_pi()?;
     let (pi, routes) = pi::Launch::new(plan, credentials, |name| std::env::var(name).ok())?;
     let launch_id = uuid::Uuid::new_v4().to_string();
     let proxy = Proxy::start(store.dir(), login, routes, &launch_id).await?;
     let setup = pi.setup(proxy.origin(), proxy.secret(), store.dir())?;
-    let name = OsString::from(Cli::Pi.to_string());
-    let program = program.unwrap_or(&name);
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program);
+    outside(&mut command, credentials, &chain, Cli::Pi);
     command
         .args(setup.args)
         .args(args)
@@ -454,7 +525,7 @@ pub async fn launch_pi(
     for note in &setup.notes {
         eprintln!("ags: {note}");
     }
-    run(store, &server, command, program, proxy).await
+    run(store, &server, command, &program, proxy).await
 }
 
 /// Runs `command` until it exits, then ends `proxy` and checks what it learned about the login.
@@ -558,7 +629,7 @@ pub(crate) async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus
     };
     loop {
         tokio::select! {
-            status = child.wait() => return status.context("waiting for the CLI"),
+            status = child.wait() => return status.map_err(|error| Started(error).into()),
             _ = interrupt.recv() => {}
             _ = quit.recv() => {}
             _ = terminate.recv() => pass(&child, libc::SIGTERM),
@@ -572,7 +643,7 @@ pub(crate) async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus
     let mut child = spawn(command, program)?;
     loop {
         tokio::select! {
-            status = child.wait() => return status.context("waiting for the CLI"),
+            status = child.wait() => return status.map_err(|error| Started(error).into()),
             interrupted = tokio::signal::ctrl_c() => interrupted?,
         }
     }

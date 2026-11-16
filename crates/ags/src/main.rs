@@ -1,14 +1,17 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{BufRead, IsTerminal},
+    path::Path,
     process::{ExitCode, ExitStatus, Stdio},
 };
 
 use ags::{
-    Approval, Cli, CliDefault, Credentials, Home, Logout, Need, Offer, Pick, Step, StepStatus,
-    Store, TypeDefault, product, provider_text,
+    Approval, Cli, CliDefault, Credentials, EnvChanges, Home, LoggedOut, Logout, Need, NoProvider,
+    NotLoggedIn, Offer, Pick, Started, Step, StepStatus, Store, TypeDefault, Unreachable, product,
+    provider_text,
+    shims::{self, Shell},
 };
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// Command-line client for Aegis.
@@ -18,6 +21,9 @@ struct Args {
     /// Use this provider for one launch, in place of the CLI's default
     #[arg(short, long, env = "AGS_PROVIDER")]
     provider: Option<String>,
+    /// Launched by a shim, which may open the real CLI when Aegis can't be used
+    #[arg(long, hide = true)]
+    shim: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -44,6 +50,8 @@ enum Command {
         cli: Option<Cli>,
         provider: Option<String>,
     },
+    /// Print the shell code that runs plain claude, codex and pi through ags
+    Init { shell: Shell },
     /// Run Claude Code through Aegis
     #[command(disable_help_flag = true)]
     Claude {
@@ -79,6 +87,7 @@ fn own_arguments(args: &[OsString]) -> usize {
         }
         match arg {
             "-p" | "--provider" => index += 2,
+            "--shim" => index += 1,
             _ if arg.starts_with("--provider=") || (arg.starts_with("-p") && arg.len() > 2) => {
                 index += 1;
             }
@@ -151,17 +160,19 @@ fn exit_code(status: ExitStatus) -> ExitCode {
         .map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
+/// `program` replaces the real CLI on `PATH`.
 async fn launch(
     store: &Store,
     credentials: &Credentials,
     cli: Cli,
-    provider: Option<String>,
+    provider: Option<&str>,
     args: Vec<OsString>,
+    program: Option<&OsStr>,
 ) -> anyhow::Result<Exit> {
     // An empty AGS_PROVIDER counts as unset.
-    let provider = provider.as_deref().filter(|id| !id.is_empty());
+    let provider = provider.filter(|id| !id.is_empty());
     if cli == Cli::Pi {
-        return launch_pi(store, credentials, provider, args).await;
+        return launch_pi(store, credentials, provider, args, program).await;
     }
     let offer = match ags::pick(store, cli, provider).await? {
         Pick::Use(offer) => offer,
@@ -182,7 +193,7 @@ async fn launch(
     };
     set_up_for_launch(credentials, cli, &offer).await?;
     warn(credentials, &offer.id, cli)?;
-    let launched = ags::launch(store, credentials, cli, &offer, args, None).await?;
+    let launched = ags::launch(store, credentials, cli, &offer, args, program).await?;
     if let Some(error) = launched.logged_out {
         eprintln!("ags: {error:#}");
     }
@@ -195,6 +206,7 @@ async fn launch_pi(
     credentials: &Credentials,
     provider: Option<&str>,
     args: Vec<OsString>,
+    program: Option<&OsStr>,
 ) -> anyhow::Result<Exit> {
     let mut plan = ags::plan_pi(store, provider).await?;
     if interactive() {
@@ -224,11 +236,178 @@ async fn launch_pi(
     for notice in credentials.pi_notices()? {
         eprintln!("ags: {notice}");
     }
-    let launched = ags::launch_pi(store, credentials, &plan, args, None).await?;
+    let launched = ags::launch_pi(store, credentials, &plan, args, program).await?;
     if let Some(error) = launched.logged_out {
         eprintln!("ags: {error:#}");
     }
     Ok(Exit::As(launched.status))
+}
+
+/// A shim's launch, which offers a fix or the real CLI without Aegis when Aegis can't be used.
+async fn launch_from_shim(
+    store: &Store,
+    credentials: &Credentials,
+    cli: Cli,
+    provider: Option<&str>,
+    args: Vec<OsString>,
+) -> anyhow::Result<Exit> {
+    let real = shims::program(store, cli)?;
+    if bypassed() {
+        return run_real(&real, args, &without_aegis(credentials, cli));
+    }
+    let chain = shims::chain();
+    shims::check_depth(&chain, cli)?;
+    // Directly inside a running launch of the same CLI, the real CLI runs in that launch.
+    if chain.last().is_some_and(|last| last.cli == cli) {
+        let mut changes = EnvChanges::default();
+        changes.set(shims::LAUNCHED, shims::entered(&chain, cli));
+        return run_real(&real, args, &changes);
+    }
+    let mut fixed = false;
+    loop {
+        let launched = launch(
+            store,
+            credentials,
+            cli,
+            provider,
+            args.clone(),
+            Some(real.as_os_str()),
+        )
+        .await;
+        let error = match launched {
+            Ok(exit) => return Ok(exit),
+            Err(error) if error.is::<Started>() || error.is::<shims::TooDeep>() => {
+                return Err(error);
+            }
+            Err(error) => error,
+        };
+        if !interactive() {
+            eprintln!("ags: opening {cli} without Aegis: {error:#}");
+            return run_real(&real, args, &without_aegis(credentials, cli));
+        }
+        eprintln!("ags: {error:#}");
+        if !fixed {
+            fixed = true;
+            let _prompts = PromptsOnStderr::start();
+            match fix(store, credentials, cli, &error).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => eprintln!("ags: {error:#}"),
+            }
+        }
+        if confirm(&format!("Open {cli} without Aegis?"))? {
+            return run_real(&real, args, &without_aegis(credentials, cli));
+        }
+        return Ok(Exit::Code(ExitCode::FAILURE));
+    }
+}
+
+fn bypassed() -> bool {
+    std::env::var_os(shims::BYPASS).is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// What `cli` run without Aegis changes in the environment ags has.
+fn without_aegis(credentials: &Credentials, cli: Cli) -> EnvChanges {
+    let mut changes = credentials.outside_launch();
+    changes.remove(shims::BYPASS);
+    changes.set(shims::LAUNCHED, shims::entered(&shims::chain(), cli));
+    changes
+}
+
+/// Offers the login, pairing or setup that `error` says `cli` lacks; whether it was done.
+async fn fix(
+    store: &Store,
+    credentials: &Credentials,
+    cli: Cli,
+    error: &anyhow::Error,
+) -> anyhow::Result<bool> {
+    let (server, again) = if error.is::<NotLoggedIn>() {
+        if !confirm("Log in to Aegis now?")? {
+            return Ok(false);
+        }
+        let url = read_answer("Server URL: ")?;
+        if url.is_empty() {
+            return Ok(false);
+        }
+        (url, false)
+    } else if let Some(LoggedOut { server, .. }) = error.downcast_ref() {
+        if !confirm(&format!("Log in to {server} again?"))? {
+            return Ok(false);
+        }
+        (server.clone(), false)
+    } else if error.is::<Unreachable>() {
+        if !confirm("Set up this machine's providers now?")? {
+            return Ok(false);
+        }
+        return setup(store, credentials, None).await;
+    } else if let Some(NoProvider { server, .. }) = error.downcast_ref() {
+        if !confirm(&format!(
+            "Pair this machine with {server} again to grant {cli} a provider?"
+        ))? {
+            return Ok(false);
+        }
+        (server.clone(), true)
+    } else {
+        return Ok(false);
+    };
+    login(store, credentials, &server, again).await?;
+    Ok(true)
+}
+
+/// Runs the real CLI in place of ags, with `changes` to its environment.
+fn run_real(real: &Path, args: Vec<OsString>, changes: &EnvChanges) -> anyhow::Result<Exit> {
+    let mut command = std::process::Command::new(real);
+    command.args(args);
+    changes.apply(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        Err(error).with_context(|| format!("could not start {}", real.display()))
+    }
+    #[cfg(not(unix))]
+    command
+        .status()
+        .map(Exit::As)
+        .with_context(|| format!("could not start {}", real.display()))
+}
+
+/// While it lives, ags's stdout goes to stderr, keeping a piped stdout for the CLI's output.
+struct PromptsOnStderr {
+    #[cfg(unix)]
+    stdout: Option<std::os::fd::OwnedFd>,
+}
+
+impl PromptsOnStderr {
+    fn start() -> Self {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsFd, AsRawFd};
+            let stdout = std::io::stdout().as_fd().try_clone_to_owned().ok();
+            if stdout.is_some() {
+                // SAFETY: both fds are this process's own, and stdout stays open as a copy of stderr.
+                unsafe { libc::dup2(std::io::stderr().as_raw_fd(), std::io::stdout().as_raw_fd()) };
+            }
+            Self { stdout }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+}
+
+impl Drop for PromptsOnStderr {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        #[cfg(unix)]
+        if let Some(stdout) = &self.stdout {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `stdout` is the copy taken at the start, open until this guard is dropped.
+            unsafe { libc::dup2(stdout.as_raw_fd(), std::io::stdout().as_raw_fd()) };
+        }
+    }
 }
 
 /// Offers to set up what `cli` needs to run on `offer`, which the launch can't go without.
@@ -245,6 +424,7 @@ async fn set_up_for_launch(
             bail!("{id} has no {need} yet; run `ags setup {id}` first");
         }
         eprintln!("{id} has no {need} yet.");
+        let _prompts = PromptsOnStderr::start();
         let step = Step {
             provider: offer.id.clone(),
             provider_type: offer.provider_type.clone(),
@@ -288,9 +468,9 @@ async fn setup(
     let (mut todo, mut absent, mut skipped) = (vec![], vec![], vec![]);
     for step in steps {
         match step.status {
-            StepStatus::Done if !redo || !installed(&step) => {}
+            StepStatus::Done if !redo || !has_cli(store, &step) => {}
             StepStatus::Skipped if !redo => skipped.push(step),
-            _ if !installed(&step) => absent.push(step),
+            _ if !has_cli(store, &step) => absent.push(step),
             _ => todo.push(step),
         }
     }
@@ -376,9 +556,9 @@ async fn setup(
 }
 
 /// Whether the CLI a step signs in to is installed; other steps need no CLI.
-fn installed(step: &Step) -> bool {
+fn has_cli(store: &Store, step: &Step) -> bool {
     match step.need {
-        Need::SignIn(cli) => ags::installed(cli),
+        Need::SignIn(cli) => ags::installed(store, cli),
         _ => true,
     }
 }
@@ -596,19 +776,30 @@ fn defaults_table(rows: &[CliDefault]) -> String {
 
 async fn run(args: Args) -> anyhow::Result<Exit> {
     let store = Store::default_location()?;
-    let credentials = Credentials::new(&store, Home::from_env());
+    let store = &store;
+    let credentials = &Credentials::new(store, Home::from_env());
+    let provider = args.provider.as_deref();
+    let launched = |cli, cli_args| async move {
+        if args.shim {
+            launch_from_shim(store, credentials, cli, provider, cli_args).await
+        } else {
+            launch(store, credentials, cli, provider, cli_args, None).await
+        }
+    };
     match args.command {
-        Command::Claude { args: cli_args } => {
-            return launch(&store, &credentials, Cli::Claude, args.provider, cli_args).await;
-        }
-        Command::Codex { args: cli_args } => {
-            return launch(&store, &credentials, Cli::Codex, args.provider, cli_args).await;
-        }
-        Command::Pi { args: cli_args } => {
-            return launch(&store, &credentials, Cli::Pi, args.provider, cli_args).await;
+        Command::Claude { args } => return launched(Cli::Claude, args).await,
+        Command::Codex { args } => return launched(Cli::Codex, args).await,
+        Command::Pi { args } => return launched(Cli::Pi, args).await,
+        Command::Init { shell } => {
+            if matches!(store.load(), Ok(Some(_)))
+                && let Err(error) = write_shims(store)
+            {
+                eprintln!("ags: {error:#}");
+            }
+            print!("{}", shims::init(shell, &shims::dir(store))?);
         }
         Command::Setup { provider } => {
-            if !setup(&store, &credentials, provider.as_deref()).await? {
+            if !setup(store, credentials, provider.as_deref()).await? {
                 return Ok(Exit::Code(ExitCode::FAILURE));
             }
         }
@@ -616,46 +807,35 @@ async fn run(args: Args) -> anyhow::Result<Exit> {
             cli: Some(cli),
             provider: Some(provider),
         } => {
-            let offer = ags::use_provider(&store, cli, &provider).await?;
+            let offer = ags::use_provider(store, cli, &provider).await?;
             match cli {
                 Cli::Pi => println!("pi now uses {provider} for {}.", offer.provider_type),
                 _ => println!("{cli} now uses {provider}."),
             }
         }
-        Command::Use { .. } => match ags::cli_defaults(&store).await? {
+        Command::Use { .. } => match ags::cli_defaults(store).await? {
             Some(rows) => println!("{}", defaults_table(&rows)),
             None => {
                 println!("Not logged in. Run `ags login <URL>` to pair this machine.");
                 return Ok(Exit::Code(ExitCode::FAILURE));
             }
         },
-        Command::Login { url } => {
-            let status = ags::login(&store, &url, show_approval).await?;
-            println!("Logged in to {} as {}.", status.server, status.account);
-            println!("Providers: {}", provider_text(&status.providers));
-            if interactive() {
-                setup(&store, &credentials, None).await?;
-            } else if ags::setup_steps(&store, &credentials, None)
-                .await?
-                .iter()
-                .any(|step| step.status == StepStatus::Missing && installed(step))
-            {
-                println!("Run `ags setup` in a terminal to sign in to each provider.");
-            }
-        }
-        Command::Logout => match ags::logout(&store).await? {
-            None => println!("Not logged in."),
-            Some(Logout::Revoked { server }) => println!("Logged out of {server}."),
-            Some(Logout::Forgotten { server, reason }) => {
-                println!("Logged out of {server}.");
-                eprintln!(
-                    "ags: could not revoke this machine's access ({reason}); disconnect it under Connected apps on {server}/account"
-                );
+        Command::Login { url } => login(store, credentials, &url, false).await?,
+        Command::Logout => {
+            let logout = ags::logout(store).await;
+            shims::remove(store)?;
+            let logout = logout?;
+            if logout.is_none() {
+                println!("Not logged in.");
+            } else if !logged_out(logout) {
                 return Ok(Exit::Code(ExitCode::FAILURE));
             }
-        },
-        Command::Status => match ags::status(&store).await? {
-            Some(status) => println!("{status}"),
+        }
+        Command::Status => match ags::status(store).await? {
+            Some(status) => {
+                println!("{status}");
+                shim_hint(store);
+            }
             None => {
                 println!("Not logged in. Run `ags login <URL>` to pair this machine.");
                 return Ok(Exit::Code(ExitCode::FAILURE));
@@ -663,6 +843,93 @@ async fn run(args: Args) -> anyhow::Result<Exit> {
         },
     }
     Ok(Exit::Code(ExitCode::SUCCESS))
+}
+
+/// `ags login`, or with `again` a new pairing that replaces the current one once approved.
+async fn login(
+    store: &Store,
+    credentials: &Credentials,
+    url: &str,
+    again: bool,
+) -> anyhow::Result<()> {
+    let status = if again {
+        let paired = ags::pair_again(store, url, show_approval).await?;
+        if let Some(reason) = paired.kept {
+            let server = &paired.status.server;
+            eprintln!(
+                "ags: could not revoke this machine's earlier access ({reason}); disconnect it under Connected apps on {server}/account"
+            );
+        }
+        paired.status
+    } else {
+        ags::login(store, url, show_approval).await?
+    };
+    println!("Logged in to {} as {}.", status.server, status.account);
+    println!("Providers: {}", provider_text(&status.providers));
+    if let Err(error) = write_shims(store) {
+        eprintln!("ags: {error:#}");
+    }
+    if interactive() {
+        setup(store, credentials, None).await?;
+    } else if ags::setup_steps(store, credentials, None)
+        .await?
+        .iter()
+        .any(|step| step.status == StepStatus::Missing && has_cli(store, step))
+    {
+        println!("Run `ags setup` in a terminal to sign in to each provider.");
+    }
+    shim_hint(store);
+    Ok(())
+}
+
+/// Writes the shims unless each already runs this ags.
+fn write_shims(store: &Store) -> anyhow::Result<()> {
+    let ags = std::env::current_exe().context("finding ags itself for its shims")?;
+    if shims::current(store, &ags) {
+        return Ok(());
+    }
+    shims::install(store, &ags)
+}
+
+/// Says how logging out went; whether the server revoked this machine's access.
+fn logged_out(logout: Option<Logout>) -> bool {
+    match logout {
+        None => true,
+        Some(Logout::Revoked { server }) => {
+            println!("Logged out of {server}.");
+            true
+        }
+        Some(Logout::Forgotten { server, reason }) => {
+            println!("Logged out of {server}.");
+            eprintln!(
+                "ags: could not revoke this machine's access ({reason}); disconnect it under Connected apps on {server}/account"
+            );
+            false
+        }
+    }
+}
+
+/// Prints the line that puts the shims first on `PATH`, unless they already are.
+fn shim_hint(store: &Store) {
+    let dir = shims::dir(store);
+    if !shims::written(&dir) || shims::active(&dir, std::env::var_os("PATH").as_deref()) {
+        return;
+    }
+    match Shell::from_env() {
+        Some(shell) => println!(
+            "To run plain claude, codex and pi through ags, add this line to {} and open a new shell:\n  {}",
+            shell.startup_file(),
+            shell.init_line()
+        ),
+        None => {
+            println!(
+                "To run plain claude, codex and pi through ags, add the line for your shell to its startup file:"
+            );
+            for shell in Shell::value_variants() {
+                println!("  {}", shell.init_line());
+            }
+        }
+    }
 }
 
 fn show_approval(approval: &Approval<'_>) {
@@ -702,7 +969,7 @@ fn open_browser(url: &str) {
 mod tests {
     use std::ffi::OsString;
 
-    use ags::{Cli, CliDefault};
+    use ags::{Cli, CliDefault, shims::Shell};
     use clap::{CommandFactory, Parser, ValueEnum, error::ErrorKind};
 
     use super::{Args, Command, defaults_table, try_parse};
@@ -881,6 +1148,29 @@ mod tests {
         let cli = Args::try_parse_from(["ags", "login", "https://aegis.example"]).unwrap();
         assert!(matches!(cli.command, Command::Login { url } if url == "https://aegis.example"));
         assert!(Args::try_parse_from(["ags", "login"]).is_err());
+    }
+
+    #[test]
+    fn a_shim_launches_like_ags_cli_and_passes_everything_on() {
+        let parsed = parse(&["ags", "--shim", "claude", "--shim", "-p", "x"]).unwrap();
+        assert!(parsed.shim);
+        assert_eq!(
+            launched(&["ags", "--shim", "claude", "--shim", "-p", "x"]),
+            (None, ["--shim", "-p", "x"].map(str::to_owned).to_vec())
+        );
+        assert!(!parse(&["ags", "claude"]).unwrap().shim);
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("--shim"), "{help}");
+    }
+
+    #[test]
+    fn init_takes_a_known_shell() {
+        assert!(matches!(
+            parse(&["ags", "init", "fish"]).unwrap().command,
+            Command::Init { shell: Shell::Fish }
+        ));
+        assert!(parse(&["ags", "init", "tcsh"]).is_err());
+        assert!(parse(&["ags", "init"]).is_err());
     }
 
     #[test]

@@ -240,10 +240,34 @@ fn shared_auth(cli: Cli, provider_type: &str) -> Vec<&'static str> {
     names
 }
 
+/// Changes to a child's environment, applied in order.
+#[derive(Debug, Default)]
+pub struct EnvChanges(Vec<(&'static str, Option<OsString>)>);
+
+impl EnvChanges {
+    pub fn set(&mut self, name: &'static str, value: impl Into<OsString>) {
+        self.0.push((name, Some(value.into())));
+    }
+
+    pub fn remove(&mut self, name: &'static str) {
+        self.0.push((name, None));
+    }
+
+    pub fn apply(&self, command: &mut std::process::Command) {
+        for (name, value) in &self.0 {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+    }
+}
+
 /// What a launch gives its CLI beside Claude Code's routes, which a sign-in run from inside that
 /// CLI must not inherit either.
 const LAUNCH_ENV: &[&str] = &[
     "AGS_LAUNCH_SECRET",
+    crate::shims::LAUNCHED,
     "ANTHROPIC_CUSTOM_HEADERS",
     "OPENAI_BASE_URL",
     "AGS_PI_ROUTES",
@@ -692,7 +716,7 @@ impl Credentials {
         })
     }
 
-    /// Runs `cli`'s own sign-in in `provider`'s config dir. `program` replaces the CLI's name on `PATH`.
+    /// Runs `cli`'s own sign-in in `provider`'s config dir. `program` replaces the real CLI on `PATH`.
     pub async fn sign_in(
         &self,
         provider: &str,
@@ -701,9 +725,11 @@ impl Credentials {
         program: Option<&OsStr>,
     ) -> Result<ExitStatus> {
         let isolation = self.isolate(provider, provider_type, cli)?;
-        let name = OsString::from(cli.to_string());
-        let program = program.unwrap_or(&name);
-        let mut command = Command::new(program);
+        let program = match program {
+            Some(program) => program.to_owned(),
+            None => crate::shims::program(&self.store, cli)?.into_os_string(),
+        };
+        let mut command = Command::new(&program);
         match cli {
             Cli::Claude => command.args(["auth", "login"]),
             Cli::Codex => command.arg("login").args(isolation.args),
@@ -731,8 +757,29 @@ impl Credentials {
             });
         }
         let _ignored = Interrupts::ignore();
-        let mut child = crate::launch::spawn(command, program)?;
+        let mut child = crate::launch::spawn(command, &program)?;
         child.wait().await.context("waiting for the sign-in")
+    }
+
+    /// Inside an Aegis launch, drops what it set and gives each CLI the user's own config dir.
+    pub fn outside_launch(&self) -> EnvChanges {
+        let mut changes = EnvChanges::default();
+        let inside = ["AGS_LAUNCH_SECRET"]
+            .into_iter()
+            .chain(DIR_VARS.iter().map(|(_, kept)| *kept))
+            .any(|name| std::env::var_os(name).is_some());
+        if !inside {
+            return changes;
+        }
+        for name in from_launch() {
+            changes.remove(name);
+        }
+        for ((own, _), value) in DIR_VARS.iter().zip(&self.home.vars) {
+            if let Some(value) = value {
+                changes.set(own, value);
+            }
+        }
+        changes
     }
 
     /// Remembers that the user chose not to set up `need` for `provider`.
@@ -906,36 +953,14 @@ pub async fn setup_steps(
     Ok(steps)
 }
 
-/// Whether `cli` is an executable on `PATH`.
-pub fn installed(cli: Cli) -> bool {
-    on_path(&cli.to_string(), std::env::var_os("PATH").as_deref())
+/// Whether the real `cli` is on `PATH`, past ags's shims.
+pub fn installed(store: &Store, cli: Cli) -> bool {
+    crate::shims::program(store, cli).is_ok()
 }
 
 /// Whether `program` is an executable in one of the dirs of `path`, a value of `PATH`.
 pub(crate) fn on_path(program: &str, path: Option<&OsStr>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    let names: &[String] = &if cfg!(windows) {
-        ["exe", "cmd", "bat"]
-            .map(|extension| format!("{program}.{extension}"))
-            .to_vec()
-    } else {
-        vec![program.to_owned()]
-    };
-    std::env::split_paths(path).any(|dir| {
-        names.iter().any(|name| {
-            let candidate = dir.join(name);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::metadata(&candidate)
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            candidate.is_file()
-        })
-    })
+    !crate::shims::executables(program, path).is_empty()
 }
 
 fn shared(cli: Cli) -> &'static [&'static str] {
