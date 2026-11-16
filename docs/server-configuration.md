@@ -41,7 +41,7 @@ Every key is optional; the values shown are the defaults.
 ```toml
 http_addr = "127.0.0.1:8765"
 database_url = "sqlite://data/aegis.db?mode=rwc"
-max_capture_bytes = 16777216
+max_capture_bytes = 16777216 # 16MiB
 # public_url = "https://aegis.example.com"
 registration_enabled = false   # allow sign-up through the web form
 
