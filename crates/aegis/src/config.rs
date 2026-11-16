@@ -2,7 +2,7 @@ use crate::domain::{AuthConfig, OAuthConfig, SmtpSettings};
 use aegis_wire::provider_type::{
     BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, TYPESAFE, VERTEX,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Datelike;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::{
     io::{ErrorKind, Write},
     net::SocketAddr,
     path::Path,
+    str::FromStr,
     time::Duration,
 };
 
@@ -92,7 +93,7 @@ impl std::str::FromStr for GuardrailsMode {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PricingConfig {
     #[serde(default = "default_pricing_url")]
     pub url: String,
@@ -115,7 +116,7 @@ impl Default for PricingConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PriceOverride {
     pub model: String,
     pub input_per_mtok: f64,
@@ -126,14 +127,14 @@ pub struct PriceOverride {
     pub cache_write_per_mtok: Option<f64>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {
     pub id: String,
     #[serde(flatten)]
     pub kind: ProviderKind,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderKind {
     ClaudeSubscription {
@@ -238,7 +239,7 @@ impl ProviderKind {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FileConfig {
     #[serde(default = "default_http_addr")]
     http_addr: SocketAddr,
@@ -256,6 +257,126 @@ struct FileConfig {
     pricing: PricingConfig,
     #[serde(default)]
     guardrails: GuardrailsConfig,
+    #[serde(default)]
+    smtp: SmtpFileConfig,
+    #[serde(default)]
+    auth: AuthFileConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SmtpFileConfig {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default = "default_smtp_port")]
+    port: u16,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+impl Default for SmtpFileConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: default_smtp_port(),
+            from: None,
+            username: None,
+            password: None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct AuthFileConfig {
+    #[serde(default)]
+    access_token_minutes: Option<u64>,
+}
+
+type ApplyOverride = fn(&mut FileConfig, String) -> Result<(), &'static str>;
+
+/// Every scalar config key and the environment variable that overrides it:
+/// the key path uppercased, with sections joined by `_`.
+const ENV_OVERRIDES: &[(&str, &str, ApplyOverride)] = &[
+    ("http_addr", "HTTP_ADDR", |file, value| {
+        parse(value, "an IP address and port").map(|value| file.http_addr = value)
+    }),
+    ("public_url", "PUBLIC_URL", |file, value| {
+        file.public_url = Some(value);
+        Ok(())
+    }),
+    ("database_url", "DATABASE_URL", |file, value| {
+        file.database_url = value;
+        Ok(())
+    }),
+    ("max_capture_bytes", "MAX_CAPTURE_BYTES", |file, value| {
+        parse(value, "a positive integer").map(|value| file.max_capture_bytes = value)
+    }),
+    (
+        "registration_enabled",
+        "REGISTRATION_ENABLED",
+        |file, value| parse(value, "true or false").map(|value| file.registration_enabled = value),
+    ),
+    ("smtp.host", "SMTP_HOST", |file, value| {
+        file.smtp.host = Some(value);
+        Ok(())
+    }),
+    ("smtp.port", "SMTP_PORT", |file, value| {
+        parse(value, "a port").map(|value| file.smtp.port = value)
+    }),
+    ("smtp.from", "SMTP_FROM", |file, value| {
+        file.smtp.from = Some(value);
+        Ok(())
+    }),
+    ("smtp.username", "SMTP_USERNAME", |file, value| {
+        file.smtp.username = Some(value);
+        Ok(())
+    }),
+    ("smtp.password", "SMTP_PASSWORD", |file, value| {
+        file.smtp.password = Some(value);
+        Ok(())
+    }),
+    (
+        "auth.access_token_minutes",
+        "AUTH_ACCESS_TOKEN_MINUTES",
+        |file, value| {
+            parse(value, "a positive integer")
+                .map(|value| file.auth.access_token_minutes = Some(value))
+        },
+    ),
+    ("pricing.enabled", "PRICING_ENABLED", |file, value| {
+        parse(value, "true or false").map(|value| file.pricing.enabled = value)
+    }),
+    (
+        "pricing.refresh_hours",
+        "PRICING_REFRESH_HOURS",
+        |file, value| {
+            parse(value, "a positive integer").map(|value| file.pricing.refresh_hours = value)
+        },
+    ),
+    ("pricing.url", "PRICING_URL", |file, value| {
+        file.pricing.url = value;
+        Ok(())
+    }),
+];
+
+fn parse<T: FromStr>(value: String, expected: &'static str) -> Result<T, &'static str> {
+    value.parse().map_err(|_| expected)
+}
+
+/// Overrides `file` with every set variable of [`ENV_OVERRIDES`].
+fn apply_env_overrides(
+    file: &mut FileConfig,
+    var: impl Fn(&str) -> Result<Option<String>>,
+) -> Result<()> {
+    for (_, name, apply) in ENV_OVERRIDES {
+        if let Some(value) = var(name)? {
+            apply(file, value).map_err(|expected| anyhow!("{name} must be {expected}"))?;
+        }
+    }
+    Ok(())
 }
 
 impl Default for FileConfig {
@@ -269,6 +390,8 @@ impl Default for FileConfig {
             registration_enabled: false,
             pricing: PricingConfig::default(),
             guardrails: GuardrailsConfig::default(),
+            smtp: SmtpFileConfig::default(),
+            auth: AuthFileConfig::default(),
         }
     }
 }
@@ -306,7 +429,7 @@ impl Config {
 
     pub fn from_env() -> Result<Self> {
         let path = env::var("AEGIS_CONFIG").unwrap_or_else(|_| "config.toml".into());
-        let file = if Path::new(&path).exists() {
+        let mut file = if Path::new(&path).exists() {
             toml::from_str::<FileConfig>(
                 &fs::read_to_string(&path)
                     .with_context(|| format!("failed to read configuration from {path}"))?,
@@ -315,57 +438,27 @@ impl Config {
         } else {
             FileConfig::default()
         };
+        apply_env_overrides(&mut file, optional_var)?;
 
-        let http_addr = env::var("HTTP_ADDR")
-            .ok()
-            .map(|value| value.parse())
-            .transpose()
-            .context("HTTP_ADDR must be an IP address and port")?
-            .unwrap_or(file.http_addr);
-        let database_url = env::var("DATABASE_URL").unwrap_or(file.database_url);
-        let max_capture_bytes = env::var("MAX_CAPTURE_BYTES")
-            .ok()
-            .map(|value| value.parse())
-            .transpose()
-            .context("MAX_CAPTURE_BYTES must be a positive integer")?
-            .unwrap_or(file.max_capture_bytes);
-        if max_capture_bytes == 0 {
-            bail!("MAX_CAPTURE_BYTES must be greater than zero");
+        if file.max_capture_bytes == 0 {
+            bail!("MAX_CAPTURE_BYTES (max_capture_bytes) must be greater than zero");
         }
-
-        let providers = file.providers;
-        validate_providers(&providers)?;
-
-        let mut pricing = file.pricing;
-        if let Some(url) = optional_var("PRICING_URL")? {
-            pricing.url = url;
-        }
-        if let Some(hours) = optional_var("PRICING_REFRESH_HOURS")? {
-            pricing.refresh_hours = hours
-                .parse()
-                .context("PRICING_REFRESH_HOURS must be a positive integer")?;
-        }
-        if let Some(enabled) = optional_var("PRICING_ENABLED")? {
-            pricing.enabled = enabled
-                .parse()
-                .context("PRICING_ENABLED must be true or false")?;
-        }
-        validate_pricing(&pricing)?;
+        validate_providers(&file.providers)?;
+        validate_pricing(&file.pricing)?;
 
         let mut guardrails = file.guardrails;
         apply_guardrails_env(&mut guardrails)?;
         validate_detectors(&guardrails)?;
 
-        let access_token_lifetime = access_token_lifetime(optional_var("ACCESS_TOKEN_MINUTES")?)?;
-
-        let smtp = smtp_config()?;
+        let access_token_lifetime = access_token_lifetime(file.auth.access_token_minutes)?;
+        let smtp = smtp_settings(file.smtp)?;
         let root_key = root_key()?;
         Ok(Self {
-            http_addr,
-            database_url,
-            max_capture_bytes,
-            providers,
-            public_url: optional_var("PUBLIC_URL")?.or(file.public_url),
+            http_addr: file.http_addr,
+            database_url: file.database_url,
+            max_capture_bytes: file.max_capture_bytes,
+            providers: file.providers,
+            public_url: file.public_url,
             registration_enabled: file.registration_enabled,
             smtp,
             auth: AuthConfig {
@@ -382,7 +475,7 @@ impl Config {
                 key_id: "v1".into(),
                 access_token_lifetime,
             },
-            pricing,
+            pricing: file.pricing,
             guardrails,
             secret_placeholder_key: derive_key(&root_key, b"aegis/v1/secret-placeholder"),
         })
@@ -408,37 +501,32 @@ fn apply_guardrails_env(guardrails: &mut GuardrailsConfig) -> Result<()> {
     Ok(())
 }
 
-fn smtp_config() -> Result<Option<SmtpSettings>> {
-    let host = match env::var("SMTP_HOST") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(error) => return Err(error).context("SMTP_HOST must be valid Unicode"),
+fn smtp_settings(smtp: SmtpFileConfig) -> Result<Option<SmtpSettings>> {
+    let Some(host) = smtp.host else {
+        return Ok(None);
     };
     if host.is_empty() {
-        bail!("SMTP_HOST must not be empty");
+        bail!("SMTP_HOST (smtp.host) must not be empty");
     }
-    let port = match env::var("SMTP_PORT") {
-        Ok(value) => value.parse::<u16>().context("SMTP_PORT must be a port")?,
-        Err(env::VarError::NotPresent) => 587,
-        Err(error) => return Err(error).context("SMTP_PORT must be valid Unicode"),
-    };
-    if port == 0 {
-        bail!("SMTP_PORT must be 1..=65535");
+    if smtp.port == 0 {
+        bail!("SMTP_PORT (smtp.port) must be 1..=65535");
     }
-    let username = optional_var("SMTP_USERNAME")?;
-    let password = optional_var("SMTP_PASSWORD")?;
-    if username.is_some() != password.is_some() {
-        bail!("SMTP_USERNAME and SMTP_PASSWORD must be set together");
+    if smtp.username.is_some() != smtp.password.is_some() {
+        bail!(
+            "SMTP_USERNAME (smtp.username) and SMTP_PASSWORD (smtp.password) must be set together"
+        );
     }
-    let from = optional_var("SMTP_FROM")?.context("SMTP_FROM is required when SMTP_HOST is set")?;
+    let from = smtp
+        .from
+        .context("SMTP_FROM (smtp.from) is required when SMTP_HOST (smtp.host) is set")?;
     if from.parse::<email_address::EmailAddress>().is_err() {
-        bail!("SMTP_FROM must be an email address");
+        bail!("SMTP_FROM (smtp.from) must be an email address");
     }
     Ok(Some(SmtpSettings {
         host,
-        port,
-        username,
-        password,
+        port: smtp.port,
+        username: smtp.username,
+        password: smtp.password,
         from,
     }))
 }
@@ -451,26 +539,24 @@ fn optional_var(name: &str) -> Result<Option<String>> {
     }
 }
 
-fn access_token_lifetime(minutes: Option<String>) -> Result<Duration> {
+fn access_token_lifetime(minutes: Option<u64>) -> Result<Duration> {
+    const TOO_LARGE: &str = "AUTH_ACCESS_TOKEN_MINUTES (auth.access_token_minutes) is too large";
     let Some(minutes) = minutes else {
         return Ok(OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME);
     };
-    let minutes: u64 = minutes
-        .parse()
-        .context("ACCESS_TOKEN_MINUTES must be a positive integer")?;
     if minutes == 0 {
-        bail!("ACCESS_TOKEN_MINUTES must be greater than zero");
+        bail!("AUTH_ACCESS_TOKEN_MINUTES (auth.access_token_minutes) must be greater than zero");
     }
     let lifetime = minutes
         .checked_mul(60)
         .map(Duration::from_secs)
-        .context("ACCESS_TOKEN_MINUTES is too large")?;
+        .context(TOO_LARGE)?;
     let expires = chrono::Duration::from_std(lifetime)
         .ok()
         .and_then(|lifetime| chrono::Utc::now().checked_add_signed(lifetime))
         .filter(|expires| expires.year() <= 9999);
     if expires.is_none() {
-        bail!("ACCESS_TOKEN_MINUTES is too large");
+        bail!(TOO_LARGE);
     }
     Ok(lifetime)
 }
@@ -551,6 +637,10 @@ fn default_database_url() -> String {
 
 fn default_max_capture_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+fn default_smtp_port() -> u16 {
+    587
 }
 
 fn default_anthropic_base_url() -> String {
@@ -674,12 +764,13 @@ pub(crate) fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
 }
 
 fn validate_pricing(pricing: &PricingConfig) -> Result<()> {
-    let url = url::Url::parse(&pricing.url).context("pricing url is not a valid URL")?;
+    let url =
+        url::Url::parse(&pricing.url).context("PRICING_URL (pricing.url) is not a valid URL")?;
     if url.scheme() != "https" || url.host_str().is_none() {
-        bail!("pricing url must use https and include a host");
+        bail!("PRICING_URL (pricing.url) must use https and include a host");
     }
     if pricing.refresh_hours < 1 {
-        bail!("pricing refresh_hours must be at least 1");
+        bail!("PRICING_REFRESH_HOURS (pricing.refresh_hours) must be at least 1");
     }
     Ok(())
 }
@@ -736,31 +827,166 @@ fn is_snake_case_identifier(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn access_tokens_last_five_minutes_unless_overridden() {
-        assert_eq!(access_token_lifetime(None).unwrap().as_secs(), 300);
-        assert_eq!(
-            access_token_lifetime(Some("15".into())).unwrap().as_secs(),
-            900
-        );
+    /// Every scalar set to a value other than its default.
+    fn populated() -> FileConfig {
+        FileConfig {
+            http_addr: "0.0.0.0:9000".parse().unwrap(),
+            database_url: "sqlite://other.db".into(),
+            max_capture_bytes: 1024,
+            providers: Vec::new(),
+            public_url: Some("https://aegis.example.com".into()),
+            registration_enabled: true,
+            pricing: PricingConfig {
+                url: "https://example.com/prices.json".into(),
+                refresh_hours: 6,
+                enabled: false,
+                overrides: Vec::new(),
+            },
+            guardrails: GuardrailsConfig::default(),
+            smtp: SmtpFileConfig {
+                host: Some("smtp.example.com".into()),
+                port: 2525,
+                from: Some("aegis@example.com".into()),
+                username: Some("aegis".into()),
+                password: Some("secret".into()),
+            },
+            auth: AuthFileConfig {
+                access_token_minutes: Some(15),
+            },
+        }
+    }
+
+    /// Each scalar's dotted key path and value; lists and the legacy
+    /// guardrails, imported once into the database, have no variables.
+    fn scalars(config: &FileConfig) -> BTreeMap<String, toml::Value> {
+        fn walk(prefix: &str, table: &toml::Table, out: &mut BTreeMap<String, toml::Value>) {
+            for (key, value) in table {
+                let path = format!("{prefix}{key}");
+                match value {
+                    toml::Value::Table(table) => walk(&format!("{path}."), table, out),
+                    toml::Value::Array(_) => {}
+                    scalar => {
+                        out.insert(path, scalar.clone());
+                    }
+                }
+            }
+        }
+        let mut table = toml::Table::try_from(config).unwrap();
+        table.remove("guardrails");
+        let mut out = BTreeMap::new();
+        walk("", &table, &mut out);
+        out
     }
 
     #[test]
-    fn access_token_minutes_must_be_a_positive_integer() {
-        for value in [
-            "0",
-            "-5",
-            "abc",
-            "",
-            "1.5",
-            "99999999999999999999",
-            "9999999999999",
+    fn every_scalar_key_has_its_env_var() {
+        let keys: Vec<_> = ENV_OVERRIDES.iter().map(|(key, _, _)| *key).collect();
+        let scalar_keys: Vec<_> = scalars(&populated()).into_keys().collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, scalar_keys);
+        for (key, var, _) in ENV_OVERRIDES {
+            assert_eq!(*var, key.replace('.', "_").to_uppercase());
+        }
+    }
+
+    #[test]
+    fn each_env_var_overrides_its_own_key() {
+        let wanted = scalars(&populated());
+        for (key, var, _) in ENV_OVERRIDES {
+            let value = match &wanted[*key] {
+                toml::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let mut config = FileConfig::default();
+            let before = scalars(&config);
+            apply_env_overrides(
+                &mut config,
+                |name| Ok((name == *var).then(|| value.clone())),
+            )
+            .unwrap();
+            let after = scalars(&config);
+            assert_eq!(after.get(*key), Some(&wanted[*key]), "{var}");
+            for (other, value) in &before {
+                if other != key {
+                    assert_eq!(after.get(other), Some(value), "{var} changed {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unparsable_env_var_is_named() {
+        for (var, value) in [
+            ("HTTP_ADDR", "8765"),
+            ("REGISTRATION_ENABLED", "yes"),
+            ("SMTP_PORT", "70000"),
+            ("AUTH_ACCESS_TOKEN_MINUTES", "-5"),
+            ("AUTH_ACCESS_TOKEN_MINUTES", "1.5"),
+            ("AUTH_ACCESS_TOKEN_MINUTES", ""),
+            ("AUTH_ACCESS_TOKEN_MINUTES", "99999999999999999999"),
         ] {
-            let error = access_token_lifetime(Some(value.into())).unwrap_err();
+            let error = apply_env_overrides(&mut FileConfig::default(), |name| {
+                Ok((name == var).then(|| value.into()))
+            })
+            .unwrap_err();
+            assert!(error.to_string().starts_with(var), "{var}={value}: {error}");
+        }
+    }
+
+    #[test]
+    fn access_tokens_last_five_minutes_unless_overridden() {
+        assert_eq!(access_token_lifetime(None).unwrap().as_secs(), 300);
+        assert_eq!(access_token_lifetime(Some(15)).unwrap().as_secs(), 900);
+        let config: FileConfig = toml::from_str("[auth]\naccess_token_minutes = 15").unwrap();
+        assert_eq!(config.auth.access_token_minutes, Some(15));
+    }
+
+    #[test]
+    fn access_token_minutes_must_be_in_range() {
+        for minutes in [0, 9_999_999_999_999, u64::MAX] {
+            let error = access_token_lifetime(Some(minutes)).unwrap_err();
             assert!(
-                format!("{error:#}").contains("ACCESS_TOKEN_MINUTES"),
-                "{value}"
+                error.to_string().contains("auth.access_token_minutes"),
+                "{minutes}"
             );
+        }
+        assert!(toml::from_str::<FileConfig>("[auth]\naccess_token_minutes = -5").is_err());
+    }
+
+    #[test]
+    fn smtp_is_read_from_the_file_and_validated() {
+        let smtp = |table: &str| {
+            let config: FileConfig = toml::from_str(&format!("[smtp]\n{table}")).unwrap();
+            smtp_settings(config.smtp)
+        };
+        assert!(smtp("port = 25").unwrap().is_none());
+        let settings = smtp("host = \"smtp.example.com\"\nfrom = \"aegis@example.com\"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.host, "smtp.example.com");
+        assert_eq!(settings.port, 587);
+        assert_eq!(settings.from, "aegis@example.com");
+        assert!(settings.username.is_none());
+
+        for (table, named) in [
+            ("host = \"\"\nfrom = \"a@example.com\"", "smtp.host"),
+            ("host = \"h\"", "smtp.from"),
+            ("host = \"h\"\nfrom = \"not an address\"", "smtp.from"),
+            (
+                "host = \"h\"\nfrom = \"a@example.com\"\nport = 0",
+                "smtp.port",
+            ),
+            (
+                "host = \"h\"\nfrom = \"a@example.com\"\nusername = \"u\"",
+                "smtp.password",
+            ),
+        ] {
+            let Err(error) = smtp(table) else {
+                panic!("{table} should be refused");
+            };
+            let error = error.to_string();
+            assert!(error.contains(named), "{table}: {error}");
         }
     }
 
