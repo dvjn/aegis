@@ -2,10 +2,6 @@
 
 Aegis reads environment variables, and optionally a config file. A variable overrides its config key.
 
-## Config file
-
-- `AEGIS_CONFIG`: path to the config file, default `config.toml`
-
 ## Server
 
 - `HTTP_ADDR` (`http_addr`): listen address, default `127.0.0.1:8765` (`0.0.0.0:8765` in the container)
@@ -36,7 +32,9 @@ Without `SMTP_HOST`, Aegis writes emails like password-reset links to the log.
 
 - `RUST_LOG`: log filter, such as `aegis=debug`; default logs Aegis at `info` and its HTTP dependencies at `warn`
 
-## Example config file
+## Config file
+
+- `AEGIS_CONFIG`: path to the config file, default `config.toml`
 
 Every key is optional; the values shown are the defaults.
 
