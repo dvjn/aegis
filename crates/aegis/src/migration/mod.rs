@@ -1,5 +1,6 @@
 use sea_orm_migration::prelude::*;
 
+pub mod legacy_config;
 mod m20260815_000001_identity_oauth;
 mod m20260829_000002_gateway_capture;
 mod m20260830_000003_gateway_keys;

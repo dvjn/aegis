@@ -8,10 +8,11 @@
 //! user can only make them stricter (see [`effective_guardrails`]).
 use crate::{
     config::{
-        Config, GuardrailConfig, GuardrailsConfig, GuardrailsMode, ProviderConfig, ProviderKind,
+        GuardrailConfig, GuardrailsConfig, GuardrailsMode, ProviderConfig, ProviderKind,
         RegexGuardrailConfig, validate_detectors, validate_providers,
     },
     domain::OAuthService,
+    migration::legacy_config::LegacyConfig,
     telemetry::timestamp,
 };
 use anyhow::Context;
@@ -543,7 +544,7 @@ impl SettingsStore {
     /// Imports the configuration file's providers and guardrails into the
     /// instance layer, once, for a database the providers migration marked as
     /// coming from an older release. Returns whether it imported.
-    pub async fn import_config_once(&self, config: &Config) -> anyhow::Result<bool> {
+    pub async fn import_config_once(&self, config: &LegacyConfig) -> anyhow::Result<bool> {
         if self.setting(IMPORT_PENDING).await?.is_none() {
             if !config.providers.is_empty() || config.guardrails.enabled {
                 tracing::warn!(
@@ -945,9 +946,13 @@ mod tests {
     #[tokio::test]
     async fn the_import_runs_only_for_databases_from_an_older_release() {
         let (store, database) = store().await;
-        let mut config = Config::test_default();
-        config.providers = vec![claude("claude")];
-        config.guardrails.enabled = true;
+        let config = LegacyConfig {
+            providers: vec![claude("claude")],
+            guardrails: GuardrailsConfig {
+                enabled: true,
+                ..GuardrailsConfig::default()
+            },
+        };
         // A new database: the migration ran before any user existed.
         assert!(!store.import_config_once(&config).await.unwrap());
         assert!(store.providers(Scope::Instance).await.unwrap().is_empty());
