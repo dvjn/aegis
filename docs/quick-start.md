@@ -1,4 +1,4 @@
-# Quick start
+# Quick Start
 
 ## Requirements
 
@@ -29,7 +29,7 @@ Add a provider. Provider IDs become part of the gateway URL. See [Providers, gua
 
 ## 3. Run a CLI through Aegis
 
-Install the client, `ags` ([other ways](client.md#install)), and pair this machine:
+Install the client, `ags` ([other ways](client-setup.md#install)), and pair this machine:
 
 ```sh
 mise use -g "github:dvjn/aegis[matching=ags-]"
@@ -56,6 +56,6 @@ Aegis is bring your own credentials. Provider credentials stay on the machine, a
 
 ## Next steps
 
-- [Use the client](client.md).
-- [Configure Aegis](configuration/README.md).
-- [Operate the container](deployment/container.md).
+- [Server Deployment](server-deployment.md)
+- [Server Configuration](server-configuration.md)
+- [Client Setup](client-setup.md)
