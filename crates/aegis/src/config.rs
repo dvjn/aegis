@@ -191,6 +191,15 @@ impl ProviderKind {
         bedrock_region(base_url)
     }
 
+    /// The location of a Vertex provider whose upstream is one location's
+    /// own host; the global host serves every location.
+    pub fn vertex_location(&self) -> Option<&str> {
+        let Self::Vertex { base_url } = self else {
+            return None;
+        };
+        vertex_location(base_url)
+    }
+
     /// Rebuilds a kind from its stored type name; an absent `base_url` takes
     /// that type's default upstream.
     pub fn from_parts(type_name: &str, base_url: Option<String>) -> Result<Self> {
@@ -559,6 +568,40 @@ pub fn default_vertex_base_url() -> String {
     "https://aiplatform.googleapis.com".into()
 }
 
+/// The upstream of a provider of `type_name` in `region`: a Bedrock region or
+/// a Vertex location. `None` for a type that has no regions.
+pub fn region_url(type_name: &str, region: &str) -> Option<String> {
+    match type_name {
+        BEDROCK => Some(bedrock_runtime_url(region)),
+        VERTEX => Some(vertex_url(region)),
+        _ => None,
+    }
+}
+
+/// Vertex's host for `location`: `global` uses the global host, the `eu` and
+/// `us` multi-regions their own, and a region its regional host.
+pub fn vertex_url(location: &str) -> String {
+    match location {
+        "global" => default_vertex_base_url(),
+        "eu" | "us" => format!("https://aiplatform.{location}.rep.googleapis.com"),
+        region => format!("https://{region}-aiplatform.googleapis.com"),
+    }
+}
+
+/// The location of a Vertex URL that `vertex_url` builds for one location
+/// other than `global`.
+pub fn vertex_location(base_url: &str) -> Option<&str> {
+    let host = base_url.strip_prefix("https://")?.trim_end_matches('/');
+    let location = match host.strip_suffix("-aiplatform.googleapis.com") {
+        Some(region) => region,
+        None => host
+            .strip_prefix("aiplatform.")?
+            .strip_suffix(".rep.googleapis.com")
+            .filter(|multi| matches!(*multi, "eu" | "us"))?,
+    };
+    is_cloud_region(location).then_some(location)
+}
+
 fn default_pricing_url() -> String {
     "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json".into()
 }
@@ -663,6 +706,35 @@ fn is_snake_case_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vertex_host_for_one_location_names_it() {
+        for location in ["us-east5", "europe-west4", "eu", "us"] {
+            let url = region_url(VERTEX, location).unwrap();
+            assert_eq!(vertex_location(&url), Some(location), "{url}");
+        }
+        assert_eq!(
+            region_url(VERTEX, "global").unwrap(),
+            default_vertex_base_url()
+        );
+        for other in [
+            "https://aiplatform.googleapis.com",
+            "https://aiplatform.asia.rep.googleapis.com",
+            "http://us-east5-aiplatform.googleapis.com",
+            "https://proxy.example.com/vertex",
+            "https://US-aiplatform.googleapis.com",
+        ] {
+            assert_eq!(vertex_location(other), None, "{other}");
+        }
+        let regional = ProviderKind::from_parts(VERTEX, region_url(VERTEX, "us-east5")).unwrap();
+        assert_eq!(regional.vertex_location(), Some("us-east5"));
+        assert_eq!(regional.bedrock_region(), None);
+        assert_eq!(
+            region_url(BEDROCK, "eu-west-1").as_deref(),
+            Some("https://bedrock-runtime.eu-west-1.amazonaws.com")
+        );
+        assert_eq!(region_url(CLAUDE_SUBSCRIPTION, "us-east-1"), None);
+    }
 
     #[test]
     fn parses_multiple_accounts() {

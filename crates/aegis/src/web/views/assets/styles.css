@@ -1469,12 +1469,14 @@ button.danger:hover {
   font-size: 13px;
 }
 
-/* Fields for one provider type, shown only while that type is selected.
+/* Fields for some provider types, shown only while one of them is selected.
    Pages carry no script, so the add form's own selection decides. */
-.bedrock-only {
+.bedrock-only,
+.vertex-only {
   display: none;
 }
 
-form:has(select[name="kind"] option[value="bedrock"]:checked) .bedrock-only {
+form:has(select[name="kind"] option[value="bedrock"]:checked) .bedrock-only,
+form:has(select[name="kind"] option[value="vertex"]:checked) .vertex-only {
   display: block;
 }

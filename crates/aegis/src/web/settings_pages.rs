@@ -1,7 +1,6 @@
 //! Provider and guardrail settings pages. Every route exists twice: under
 //! `/settings` for the signed-in user's own layer, and under `/admin` for the
 //! instance layer, which only superusers reach.
-use aegis_wire::provider_type;
 
 use super::{
     AppState, authenticate, csrf_from_token,
@@ -198,6 +197,8 @@ struct CreateProviderForm {
     #[serde(default)]
     region: String,
     #[serde(default)]
+    location: String,
+    #[serde(default)]
     base_url: String,
 }
 
@@ -216,19 +217,22 @@ async fn provider_create(
         return Ok(to_login());
     };
     let id = input.id.trim().to_owned();
-    // The region field is hidden for other types, but a value typed before
-    // switching type is still submitted, so only Bedrock reads it.
-    let region = (input.kind == provider_type::BEDROCK)
-        .then(|| optional(&input.region))
-        .flatten();
+    // Each type's field is hidden for the others, but a value typed before
+    // switching type is still submitted, so only the selected type's is read.
+    let typed = match input.kind.as_str() {
+        aegis_wire::provider_type::VERTEX => &input.location,
+        _ => &input.region,
+    };
+    let region = optional(typed).and_then(|region| {
+        let url = crate::config::region_url(&input.kind, &region)?;
+        Some((region, url))
+    });
     let base_url = match region {
         None => Ok(optional(&input.base_url)),
-        Some(region) if optional(&input.base_url).is_some() => Err(format!(
+        Some((region, _)) if optional(&input.base_url).is_some() => Err(format!(
             "Set either a region or an upstream base URL, not both (region {region})."
         )),
-        Some(region) if crate::config::is_cloud_region(&region) => {
-            Ok(Some(crate::config::bedrock_runtime_url(&region)))
-        }
+        Some((region, url)) if crate::config::is_cloud_region(&region) => Ok(Some(url)),
         Some(_) => Err("A region contains only lowercase letters, digits and hyphens.".into()),
     };
     let result = match base_url.map(|base_url| ProviderKind::from_parts(&input.kind, base_url)) {
@@ -257,6 +261,7 @@ async fn provider_create(
                         id: input.id,
                         kind: input.kind,
                         region: input.region,
+                        location: input.location,
                         base_url: input.base_url,
                     }),
                     error: Some(&message),

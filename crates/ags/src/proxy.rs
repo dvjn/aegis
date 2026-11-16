@@ -20,7 +20,7 @@ use axum::{
     Router,
     body::{Body, HttpBody},
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -146,8 +146,15 @@ fn new_secret() -> Result<String> {
 }
 
 impl Target {
-    fn is_from_launch(&self, headers: &HeaderMap) -> bool {
-        headers.get(header::HOST).map(HeaderValue::as_bytes) == Some(self.host.as_bytes())
+    fn is_from_launch(&self, uri: &Uri, headers: &HeaderMap) -> bool {
+        // HTTP/2 names the host in the request's authority instead of a header.
+        let host = match headers.get(header::HOST) {
+            Some(host) => Some(host.as_bytes()),
+            None => uri
+                .authority()
+                .map(|authority| authority.as_str().as_bytes()),
+        };
+        host == Some(self.host.as_bytes())
             && !headers.contains_key(header::ORIGIN)
             && headers
                 .get(SECRET_HEADER)
@@ -201,8 +208,15 @@ impl Target {
 
 async fn forward(State(target): State<Arc<Target>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    if !target.is_from_launch(&parts.headers) {
+    if !target.is_from_launch(&parts.uri, &parts.headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    // HTTP/2's extended CONNECT is a CONNECT too, with its protocol in an extension.
+    if parts.method == Method::CONNECT {
+        return failure(
+            StatusCode::NOT_IMPLEMENTED,
+            "the launch proxy does not open tunnels (CONNECT)",
+        );
     }
     let Some(url) = target.rest(&parts.uri).and_then(|rest| target.url(rest)) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -328,6 +342,31 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn a_tunnel_is_refused() {
+        let target = Arc::new(target(""));
+        let connect = |uri: &'static str, host: Option<&'static str>| {
+            let mut request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(uri)
+                .header(SECRET_HEADER, SECRET);
+            if let Some(host) = host {
+                request = request.header(header::HOST, host);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        for request in [
+            connect("127.0.0.1:4000", Some("127.0.0.1:4000")),
+            connect("http://127.0.0.1:4000/v1/messages", None),
+        ] {
+            let response = forward(State(target.clone()), request).await;
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+        let elsewhere = connect("evil.example:443", Some("evil.example:443"));
+        let response = forward(State(target), elsewhere).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn a_secret_is_128_random_bits() {
         let (first, second) = (new_secret().unwrap(), new_secret().unwrap());
@@ -339,14 +378,27 @@ mod tests {
     #[test]
     fn only_the_launched_process_reaches_the_proxy() {
         let target = target("");
+        let origin_form = Uri::from_static("/v1/messages");
         let with = |extra: &[(&'static str, &'static str)]| {
             let mut pairs = vec![("host", "127.0.0.1:4000"), ("x-ags-launch-secret", SECRET)];
             pairs.extend_from_slice(extra);
             headers(&pairs)
         };
-        assert!(target.is_from_launch(&with(&[])));
-        assert!(!target.is_from_launch(&with(&[("origin", "http://127.0.0.1:4000")])));
-        assert!(!target.is_from_launch(&headers(&[("host", "127.0.0.1:4000")])));
+        assert!(target.is_from_launch(&origin_form, &with(&[])));
+        assert!(
+            !target.is_from_launch(&origin_form, &with(&[("origin", "http://127.0.0.1:4000")]))
+        );
+        assert!(!target.is_from_launch(&origin_form, &headers(&[("host", "127.0.0.1:4000")])));
+        let secret_only = headers(&[("x-ags-launch-secret", SECRET)]);
+        assert!(target.is_from_launch(
+            &Uri::from_static("http://127.0.0.1:4000/model/m/converse"),
+            &secret_only
+        ));
+        assert!(!target.is_from_launch(&origin_form, &secret_only));
+        assert!(!target.is_from_launch(
+            &Uri::from_static("http://evil.example:4000/model/m/converse"),
+            &secret_only
+        ));
         for (host, secret) in [
             ("localhost:4000", SECRET),
             ("evil.example:4000", SECRET),
@@ -355,7 +407,10 @@ mod tests {
             ("127.0.0.1:4000", ""),
         ] {
             let request = headers(&[("host", host), ("x-ags-launch-secret", secret)]);
-            assert!(!target.is_from_launch(&request), "{host} {secret}");
+            assert!(
+                !target.is_from_launch(&origin_form, &request),
+                "{host} {secret}"
+            );
         }
     }
 

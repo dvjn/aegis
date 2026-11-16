@@ -29,7 +29,6 @@ mod usage_hourly;
 mod usage_json;
 mod web;
 
-use aegis_wire::provider_type;
 use anyhow::{Context, Result, bail};
 use api_keys::KeyStore;
 use clap::{Parser, Subcommand};
@@ -105,7 +104,8 @@ enum ProviderCommand {
         /// Upstream base URL; defaults to the provider type's usual upstream.
         #[arg(long, conflicts_with = "region")]
         base_url: Option<String>,
-        /// AWS region of a `bedrock` provider, instead of a base URL.
+        /// AWS region of a `bedrock` provider, or location of a `vertex` provider, instead of a
+        /// base URL.
         #[arg(long)]
         region: Option<String>,
     },
@@ -342,15 +342,13 @@ async fn manage_provider(
         } => {
             let base_url = match region {
                 None => base_url,
-                Some(region)
-                    if kind == provider_type::BEDROCK && config::is_cloud_region(&region) =>
-                {
-                    Some(config::bedrock_runtime_url(&region))
-                }
-                Some(_) if kind == provider_type::BEDROCK => {
-                    bail!("a region contains only lowercase letters, digits and hyphens")
-                }
-                Some(_) => bail!("--region applies only to bedrock providers"),
+                Some(region) => match config::region_url(&kind, &region) {
+                    None => bail!("--region applies only to bedrock and vertex providers"),
+                    Some(_) if !config::is_cloud_region(&region) => {
+                        bail!("a region contains only lowercase letters, digits and hyphens")
+                    }
+                    url => url,
+                },
             };
             let provider = ProviderConfig {
                 kind: ProviderKind::from_parts(&kind, base_url)?,

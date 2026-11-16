@@ -19,6 +19,9 @@ pub(super) struct Snapshot {
     providers: HashMap<(Option<String>, String), ProviderTarget>,
     /// Each provider's type, keyed as `providers` is.
     types: HashMap<(Option<String>, String), &'static str>,
+    /// The AWS region or Vertex location of each cloud provider whose
+    /// endpoint names one.
+    regions: HashMap<(Option<String>, String), String>,
     instance_guardrails: GuardrailsConfig,
     user_guardrails: HashMap<String, GuardrailsConfig>,
     /// Built on first use per user; compiling detectors is not free.
@@ -32,18 +35,28 @@ impl Snapshot {
         user_guardrails: HashMap<String, GuardrailsConfig>,
     ) -> anyhow::Result<Self> {
         let mut types = HashMap::new();
+        let mut regions = HashMap::new();
         let providers = providers
             .into_iter()
             .map(|stored| {
                 let type_name = stored.config.kind.type_name();
+                let kind = &stored.config.kind;
+                let region = kind
+                    .bedrock_region()
+                    .or_else(|| kind.vertex_location())
+                    .map(str::to_owned);
                 let (id, target) = target(stored.config)?;
                 types.insert((stored.owner.clone(), id.clone()), type_name);
+                if let Some(region) = region {
+                    regions.insert((stored.owner.clone(), id.clone()), region);
+                }
                 Ok(((stored.owner, id), target))
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             providers,
             types,
+            regions,
             instance_guardrails,
             user_guardrails,
             pipelines: Mutex::default(),
@@ -77,6 +90,18 @@ impl Snapshot {
             .get(&(Some(user.to_owned()), id.to_owned()))
             .or_else(|| self.types.get(&(None, id.to_owned())))
             .copied()
+    }
+
+    /// The AWS region or Vertex location of the provider `resolve` would
+    /// pick, if its endpoint names one.
+    pub(super) fn region(&self, user: &str, id: &str) -> Option<&str> {
+        let own = (Some(user.to_owned()), id.to_owned());
+        let key = if self.types.contains_key(&own) {
+            own
+        } else {
+            (None, id.to_owned())
+        };
+        self.regions.get(&key).map(String::as_str)
     }
 
     /// The user's own providers and the instance's, sorted by ID.
@@ -154,4 +179,65 @@ fn target(config: ProviderConfig) -> anyhow::Result<(String, ProviderTarget)> {
             price_scope: Arc::from(price_scope),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProviderKind;
+
+    fn stored(owner: Option<&str>, id: &str, kind: ProviderKind) -> StoredProvider {
+        StoredProvider {
+            owner: owner.map(str::to_owned),
+            config: ProviderConfig {
+                id: id.into(),
+                kind,
+            },
+        }
+    }
+
+    #[test]
+    fn a_cloud_providers_region_is_its_endpoints_and_a_users_own_comes_first() {
+        let bedrock = |url: &str| ProviderKind::Bedrock {
+            base_url: url.into(),
+        };
+        let snapshot = Snapshot::new(
+            vec![
+                stored(
+                    None,
+                    "aws",
+                    bedrock("https://bedrock-runtime.eu-west-1.amazonaws.com"),
+                ),
+                stored(Some("me"), "aws", bedrock("https://vpce.example.com")),
+                stored(
+                    None,
+                    "us",
+                    bedrock("https://bedrock-runtime.us-east-1.amazonaws.com"),
+                ),
+                stored(
+                    None,
+                    "gcp",
+                    ProviderKind::Vertex {
+                        base_url: "https://us-east5-aiplatform.googleapis.com".into(),
+                    },
+                ),
+                stored(
+                    None,
+                    "global",
+                    ProviderKind::Vertex {
+                        base_url: crate::config::default_vertex_base_url(),
+                    },
+                ),
+            ],
+            GuardrailsConfig::default(),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.region("you", "aws"), Some("eu-west-1"));
+        assert_eq!(snapshot.region("me", "aws"), None);
+        assert_eq!(snapshot.region("me", "us"), Some("us-east-1"));
+        assert_eq!(snapshot.region("me", "missing"), None);
+        assert_eq!(snapshot.region("me", "gcp"), Some("us-east5"));
+        assert_eq!(snapshot.region("me", "global"), None);
+    }
 }

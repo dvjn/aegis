@@ -3,7 +3,10 @@
 //! A subscription provider has one upstream and one format. A Bedrock or
 //! Vertex provider serves several clients, each speaking its own format to
 //! its own endpoint, so the request path decides both.
-use crate::{config::is_cloud_region, providers::Provider};
+use crate::{
+    config::{is_cloud_region, vertex_url},
+    providers::Provider,
+};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -120,7 +123,7 @@ impl ProviderTarget {
                 };
                 let url = match custom {
                     Some(base) => base.url(&versioned),
-                    None => format!("https://{}{versioned}", vertex_host(bare)),
+                    None => format!("{}{versioned}", vertex_base(bare)),
                 };
                 let (model, method) = vertex_model(bare).unzip();
                 let counting = model.as_deref() == Some("count-tokens");
@@ -181,20 +184,15 @@ fn vertex_model(path: &str) -> Option<(String, &str)> {
     (!model.is_empty() && !model.contains('/')).then(|| (percent_decode(model), method))
 }
 
-/// Vertex's host for the location in a path: `global` uses the global host,
-/// the `eu` and `us` multi-regions their own, and a region its regional host.
+/// Vertex's base URL for the location in a path, as `vertex_url` names it.
 /// A missing or malformed location falls back to the global host rather than
 /// reaching a host built from arbitrary text.
-fn vertex_host(path: &str) -> String {
+fn vertex_base(path: &str) -> String {
     let location = path
         .split_once("/locations/")
         .map(|(_, rest)| rest.split('/').next().unwrap_or_default())
         .filter(|location| is_cloud_region(location));
-    match location {
-        None | Some("global") => "aiplatform.googleapis.com".into(),
-        Some(multi @ ("eu" | "us")) => format!("aiplatform.{multi}.rep.googleapis.com"),
-        Some(region) => format!("{region}-aiplatform.googleapis.com"),
-    }
+    vertex_url(location.unwrap_or("global"))
 }
 
 fn percent_decode(value: &str) -> String {

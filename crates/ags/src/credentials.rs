@@ -12,7 +12,7 @@ use std::{
 };
 
 use aegis_wire::provider_type::{BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, VERTEX};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -60,6 +60,7 @@ const CODEX_SHARED: &[&str] = &[
     "rules",
     "prompts",
     "hooks.json",
+    ".hook-trust",
     "skills",
     "plugins",
 ];
@@ -168,27 +169,59 @@ const CLAUDE_CREDENTIAL_VARS: &[&str] = &[
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
 ];
 
-/// Each sends Claude Code to another upstream than the provider's.
-const CLAUDE_UPSTREAM_SWITCHES: &[(&str, Option<&str>)] = &[
+/// What picks where Claude Code sends its requests, as Claude Code reads it: each upstream's
+/// switch, base URL and skipped sign-in, with the provider type whose launch sets it.
+const CLAUDE_ROUTES: &[(&str, Option<&str>)] = &[
+    ("ANTHROPIC_BASE_URL", Some(CLAUDE_SUBSCRIPTION)),
     ("CLAUDE_CODE_USE_BEDROCK", Some(BEDROCK)),
+    ("ANTHROPIC_BEDROCK_BASE_URL", Some(BEDROCK)),
     ("CLAUDE_CODE_USE_VERTEX", Some(VERTEX)),
+    ("ANTHROPIC_VERTEX_BASE_URL", Some(VERTEX)),
     ("CLAUDE_CODE_USE_FOUNDRY", None),
     ("CLAUDE_CODE_USE_ANTHROPIC_AWS", None),
     ("CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", None),
     ("CLAUDE_CODE_USE_MANTLE", None),
     ("CLAUDE_CODE_USE_GATEWAY", None),
+    ("ANTHROPIC_FOUNDRY_BASE_URL", None),
+    ("ANTHROPIC_FOUNDRY_RESOURCE", None),
+    ("ANTHROPIC_BEDROCK_MANTLE_BASE_URL", None),
+    ("ANTHROPIC_AWS_BASE_URL", None),
+    ("ANTHROPIC_GOOGLE_CLOUD_BASE_URL", None),
+    ("ANTHROPIC_UNIX_SOCKET", None),
+    ("CLAUDE_CODE_SKIP_BEDROCK_AUTH", None),
+    ("CLAUDE_CODE_SKIP_VERTEX_AUTH", None),
+    ("CLAUDE_CODE_SKIP_FOUNDRY_AUTH", None),
+    ("CLAUDE_CODE_SKIP_MANTLE_AUTH", None),
+    ("CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH", None),
+    ("CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH", None),
+];
+
+/// Cloud credentials a CLI would use in place of a Bedrock or Vertex provider's own: AWS's, which
+/// a Bedrock client tries beside an API key, and a Google API key, which replaces a service account.
+const CLOUD_CREDENTIALS: &[&str] = &[
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "GOOGLE_CLOUD_API_KEY",
 ];
 
 /// What a CLI would use for every provider in place of the provider's own sign-in and upstream.
 fn shared_auth(cli: Cli, provider_type: &str) -> Vec<&'static str> {
-    match (cli, provider_type) {
+    let mut names = match (cli, provider_type) {
         (Cli::Claude, _) => CLAUDE_CREDENTIAL_VARS
             .iter()
             .copied()
             .chain(
-                CLAUDE_UPSTREAM_SWITCHES
+                CLAUDE_ROUTES
                     .iter()
-                    .filter(|(_, chosen_by)| *chosen_by != Some(provider_type))
+                    .filter(|(_, set_by)| *set_by != Some(provider_type))
                     .map(|(name, _)| *name),
             )
             .collect(),
@@ -199,20 +232,28 @@ fn shared_auth(cli: Cli, provider_type: &str) -> Vec<&'static str> {
             "ANTHROPIC_AUTH_TOKEN",
         ],
         (Cli::Pi, _) => vec![],
+    };
+    if matches!(provider_type, BEDROCK | VERTEX) {
+        names.extend(CLOUD_CREDENTIALS);
     }
+    names
 }
 
-/// What a launch gives its CLI, which a sign-in run from inside that CLI must not inherit.
+/// What a launch gives its CLI beside Claude Code's routes, which a sign-in run from inside that
+/// CLI must not inherit either.
 const LAUNCH_ENV: &[&str] = &[
     "AGS_LAUNCH_SECRET",
     "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_BASE_URL",
     "OPENAI_BASE_URL",
     "AGS_PI_PROVIDER",
     "AGS_PI_BASE_URL",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
+    "AWS_REGION",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
 ];
 
 /// What a sign-in run from inside a launch drops before setting its own.
@@ -220,6 +261,7 @@ fn from_launch() -> impl Iterator<Item = &'static str> {
     LAUNCH_ENV
         .iter()
         .copied()
+        .chain(CLAUDE_ROUTES.iter().map(|(name, _)| *name))
         .chain(DIR_VARS.iter().flat_map(|(own, kept)| [*own, *kept]))
 }
 
@@ -519,13 +561,32 @@ impl Credentials {
                 });
             }
             let env = settings.get("env").and_then(Value::as_object);
-            for name in CLAUDE_CREDENTIAL_VARS {
-                if env.is_some_and(|env| env.contains_key(*name)) {
-                    notices.push(Notice {
-                        key: format!("claude/env/{name}"),
-                        text: format!("your Claude Code settings set {name}, so every Claude provider uses it in place of its own sign-in"),
-                    });
-                }
+            let set = |name: &str| env.is_some_and(|env| env.contains_key(name));
+            let mut warn = |name: &str, text: String| {
+                notices.push(Notice {
+                    key: format!("claude/env/{name}"),
+                    text: format!("your Claude Code settings set {name}, {text}"),
+                });
+            };
+            for name in CLAUDE_CREDENTIAL_VARS.iter().filter(|name| set(name)) {
+                warn(
+                    name,
+                    "so every Claude provider uses it in place of its own sign-in".to_owned(),
+                );
+            }
+            // Claude Code applies its settings' environment over the one a launch gives it.
+            for (name, _) in CLAUDE_ROUTES.iter().filter(|(name, _)| set(name)) {
+                warn(
+                    name,
+                    "which overrides where each ags launch sends Claude Code".to_owned(),
+                );
+            }
+            for name in CLOUD_CREDENTIALS.iter().filter(|name| set(name)) {
+                warn(
+                    name,
+                    "which a Bedrock or Vertex provider may use in place of its own credential"
+                        .to_owned(),
+                );
             }
         }
         if notices.iter().all(|notice| {
@@ -674,6 +735,31 @@ impl Credentials {
         Ok(())
     }
 
+    /// The Google Cloud project of `provider`'s stored service account, where its CLIs call Vertex.
+    pub fn vertex_project(&self, provider: &str) -> Result<String> {
+        let path = self.provider_dir(provider)?.join(VERTEX_ACCOUNT);
+        let account = read_json(&path)?.ok_or_else(|| {
+            anyhow!(
+                "{provider} has no {}; run `ags setup {provider}`",
+                Need::VertexAccount
+            )
+        })?;
+        account
+            .get("project_id")
+            .and_then(Value::as_str)
+            // A project ID starts with a letter, so it is never `.` or `..` in a request path.
+            .filter(|project| {
+                project.starts_with(|first: char| first.is_ascii_lowercase())
+                    && project.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-.:".contains(&byte)
+                    })
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                anyhow!("the service account of {provider} names no Google Cloud project")
+            })
+    }
+
     /// How a CLI finds a cloud provider's stored credential: the variables its SDK reads.
     pub fn cloud_env(
         &self,
@@ -762,17 +848,22 @@ pub async fn setup_steps(
 
 /// Whether `cli` is an executable on `PATH`.
 pub fn installed(cli: Cli) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
+    on_path(&cli.to_string(), std::env::var_os("PATH").as_deref())
+}
+
+/// Whether `program` is an executable in one of the dirs of `path`, a value of `PATH`.
+pub(crate) fn on_path(program: &str, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
         return false;
     };
     let names: &[String] = &if cfg!(windows) {
         ["exe", "cmd", "bat"]
-            .map(|extension| format!("{cli}.{extension}"))
+            .map(|extension| format!("{program}.{extension}"))
             .to_vec()
     } else {
-        vec![cli.to_string()]
+        vec![program.to_owned()]
     };
-    std::env::split_paths(&path).any(|dir| {
+    std::env::split_paths(path).any(|dir| {
         names.iter().any(|name| {
             let candidate = dir.join(name);
             #[cfg(unix)]
@@ -984,7 +1075,7 @@ fn read_json(path: &Path) -> Result<Option<Map<String, Value>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::tests::scratch;
+    use crate::{clis::Upstream, store::tests::scratch};
 
     struct Fixture {
         root: PathBuf,
@@ -1077,8 +1168,13 @@ mod tests {
         assert!(claude.unset.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(codex.unset.contains(&"OPENAI_API_KEY"));
         assert!(codex.unset.contains(&"CODEX_ACCESS_TOKEN"));
-        for (switch, _) in CLAUDE_UPSTREAM_SWITCHES {
-            assert!(claude.unset.contains(switch), "{switch}");
+        for (route, _) in CLAUDE_ROUTES {
+            let set_by_subscription = *route == "ANTHROPIC_BASE_URL";
+            assert_eq!(
+                claude.unset.contains(route),
+                !set_by_subscription,
+                "{route}"
+            );
         }
         assert!(
             claude
@@ -1298,6 +1394,24 @@ mod tests {
     }
 
     #[test]
+    fn a_route_or_cloud_credential_in_the_users_settings_is_named_once() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".claude/settings.json",
+            r#"{"env":{"ANTHROPIC_UNIX_SOCKET":"/run/s","AWS_PROFILE":"dev","AWS_REGION":"us-east-1"}}"#,
+        );
+        let credentials = &fixture.credentials;
+        assert_eq!(
+            credentials.notices("work", Cli::Claude).unwrap(),
+            [
+                "your Claude Code settings set ANTHROPIC_UNIX_SOCKET, which overrides where each ags launch sends Claude Code",
+                "your Claude Code settings set AWS_PROFILE, which a Bedrock or Vertex provider may use in place of its own credential",
+            ]
+        );
+        assert!(credentials.notices("work", Cli::Claude).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_claude_sign_in_is_its_own_oauth_entry() {
         let fixture = Fixture::new();
         let credentials = &fixture.credentials;
@@ -1354,6 +1468,25 @@ mod tests {
             .unwrap();
         let stored = fixture.provider("gcp").join(VERTEX_ACCOUNT);
         assert_eq!(fs::read_to_string(&stored).unwrap(), account);
+        assert_eq!(credentials.vertex_project("gcp").unwrap(), "p");
+        assert!(credentials.vertex_project("aws").is_err());
+        for project in ["p/../x", ".", "..", "", "-p"] {
+            fixture.write(
+                "key.json",
+                &account.replace(
+                    r#""project_id":"p""#,
+                    &format!(r#""project_id":"{project}""#),
+                ),
+            );
+            credentials
+                .save_vertex_account("bad", &fixture.home.join("key.json"))
+                .unwrap();
+            assert_eq!(
+                credentials.vertex_project("bad").unwrap_err().to_string(),
+                "the service account of bad names no Google Cloud project",
+                "{project}"
+            );
+        }
         assert_eq!(
             credentials.cloud_env("gcp", VERTEX).unwrap(),
             [(
@@ -1436,6 +1569,8 @@ mod tests {
     #[test]
     fn a_sign_in_inherits_nothing_a_launch_sets() {
         let fixture = Fixture::new();
+        let path = gcloud_on_path(&fixture);
+        store_cloud_credentials(&fixture, "work");
         let dropped: Vec<&str> = from_launch().collect();
         // A launch only adds loopback hosts to the user's own list, which a sign-in may keep.
         let kept: Vec<&str> = crate::launch::no_proxy(|_| None)
@@ -1446,22 +1581,27 @@ mod tests {
             for provider_type in cli.provider_types() {
                 let setup = cli
                     .setup(
-                        provider_type,
+                        cloud_upstream(provider_type),
                         "http://127.0.0.1:1",
                         "secret",
                         &fixture.root,
-                        |_| None,
+                        |name| (name == "PATH").then(|| path.clone()),
                     )
                     .unwrap();
                 let isolation = fixture
                     .credentials
                     .isolate("work", provider_type, *cli)
                     .unwrap();
+                let cloud = fixture
+                    .credentials
+                    .cloud_env("work", provider_type)
+                    .unwrap();
                 let set = setup
                     .env
                     .iter()
                     .map(|(name, _)| *name)
-                    .chain(isolation.env.iter().map(|(name, _)| *name));
+                    .chain(isolation.env.iter().map(|(name, _)| *name))
+                    .chain(cloud.iter().map(|(name, _)| *name));
                 for name in set {
                     assert!(dropped.contains(&name), "{cli} sets {name}");
                 }
@@ -1469,6 +1609,85 @@ mod tests {
         }
         assert_eq!(kept, ["NO_PROXY", "no_proxy"]);
         assert!(kept.iter().all(|name| !dropped.contains(name)));
+    }
+
+    fn cloud_upstream(provider_type: &str) -> Upstream<'_> {
+        Upstream {
+            id: "work",
+            provider_type,
+            region: Some("us-east-1"),
+            project: Some("p"),
+        }
+    }
+
+    /// A `PATH` value holding an executable `gcloud`.
+    fn gcloud_on_path(fixture: &Fixture) -> String {
+        let bin = fixture.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("gcloud"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(bin.join("gcloud"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin.to_str().unwrap().to_owned()
+    }
+
+    fn store_cloud_credentials(fixture: &Fixture, provider: &str) {
+        fixture.write(
+            "key.json",
+            r#"{"type":"service_account","project_id":"p","client_email":"a@p.iam.gserviceaccount.com","private_key":"k"}"#,
+        );
+        let credentials = &fixture.credentials;
+        credentials
+            .save_bedrock_key(provider, "ABSKexample")
+            .unwrap();
+        credentials
+            .save_vertex_account(provider, &fixture.home.join("key.json"))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_claude_launch_keeps_only_its_providers_route_and_cloud_credential() {
+        let fixture = Fixture::new();
+        let path = gcloud_on_path(&fixture);
+        for provider_type in [CLAUDE_SUBSCRIPTION, BEDROCK, VERTEX] {
+            let setup = Cli::Claude
+                .setup(
+                    cloud_upstream(provider_type),
+                    "http://127.0.0.1:1",
+                    "secret",
+                    &fixture.root,
+                    |name| (name == "PATH").then(|| path.clone()),
+                )
+                .unwrap();
+            let isolation = fixture
+                .credentials
+                .isolate("work", provider_type, Cli::Claude)
+                .unwrap();
+            for (route, _) in CLAUDE_ROUTES {
+                let set = setup.env.iter().any(|(name, _)| name == route);
+                assert_ne!(
+                    set,
+                    isolation.unset.contains(route),
+                    "{provider_type}: {route} is either set or cleared"
+                );
+            }
+            let cloud = matches!(provider_type, BEDROCK | VERTEX);
+            for cli in Cli::value_variants() {
+                let isolation = fixture
+                    .credentials
+                    .isolate("work", provider_type, *cli)
+                    .unwrap();
+                for name in CLOUD_CREDENTIALS {
+                    assert_eq!(
+                        isolation.unset.contains(name),
+                        cloud,
+                        "{cli} on {provider_type}: {name}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

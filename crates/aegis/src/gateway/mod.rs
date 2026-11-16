@@ -262,6 +262,22 @@ impl Gateway {
             .collect()
     }
 
+    /// The region of each of `ids` that is a provider of `provider_type` the
+    /// user can reach, if its endpoint names one: a Bedrock provider's AWS
+    /// region or a Vertex provider's location.
+    pub fn provider_regions(
+        &self,
+        user: &str,
+        ids: &[String],
+        provider_type: &str,
+    ) -> BTreeMap<String, String> {
+        let snapshot = self.snapshot();
+        ids.iter()
+            .filter(|id| snapshot.type_name(user, id) == Some(provider_type))
+            .filter_map(|id| Some((id.clone(), snapshot.region(user, id)?.to_owned())))
+            .collect()
+    }
+
     pub async fn forward(&self, provider_id: &str, request: Request) -> Response {
         let snapshot = self.snapshot();
         if !snapshot.exists(provider_id) {

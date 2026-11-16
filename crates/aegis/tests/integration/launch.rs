@@ -34,6 +34,7 @@ fn offer(id: &str, provider_type: &str) -> Offer {
     Offer {
         id: id.to_owned(),
         provider_type: provider_type.to_owned(),
+        region: None,
     }
 }
 

@@ -4,14 +4,17 @@ use std::{
     process::ExitStatus,
 };
 
-use aegis_wire::Machine;
+use aegis_wire::{Machine, provider_type::VERTEX};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
 use clap::ValueEnum;
 
 use crate::{
-    Cli, Credentials, LoggedOut, Login, Store, current_login, defaults, forget, proxy::Proxy,
+    Cli, Credentials, LoggedOut, Login, Store,
+    clis::{Upstream, stray_model_regions},
+    current_login, defaults, forget,
+    proxy::Proxy,
     server::Server,
 };
 
@@ -20,6 +23,34 @@ use crate::{
 pub struct Offer {
     pub id: String,
     pub provider_type: String,
+    /// A Bedrock provider's AWS region or a Vertex provider's location, when the server names one.
+    pub region: Option<String>,
+}
+
+impl Offer {
+    fn of(machine: &Machine, id: &str, provider_type: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            provider_type: provider_type.to_owned(),
+            region: machine
+                .provider_regions
+                .as_ref()
+                .and_then(|regions| regions.get(id))
+                .or_else(|| machine.provider_locations.get(id))
+                .cloned(),
+        }
+    }
+
+    /// Why `cli` can't run on this provider of `machine`, with `path` as the value of `PATH`.
+    fn refusal(&self, machine: &Machine, cli: Cli, path: Option<&OsStr>) -> Option<String> {
+        cli.refusal(
+            &self.id,
+            &self.provider_type,
+            self.region.as_deref(),
+            machine.provider_regions.is_some(),
+            path,
+        )
+    }
 }
 
 pub enum Pick {
@@ -51,21 +82,24 @@ pub(crate) async fn granted(store: &Store) -> Result<Option<(Login, Machine)>> {
     }
 }
 
-fn offers(machine: &Machine, cli: Cli) -> Vec<Offer> {
+fn offers(machine: &Machine, cli: Cli, path: Option<&OsStr>) -> Vec<Offer> {
     machine
         .providers
         .iter()
         .filter_map(|id| {
-            let provider_type = machine.provider_types.get(id)?;
-            cli.runs_on(provider_type).then(|| Offer {
-                id: id.clone(),
-                provider_type: provider_type.clone(),
-            })
+            let offer = Offer::of(machine, id, machine.provider_types.get(id)?);
+            offer.refusal(machine, cli, path).is_none().then_some(offer)
         })
         .collect()
 }
 
-fn offer(machine: &Machine, server: &str, cli: Cli, id: &str) -> Result<Offer> {
+fn offer(
+    machine: &Machine,
+    server: &str,
+    cli: Cli,
+    id: &str,
+    path: Option<&OsStr>,
+) -> Result<Offer> {
     if !machine.providers.iter().any(|granted| granted == id) {
         bail!(
             "{id} is not granted to this machine; run `ags logout`, then `ags login {server}` to grant it"
@@ -74,22 +108,24 @@ fn offer(machine: &Machine, server: &str, cli: Cli, id: &str) -> Result<Offer> {
     let Some(provider_type) = machine.provider_types.get(id) else {
         bail!("{server} no longer has a provider named {id}");
     };
-    if !cli.runs_on(provider_type) {
-        bail!("{cli} can't run on {id}, a {provider_type} provider");
+    let offer = Offer::of(machine, id, provider_type);
+    if let Some(refusal) = offer.refusal(machine, cli, path) {
+        bail!(refusal);
     }
-    Ok(Offer {
-        id: id.to_owned(),
-        provider_type: provider_type.clone(),
-    })
+    Ok(offer)
+}
+
+fn path() -> Option<OsString> {
+    std::env::var_os("PATH")
 }
 
 /// The provider for one launch of `cli`: `requested`, else the remembered one, else the only fit.
 pub async fn pick(store: &Store, cli: Cli, requested: Option<&str>) -> Result<Pick> {
     let (login, machine) = granted(store).await?.ok_or_else(not_logged_in)?;
     if let Some(id) = requested {
-        return offer(&machine, &login.server, cli, id).map(Pick::Use);
+        return offer(&machine, &login.server, cli, id, path().as_deref()).map(Pick::Use);
     }
-    let mut offers = offers(&machine, cli);
+    let mut offers = offers(&machine, cli, path().as_deref());
     // A remembered provider that no longer fits is asked about again.
     if let Some(remembered) = defaults::load(store.dir())?.get(&cli.to_string())
         && let Some(index) = offers.iter().position(|offer| &offer.id == remembered)
@@ -115,7 +151,7 @@ pub fn remember(store: &Store, cli: Cli, provider: &str) -> Result<()> {
 /// `ags use <cli> <provider>`: checks the provider, then remembers it.
 pub async fn use_provider(store: &Store, cli: Cli, provider: &str) -> Result<()> {
     let (login, machine) = granted(store).await?.ok_or_else(not_logged_in)?;
-    offer(&machine, &login.server, cli, provider)?;
+    offer(&machine, &login.server, cli, provider, path().as_deref())?;
     remember(store, cli, provider)
 }
 
@@ -175,13 +211,24 @@ pub async fn launch(
         &launch_id,
     )
     .await?;
+    let project = match offer.provider_type.as_str() {
+        VERTEX => Some(credentials.vertex_project(&offer.id)?),
+        _ => None,
+    };
+    let upstream = Upstream {
+        id: &offer.id,
+        provider_type: &offer.provider_type,
+        region: offer.region.as_deref(),
+        project: project.as_deref(),
+    };
     let setup = cli.setup(
-        &offer.provider_type,
+        upstream,
         proxy.base_url(),
         proxy.secret(),
         store.dir(),
         |name| std::env::var(name).ok(),
     )?;
+    let setup_notes = setup.notes;
     let name = OsString::from(cli.to_string());
     let program = program.unwrap_or(&name);
     let mut command = Command::new(program);
@@ -190,11 +237,24 @@ pub async fn launch(
         .args(setup.args)
         .args(args)
         .envs(isolation.env)
+        .envs(credentials.cloud_env(&offer.id, &offer.provider_type)?)
         .envs(setup.env)
         .envs(no_proxy(|name| std::env::var(name).ok()))
         .kill_on_drop(true);
-    for name in isolation.unset.iter().chain(setup.unset) {
+    for name in &isolation.unset {
         command.env_remove(name);
+    }
+    if cli == Cli::Claude
+        && offer.provider_type == VERTEX
+        && let Some(location) = &offer.region
+    {
+        for (name, note) in stray_model_regions(&offer.id, location, std::env::vars_os()) {
+            command.env_remove(name);
+            eprintln!("ags: {note}");
+        }
+    }
+    for note in &setup_notes {
+        eprintln!("ags: {note}");
     }
     die_with_parent(&mut command);
     let status = wait(command, program).await;
@@ -312,6 +372,77 @@ pub(crate) async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, value)| ((*id).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn cloud_machine(regions: Option<&[(&str, &str)]>) -> Machine {
+        Machine {
+            account: "me@example.com".into(),
+            name: "ags".into(),
+            providers: vec!["aws".into(), "gcp".into(), "vpce".into()],
+            provider_types: map(&[("aws", "bedrock"), ("gcp", "vertex"), ("vpce", "bedrock")]),
+            provider_regions: regions.map(map),
+            provider_locations: map(&[("gcp", "us-east5")]),
+        }
+    }
+
+    /// A `PATH` value whose one dir holds an executable `gcloud`.
+    #[cfg(unix)]
+    fn gcloud() -> (std::path::PathBuf, OsString) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::store::tests::scratch();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gcloud"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join("gcloud"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        (dir.clone(), dir.into_os_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_is_offered_bedrock_on_a_regional_endpoint_and_vertex_with_gcloud() {
+        let machine = cloud_machine(Some(&[("aws", "eu-west-1")]));
+        let (dir, path) = gcloud();
+        let ids = |cli, path: Option<&OsStr>| {
+            offers(&machine, cli, path)
+                .into_iter()
+                .map(|offer| (offer.id, offer.region))
+                .collect::<Vec<_>>()
+        };
+        let aws = ("aws".to_owned(), Some("eu-west-1".to_owned()));
+        let gcp = ("gcp".to_owned(), Some("us-east5".to_owned()));
+        assert_eq!(ids(Cli::Codex, Some(&path)), [aws.clone(), gcp.clone()]);
+        assert_eq!(ids(Cli::Codex, None), std::slice::from_ref(&aws));
+        assert_eq!(
+            ids(Cli::Claude, None),
+            [aws, gcp, ("vpce".to_owned(), None)]
+        );
+        let server = "https://aegis.example";
+        let refused = |machine: &Machine, id, path| {
+            offer(machine, server, Cli::Codex, id, path)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused(&machine, "vpce", Some(&path)),
+            "codex can't run on vpce, a bedrock provider without a regional endpoint"
+        );
+        assert_eq!(
+            refused(&machine, "gcp", None),
+            "codex can't run on gcp: Codex signs in to Vertex with gcloud, which is not on PATH; install the Google Cloud CLI"
+        );
+        let old = cloud_machine(None);
+        assert_eq!(
+            refused(&old, "aws", Some(&path)),
+            "codex can't run on aws until the Aegis server is updated to name its region"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn the_cli_reaches_loopback_directly_whichever_spelling_its_proxy_uses() {

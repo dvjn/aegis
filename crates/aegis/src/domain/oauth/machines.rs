@@ -241,6 +241,8 @@ impl OAuthService {
             name: row.name,
             providers: parse_providers(&row.allowed_providers)?,
             provider_types: Default::default(),
+            provider_regions: Default::default(),
+            provider_locations: Default::default(),
         })
     }
 

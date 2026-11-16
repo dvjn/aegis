@@ -3501,6 +3501,7 @@ mod tests {
                 "name": "ags on laptop",
                 "providers": ["claude"],
                 "provider_types": {"claude": "claude_subscription"},
+                "provider_regions": {},
             })
         );
 

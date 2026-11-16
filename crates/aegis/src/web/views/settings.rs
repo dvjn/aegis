@@ -85,6 +85,7 @@ pub struct NewProvider {
     pub id: String,
     pub kind: String,
     pub region: String,
+    pub location: String,
     pub base_url: String,
 }
 
@@ -186,12 +187,17 @@ pub fn providers_page(view: &ProvidersView<'_>) -> Markup {
                                         }
                                     }
                                 }
-                                // Shown only while Amazon Bedrock is the selected type; see
-                                // `.bedrock-only` in the stylesheet.
+                                // Each shown only while its type is selected; see `.bedrock-only`
+                                // and `.vertex-only` in the stylesheet.
                                 div class="bedrock-only" {
                                     label for="provider-region" { "Region" }
                                     input id="provider-region" name="region" maxlength="40" pattern="[a-z0-9-]+"
                                         placeholder="us-east-1" value=(view.new.region);
+                                }
+                                div class="vertex-only" {
+                                    label for="provider-location" { "Location" }
+                                    input id="provider-location" name="location" maxlength="40" pattern="[a-z0-9-]+"
+                                        placeholder="global, or one such as us-east5" value=(view.new.location);
                                 }
                                 details class="advanced" open[!view.new.base_url.is_empty()] {
                                     summary { "Advanced" }
@@ -238,7 +244,7 @@ fn provider_row(view: &ProvidersView<'_>, provider: &ProviderConfig, inherited: 
             } @else {
                 td {
                     @if url == default { span class="cell-absent" { "default" } }
-                    @else if let Some(region) = provider.kind.bedrock_region() { (region) }
+                    @else if let Some(region) = provider.kind.bedrock_region().or_else(|| provider.kind.vertex_location()) { (region) }
                     @else { code { (url) } }
                 }
                 td { (usage_text(keys, apps)) }

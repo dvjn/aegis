@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 aegis-wire = { workspace = true }
 anyhow = "1.0.104"
-axum = { workspace = true }
+axum = { workspace = true, features = ["http2"] }
 clap = { workspace = true, features = ["env"] }
 getrandom = "0.4.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "http2", "json", "rustls-no-provider", "stream"] }

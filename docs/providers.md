@@ -12,7 +12,7 @@ A provider is an upstream that clients reach at `/providers/<id>/…`. Clients k
 | `codex_subscription` | ChatGPT's Codex backend |
 | `typesafe` | TypeSafe API |
 | `bedrock` | Amazon Bedrock in one region (default `us-east-1`). Clients must use a Bedrock API key; AWS credentials that sign requests are rejected, because Aegis changes the signed host and body. |
-| `vertex` | Google Vertex AI, at the location each request names |
+| `vertex` | Google Vertex AI, at the location each request names, or only at the region set for it (a region, `eu` or `us`) |
 
 Every type has a default upstream. A custom base URL replaces it, for a proxy or a private endpoint.
 
@@ -51,6 +51,7 @@ The commands manage instance providers and guardrails, and work on the server's 
 ```sh
 aegis provider add claude --type claude_subscription
 aegis provider add aws --type bedrock --region eu-west-1
+aegis provider add gcp --type vertex --region us-east5
 aegis provider add work --type codex_subscription --base-url https://proxy.example.com/codex
 aegis provider update work --default-url
 aegis provider list

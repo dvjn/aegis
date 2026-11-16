@@ -6,6 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use aegis_wire::provider_type::{BEDROCK, VERTEX};
+
 use crate::{
     domain::{DomainError, Principal},
     oauth::State as AppState,
@@ -75,9 +77,16 @@ async fn authenticate(
 async fn read(state: &AppState, headers: &HeaderMap) -> Result<Response, Failure> {
     let (principal, issuer) = authenticate(state, headers).await?;
     let mut machine = state.domain.oauth().machine(&principal, &issuer).await?;
-    machine.provider_types = state
+    let user = principal.user_id().to_string();
+    machine.provider_types = state.gateway.provider_types(&user, &machine.providers);
+    machine.provider_regions = Some(state.gateway.provider_regions(
+        &user,
+        &machine.providers,
+        BEDROCK,
+    ));
+    machine.provider_locations = state
         .gateway
-        .provider_types(&principal.user_id().to_string(), &machine.providers);
+        .provider_regions(&user, &machine.providers, VERTEX);
     Ok(Json(machine).into_response())
 }
 

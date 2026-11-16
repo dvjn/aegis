@@ -125,6 +125,13 @@ pub struct Machine {
     /// The type of each granted provider that still exists, by ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_types: BTreeMap<String, String>,
+    /// The AWS region of each granted Bedrock provider whose endpoint names one, by ID. `None` from
+    /// a server too old to report regions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_regions: Option<BTreeMap<String, String>>,
+    /// The location of each granted Vertex provider whose endpoint serves one location only, by ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_locations: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -163,6 +170,8 @@ mod tests {
         )
         .unwrap();
         assert!(machine.provider_types.is_empty());
+        assert!(machine.provider_regions.is_none());
+        assert!(machine.provider_locations.is_empty());
     }
 
     #[test]
