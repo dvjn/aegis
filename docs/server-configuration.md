@@ -36,13 +36,13 @@ Without `SMTP_HOST`, Aegis writes emails like password-reset links to the log.
 
 - `AEGIS_CONFIG`: path to the config file, default `config.toml`
 
-Every key is optional; the values shown are the defaults.
+Every key is optional. Except for `public_url`, the values shown are the defaults.
 
 ```toml
-http_addr = "127.0.0.1:8765"
+public_url = "https://aegis.example.com"
 database_url = "sqlite://data/aegis.db?mode=rwc"
-max_capture_bytes = 16777216 # 16MiB
-# public_url = "https://aegis.example.com"
+http_addr = "127.0.0.1:8765"   # 0.0.0.0:8765 for listening on all interfaces
+max_capture_bytes = 16777216   # 16MiB
 registration_enabled = false   # allow sign-up through the web form
 
 [pricing]
