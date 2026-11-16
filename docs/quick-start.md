@@ -72,8 +72,6 @@ claude
 
 Aegis is bring your own credentials. Provider credentials stay on the machine, and Aegis does not store them.
 
-For clients and automation that can't use ags, [configure the client by hand](clients.md) with an API key.
-
 ## Next steps
 
 - [Use ags](ags.md).
