@@ -15,8 +15,7 @@ use clap::ValueEnum;
 use crate::{credentials::on_path, proxy::SECRET_HEADER, store::create_private_dir};
 
 /// Carries the proxy's secret to the CLI.
-const SECRET_ENV: &str = "AGS_LAUNCH_SECRET";
-pub(crate) const PI_EXTENSION_NAME: &str = "pi-extension.js";
+pub(crate) const SECRET_ENV: &str = "AGS_LAUNCH_SECRET";
 /// Codex has no Google sign-in for a custom provider, so it asks gcloud for each token.
 const GCLOUD: &str = "gcloud";
 /// gcloud's own config for those tokens, empty so that no impersonation or account of the
@@ -150,8 +149,12 @@ impl Cli {
                         ("AWS_REGION", aws_region(self, upstream, inherited)?),
                     ]),
                     VERTEX => {
-                        let (project, location) =
-                            vertex_location(upstream, "CLOUD_ML_REGION", inherited, &mut setup)?;
+                        let (project, location) = vertex_location(
+                            upstream,
+                            "CLOUD_ML_REGION",
+                            inherited,
+                            &mut setup.notes,
+                        )?;
                         setup.env.extend([
                             ("CLAUDE_CODE_USE_VERTEX", "1".to_owned()),
                             ("ANTHROPIC_VERTEX_BASE_URL", base_url.to_owned()),
@@ -176,7 +179,7 @@ impl Cli {
                             upstream,
                             "GOOGLE_CLOUD_LOCATION",
                             inherited,
-                            &mut setup,
+                            &mut setup.notes,
                         )?;
                         let config = dir.join(GCLOUD_CONFIG);
                         create_private_dir(&config)?;
@@ -232,51 +235,15 @@ impl Cli {
                 .collect();
                 setup.env.push((SECRET_ENV, secret.to_owned()));
             }
-            Self::Pi => {
-                let source = pi_extension();
-                let extension = dir.join(PI_EXTENSION_NAME);
-                if std::fs::read(&extension).ok().as_deref() != Some(source.as_bytes()) {
-                    crate::store::write_private(dir, PI_EXTENSION_NAME, source.as_bytes())?;
-                }
-                let (provider, base_url) = match provider_type {
-                    CLAUDE_SUBSCRIPTION => ("anthropic", base_url.to_owned()),
-                    CODEX_SUBSCRIPTION => ("openai-codex", base_url.to_owned()),
-                    BEDROCK => {
-                        let region = aws_region(self, upstream, inherited)?;
-                        setup.env.push(("AWS_REGION", region));
-                        ("amazon-bedrock", base_url.to_owned())
-                    }
-                    _ => {
-                        let (project, location) = vertex_location(
-                            upstream,
-                            "GOOGLE_CLOUD_LOCATION",
-                            inherited,
-                            &mut setup,
-                        )?;
-                        // pi leaves the project and location out of its paths once its base URL moves.
-                        let base_url =
-                            format!("{base_url}/v1/projects/{project}/locations/{location}");
-                        setup.env.extend([
-                            ("GOOGLE_CLOUD_PROJECT", project.to_owned()),
-                            ("GOOGLE_CLOUD_LOCATION", location),
-                        ]);
-                        ("google-vertex", base_url)
-                    }
-                };
-                setup.args = vec!["--extension".into(), extension.into()];
-                setup.env.extend([
-                    ("AGS_PI_PROVIDER", provider.to_owned()),
-                    ("AGS_PI_BASE_URL", base_url),
-                    (SECRET_ENV, secret.to_owned()),
-                ]);
-            }
+            // pi reaches several providers at once, so a pi launch sets it up by its routes.
+            Self::Pi => bail!("pi is set up by the routes of its launch"),
         }
         Ok(setup)
     }
 }
 
 /// The region of the provider's endpoint, else the one the user's AWS setup names.
-fn aws_region(
+pub(crate) fn aws_region(
     cli: Cli,
     upstream: Upstream<'_>,
     inherited: impl Fn(&str) -> Option<String>,
@@ -295,11 +262,11 @@ fn aws_region(
 
 /// The project and location of a Vertex request path. A provider whose host serves one location
 /// uses it, with a note when `variable` names another; otherwise `variable` decides, else `global`.
-fn vertex_location<'a>(
+pub(crate) fn vertex_location<'a>(
     upstream: Upstream<'a>,
     variable: &str,
     inherited: impl Fn(&str) -> Option<String>,
-    setup: &mut Setup,
+    notes: &mut Vec<String>,
 ) -> Result<(&'a str, String)> {
     let Some(project) = upstream.project else {
         bail!("{} names no Google Cloud project", upstream.id);
@@ -307,9 +274,7 @@ fn vertex_location<'a>(
     let theirs = inherited(variable);
     let location = match (upstream.region, theirs) {
         (Some(fixed), Some(theirs)) if theirs != fixed => {
-            setup
-                .notes
-                .push(ignored(upstream.id, fixed, variable, &theirs));
+            notes.push(ignored(upstream.id, fixed, variable, &theirs));
             fixed.to_owned()
         }
         (Some(fixed), _) => fixed.to_owned(),
@@ -360,22 +325,6 @@ pub(crate) struct Setup {
     pub env: Vec<(&'static str, String)>,
     /// What the user should hear about this launch's setup.
     pub notes: Vec<String>,
-}
-
-fn pi_extension() -> String {
-    format!(
-        "\
-// Written by ags: sends one pi provider through this launch's Aegis proxy.
-export default function (pi) {{
-  const provider = process.env.AGS_PI_PROVIDER;
-  const baseUrl = process.env.AGS_PI_BASE_URL;
-  const secret = process.env.{SECRET_ENV};
-  if (provider && baseUrl && secret) {{
-    pi.registerProvider(provider, {{ baseUrl, headers: {{ \"{SECRET_HEADER}\": secret }} }});
-  }}
-}}
-"
-    )
 }
 
 fn toml_string(value: &str) -> String {
@@ -452,6 +401,10 @@ mod tests {
             assert_eq!(Cli::from_str(&cli.to_string(), false).unwrap(), *cli);
             for provider_type in cli.provider_types() {
                 assert!(cli.runs_on(provider_type));
+                // A pi launch is set up by its routes; see the pi module.
+                if *cli == Cli::Pi {
+                    continue;
+                }
                 let setup = cli
                     .setup(upstream(provider_type), BASE_URL, SECRET, &dir, |name| {
                         (name == "PATH").then(|| path.clone())
@@ -617,13 +570,6 @@ mod tests {
             })
             .unwrap();
         assert!(same.notes.is_empty());
-        let pi = Cli::Pi
-            .setup(located, BASE_URL, SECRET, &dir, |name| {
-                (name == "GOOGLE_CLOUD_LOCATION").then(|| "global".to_owned())
-            })
-            .unwrap();
-        assert_eq!(env(&pi, "GOOGLE_CLOUD_LOCATION"), Some("europe-west4"));
-        assert_eq!(pi.notes.len(), 1);
         let models = stray_model_regions(
             "work",
             "europe-west4",
@@ -732,70 +678,6 @@ mod tests {
             let parsed: toml::Table = table.parse().expect("every setting is TOML");
             assert_eq!(parsed["model_provider"].as_str(), Some("ags"));
         }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn pi_loads_an_extension_that_moves_one_provider() {
-        let dir = crate::store::tests::scratch();
-        let codex = setup(Cli::Pi, CODEX_SUBSCRIPTION, &dir);
-        let extension = dir.join(PI_EXTENSION_NAME);
-        assert_eq!(
-            codex.args,
-            [OsString::from("--extension"), extension.clone().into()]
-        );
-        let source = std::fs::read_to_string(&extension).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // A rewrite renames a new file into place, which changes the inode.
-            let inode = || std::fs::metadata(&extension).unwrap().ino();
-            let written = inode();
-            setup(Cli::Pi, CODEX_SUBSCRIPTION, &dir);
-            assert_eq!(inode(), written, "an unchanged extension is not rewritten");
-        }
-        assert!(source.contains("process.env.AGS_LAUNCH_SECRET"), "{source}");
-        assert!(
-            source.contains("\"x-ags-launch-secret\": secret"),
-            "{source}"
-        );
-        assert_eq!(env(&codex, "AGS_PI_PROVIDER"), Some("openai-codex"));
-        assert_eq!(Cli::Pi.base_path(CODEX_SUBSCRIPTION), "/codex");
-        assert_eq!(Cli::Pi.base_path(CLAUDE_SUBSCRIPTION), "");
-        let claude = setup(Cli::Pi, CLAUDE_SUBSCRIPTION, &dir);
-        assert_eq!(env(&claude, "AGS_PI_PROVIDER"), Some("anthropic"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn pi_moves_its_own_bedrock_and_vertex_providers() {
-        let dir = crate::store::tests::scratch();
-        let bedrock = setup(Cli::Pi, BEDROCK, &dir);
-        assert_eq!(env(&bedrock, "AGS_PI_PROVIDER"), Some("amazon-bedrock"));
-        assert_eq!(env(&bedrock, "AGS_PI_BASE_URL"), Some(BASE_URL));
-        assert_eq!(env(&bedrock, "AWS_REGION"), Some("eu-west-1"));
-
-        let vertex = Cli::Pi
-            .setup(upstream(VERTEX), BASE_URL, SECRET, &dir, |name| {
-                (name == "GOOGLE_CLOUD_LOCATION").then(|| "europe-west4".to_owned())
-            })
-            .unwrap();
-        assert_eq!(env(&vertex, "AGS_PI_PROVIDER"), Some("google-vertex"));
-        assert_eq!(
-            env(&vertex, "AGS_PI_BASE_URL"),
-            Some("http://127.0.0.1:1/v1/projects/proj/locations/europe-west4")
-        );
-        assert_eq!(env(&vertex, "GOOGLE_CLOUD_PROJECT"), Some("proj"));
-        assert_eq!(env(&vertex, "GOOGLE_CLOUD_LOCATION"), Some("europe-west4"));
-        let without = Upstream {
-            project: None,
-            ..upstream(VERTEX)
-        };
-        assert!(
-            Cli::Pi
-                .setup(without, BASE_URL, SECRET, &dir, |_| None)
-                .is_err()
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

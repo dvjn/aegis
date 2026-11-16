@@ -1,5 +1,6 @@
-//! The private loopback proxy of one launch. It forwards the CLI's requests to one provider on
-//! the paired gateway and adds the machine's token, so the CLI never holds it.
+//! The private loopback proxy of one launch. It forwards the CLI's requests to the launch's
+//! providers on the paired gateway and adds the machine's token, so the CLI never holds it. Each
+//! provider has its own path prefix, which a launch on one provider leaves empty.
 //!
 //! Loopback is shared by every user and browser on the machine, so the proxy answers only
 //! requests that name its address as their host (no DNS rebinding), carry no `Origin` (no web
@@ -35,7 +36,7 @@ pub(crate) const SECRET_HEADER: &str = "x-ags-launch-secret";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct Proxy {
-    base_url: String,
+    origin: String,
     secret: String,
     target: Arc<Target>,
     task: JoinHandle<()>,
@@ -49,13 +50,45 @@ pub(crate) struct Ended {
     pub logged_out: Option<anyhow::Error>,
 }
 
+/// What the proxy does with requests under one path prefix.
+pub(crate) struct Route {
+    /// What the CLI's base URL adds after the proxy's address, such as `/<id>`; empty when the
+    /// launch has one provider.
+    pub prefix: String,
+    pub to: To,
+}
+
+pub(crate) enum To {
+    /// Provider `id` on the gateway; `base_path` is what the CLI adds that the gateway does not expect.
+    Provider { id: String, base_path: &'static str },
+    /// Answers every request with this message.
+    Refusal(String),
+}
+
+impl Route {
+    pub(crate) fn provider(prefix: String, id: &str, base_path: &'static str) -> Self {
+        Self {
+            prefix,
+            to: To::Provider {
+                id: id.to_owned(),
+                base_path,
+            },
+        }
+    }
+
+    /// The path that comes before what the CLI sends.
+    fn base(&self) -> String {
+        match &self.to {
+            To::Provider { base_path, .. } => format!("{}{base_path}", self.prefix),
+            To::Refusal(_) => self.prefix.clone(),
+        }
+    }
+}
+
 struct Target {
     store: Store,
     server: String,
-    /// `/providers/<id>` on the server.
-    route: String,
-    /// The path the CLI adds that the gateway does not expect.
-    base_path: String,
+    routes: Vec<Route>,
     host: String,
     secret: HeaderValue,
     launch_id: HeaderValue,
@@ -69,8 +102,7 @@ impl Proxy {
     pub(crate) async fn start(
         store_dir: &Path,
         login: Login,
-        provider: &str,
-        base_path: &str,
+        routes: Vec<Route>,
         launch_id: &str,
     ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -81,8 +113,7 @@ impl Proxy {
         let target = Arc::new(Target {
             store: Store::at(store_dir),
             server: login.server.clone(),
-            route: format!("/providers/{provider}"),
-            base_path: base_path.to_owned(),
+            routes,
             host: host.clone(),
             secret: HeaderValue::from_str(&secret)?,
             launch_id: HeaderValue::from_str(launch_id).context("an invalid launch ID")?,
@@ -99,16 +130,16 @@ impl Proxy {
             let _ = axum::serve(listener, app).await;
         });
         Ok(Self {
-            base_url: format!("http://{host}{base_path}"),
+            origin: format!("http://{host}"),
             secret,
             target,
             task,
         })
     }
 
-    /// The URL the CLI uses in place of its provider's.
-    pub(crate) fn base_url(&self) -> &str {
-        &self.base_url
+    /// The proxy's scheme and address, which each route's base URL starts with.
+    pub(crate) fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// The value the CLI sends in [`SECRET_HEADER`].
@@ -161,23 +192,27 @@ impl Target {
                 .is_some_and(|secret| bool::from(secret.as_bytes().ct_eq(self.secret.as_bytes())))
     }
 
-    /// The path and query after the base path.
-    fn rest<'a>(&self, uri: &'a Uri) -> Option<&'a str> {
+    /// The route of a request, and its path and query after the route's base.
+    fn route<'a>(&self, uri: &'a Uri) -> Option<(&To, &'a str)> {
         let path = uri.path_and_query().map_or("/", |value| value.as_str());
-        let rest = path
-            .as_bytes()
-            .starts_with(self.base_path.as_bytes())
-            .then(|| path.get(self.base_path.len()..))
-            .flatten()?;
-        (rest.is_empty() || rest.starts_with(['/', '?'])).then_some(rest)
+        self.routes.iter().find_map(|route| {
+            let base = route.base();
+            let rest = path
+                .as_bytes()
+                .starts_with(base.as_bytes())
+                .then(|| path.get(base.len()..))
+                .flatten()?;
+            (rest.is_empty() || rest.starts_with(['/', '?'])).then_some((&route.to, rest))
+        })
     }
 
-    /// The gateway URL for `rest`, which must stay under this provider's route.
-    fn url(&self, rest: &str) -> Option<Url> {
-        let url = Url::parse(&format!("{}{}{rest}", self.server, self.route)).ok()?;
+    /// The gateway URL of provider `id` for `rest`, which must stay under the provider's route.
+    fn url(&self, id: &str, rest: &str) -> Option<Url> {
+        let route = format!("/providers/{id}");
+        let url = Url::parse(&format!("{}{route}{rest}", self.server)).ok()?;
         let path = url.path();
         let inside = path
-            .strip_prefix(&self.route)
+            .strip_prefix(&route)
             .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'));
         inside.then_some(url)
     }
@@ -218,7 +253,12 @@ async fn forward(State(target): State<Arc<Target>>, request: Request) -> Respons
             "the launch proxy does not open tunnels (CONNECT)",
         );
     }
-    let Some(url) = target.rest(&parts.uri).and_then(|rest| target.url(rest)) else {
+    let url = match target.route(&parts.uri) {
+        Some((To::Provider { id, .. }, rest)) => target.url(id, rest),
+        Some((To::Refusal(message), _)) => return failure(StatusCode::FORBIDDEN, message),
+        None => None,
+    };
+    let Some(url) = url else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if parts.headers.contains_key(header::UPGRADE) {
@@ -308,12 +348,15 @@ mod tests {
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
-    fn target(base_path: &str) -> Target {
+    fn target(base_path: &'static str) -> Target {
+        routed(vec![Route::provider(String::new(), "claude", base_path)])
+    }
+
+    fn routed(routes: Vec<Route>) -> Target {
         Target {
             store: Store::at("unused"),
             server: "https://aegis.example".into(),
-            route: "/providers/claude".into(),
-            base_path: base_path.into(),
+            routes,
             host: "127.0.0.1:4000".into(),
             secret: HeaderValue::from_static(SECRET),
             launch_id: HeaderValue::from_static("launch"),
@@ -414,11 +457,21 @@ mod tests {
         }
     }
 
+    /// The gateway URL a request to `path` goes to.
+    fn forwarded(target: &Target, path: &'static str) -> Option<String> {
+        match target.route(&Uri::from_static(path))? {
+            (To::Provider { id, .. }, rest) => target.url(id, rest).map(String::from),
+            (To::Refusal(_), _) => None,
+        }
+    }
+
     #[test]
     fn the_base_path_is_removed_and_nothing_else_matches() {
         let plain = target("");
         let rest = |target: &Target, path: &'static str| {
-            target.rest(&Uri::from_static(path)).map(str::to_owned)
+            target
+                .route(&Uri::from_static(path))
+                .map(|(_, rest)| rest.to_owned())
         };
         assert_eq!(
             rest(&plain, "/v1/messages").as_deref(),
@@ -439,11 +492,14 @@ mod tests {
     fn a_request_stays_under_its_provider() {
         let target = target("");
         assert_eq!(
-            target.url("/v1/messages?beta=true").unwrap().as_str(),
+            target
+                .url("claude", "/v1/messages?beta=true")
+                .unwrap()
+                .as_str(),
             "https://aegis.example/providers/claude/v1/messages?beta=true"
         );
         assert_eq!(
-            target.url("").unwrap().as_str(),
+            target.url("claude", "").unwrap().as_str(),
             "https://aegis.example/providers/claude"
         );
         for escape in [
@@ -452,8 +508,53 @@ mod tests {
             "/..",
             "x",
         ] {
-            assert!(target.url(escape).is_none(), "{escape}");
+            assert!(target.url("claude", escape).is_none(), "{escape}");
         }
+    }
+
+    #[tokio::test]
+    async fn each_provider_has_its_own_prefix_and_a_refused_one_says_why() {
+        let target = Arc::new(routed(vec![
+            Route::provider("/work".into(), "work", ""),
+            Route::provider("/chat".into(), "chat", "/codex"),
+            Route {
+                prefix: "/.off/google-vertex".into(),
+                to: To::Refusal("no vertex provider".into()),
+            },
+        ]));
+        assert_eq!(
+            forwarded(&target, "/work/v1/messages?beta=true").as_deref(),
+            Some("https://aegis.example/providers/work/v1/messages?beta=true")
+        );
+        assert_eq!(
+            forwarded(&target, "/chat/codex/responses").as_deref(),
+            Some("https://aegis.example/providers/chat/responses")
+        );
+        for path in [
+            "/v1/messages",
+            "/workshop/v1/messages",
+            "/chat/responses",
+            "/work/../chat/codex/responses",
+            "/.off",
+        ] {
+            assert_eq!(forwarded(&target, path), None, "{path}");
+        }
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/.off/google-vertex/v1/projects/p")
+            .header(header::HOST, "127.0.0.1:4000")
+            .header(SECRET_HEADER, SECRET)
+            .body(Body::empty())
+            .unwrap();
+        let response = forward(State(target), request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["message"],
+            "ags: no vertex provider"
+        );
     }
 
     #[test]

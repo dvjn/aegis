@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ags::{Cli, Credentials, Home, Need, Offer, Pick, Step, StepStatus, Store};
+use ags::{Cli, Credentials, Home, Need, Offer, Pick, Step, StepStatus, Store, TypeDefault};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
 use crate::{pairing::approve, shared::gateway::Gateway};
@@ -83,26 +83,29 @@ async fn a_launched_cli_reaches_its_provider_only_through_its_own_proxy() {
     approval.unwrap().await.unwrap();
     let token = store.load().unwrap().unwrap().access_token;
 
-    // One provider fits Claude Code, so it is used without asking; pi fits both.
+    // One provider fits Claude Code, so it is used without asking; pi uses each for its type.
     let Pick::Use(claude) = ags::pick(&store, Cli::Claude, None).await.unwrap() else {
         panic!("claude has one provider");
     };
     assert_eq!(claude, offer("claude", "claude_subscription"));
-    let Pick::Ask(offers) = ags::pick(&store, Cli::Pi, None).await.unwrap() else {
-        panic!("pi has two providers");
-    };
+    let plan = ags::plan_pi(&store, None).await.unwrap();
     assert_eq!(
-        offers,
+        plan.types,
         [
-            offer("claude", "claude_subscription"),
-            offer("codex", "codex_subscription")
+            (
+                "claude_subscription".to_owned(),
+                TypeDefault::Use(offer("claude", "claude_subscription"))
+            ),
+            (
+                "codex_subscription".to_owned(),
+                TypeDefault::Use(offer("codex", "codex_subscription"))
+            ),
+            ("bedrock".to_owned(), TypeDefault::None),
+            ("vertex".to_owned(), TypeDefault::None),
         ]
     );
-    ags::remember(&store, Cli::Pi, "codex").unwrap();
-    assert!(matches!(
-        ags::pick(&store, Cli::Pi, None).await.unwrap(),
-        Pick::Use(remembered) if remembered.id == "codex"
-    ));
+    let used = ags::use_provider(&store, Cli::Pi, "codex").await.unwrap();
+    assert_eq!(used, offer("codex", "codex_subscription"));
     for (cli, provider, error) in [
         (
             Cli::Claude,
@@ -244,18 +247,22 @@ exit 7"#,
         &bin,
         "pi",
         r#"printf '%s\n' "$@" > "$out/pi-args"
-printf '%s' "$AGS_PI_PROVIDER" > "$out/pi-provider"
 printf '%s' "$PI_CODING_AGENT_DIR" > "$out/pi-config"
-call -X POST "$AGS_PI_BASE_URL/responses" -H 'content-type: application/json' \
+base_url() { printf '%s' "$AGS_PI_ROUTES" | grep -o "\"id\":\"$1\"[^}]*" | sed 's/.*"baseUrl":"\([^"]*\)".*/\1/'; }
+codex="$(base_url openai-codex)"
+printf '%s' "$codex" > "$out/pi-codex"
+call -X POST "$codex/responses" -H 'content-type: application/json' \
   -H "x-ags-launch-secret: $AGS_LAUNCH_SECRET" \
   --data '{"model":"gpt-test","input":"hi"}' > "$out/pi-status"
+call -X POST "$(base_url amazon-bedrock)/model/m/converse" \
+  -H "x-ags-launch-secret: $AGS_LAUNCH_SECRET" > "$out/pi-ungranted"
 kill -TERM $$"#,
     );
-    let launched = ags::launch(
+    let plan = ags::plan_pi(&store, None).await.unwrap();
+    let launched = ags::launch_pi(
         &store,
         &credentials,
-        Cli::Pi,
-        &offer("codex", "codex_subscription"),
+        &plan,
         vec!["--print".into()],
         Some(pi.as_os_str()),
     )
@@ -272,16 +279,17 @@ kill -TERM $$"#,
     assert_eq!(pi_args[0], "--extension");
     assert!(pi_args[1].ends_with("pi-extension.js"));
     assert_eq!(pi_args[2..], ["--print"]);
-    assert_eq!(read(&bin, "pi-provider"), "openai-codex");
+    assert!(
+        read(&bin, "pi-codex").ends_with("/codex/codex"),
+        "{}",
+        read(&bin, "pi-codex")
+    );
     assert_eq!(
         read(&bin, "pi-config"),
-        credentials
-            .cli_dir("codex", Cli::Pi)
-            .unwrap()
-            .to_str()
-            .unwrap()
+        store.dir().join("pi").to_str().unwrap()
     );
     assert_eq!(read(&bin, "pi-status"), "200");
+    assert_eq!(read(&bin, "pi-ungranted"), "403");
     let received = gateway.upstream.received();
     assert_eq!(received.last().unwrap().path, "/responses");
 

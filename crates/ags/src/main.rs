@@ -6,7 +6,7 @@ use std::{
 
 use ags::{
     Approval, Cli, CliDefault, Credentials, Home, Logout, Need, Offer, Pick, Step, StepStatus,
-    Store, product, provider_text,
+    Store, TypeDefault, product, provider_text,
 };
 use anyhow::bail;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -160,10 +160,18 @@ async fn launch(
 ) -> anyhow::Result<Exit> {
     // An empty AGS_PROVIDER counts as unset.
     let provider = provider.as_deref().filter(|id| !id.is_empty());
+    if cli == Cli::Pi {
+        return launch_pi(store, credentials, provider, args).await;
+    }
     let offer = match ags::pick(store, cli, provider).await? {
         Pick::Use(offer) => offer,
         Pick::Ask(offers) => {
-            let offer = ask(cli, offers)?;
+            if !interactive() {
+                bail!(
+                    "{cli} can run on several providers; choose one with `ags use {cli} <provider>`, or for one launch with `ags -p <provider> {cli}` or AGS_PROVIDER"
+                );
+            }
+            let offer = ask(&format!("Which provider should {cli} use?"), offers)?;
             ags::remember(store, cli, &offer.id)?;
             eprintln!(
                 "{cli} now uses {}. Change it with `ags use {cli} <provider>`.",
@@ -172,6 +180,63 @@ async fn launch(
             offer
         }
     };
+    set_up_for_launch(credentials, cli, &offer).await?;
+    warn(credentials, &offer.id, cli)?;
+    let launched = ags::launch(store, credentials, cli, &offer, args, None).await?;
+    if let Some(error) = launched.logged_out {
+        eprintln!("ags: {error:#}");
+    }
+    Ok(Exit::As(launched.status))
+}
+
+/// Runs pi on every provider it can use, asking once for each type that has several.
+async fn launch_pi(
+    store: &Store,
+    credentials: &Credentials,
+    provider: Option<&str>,
+    args: Vec<OsString>,
+) -> anyhow::Result<Exit> {
+    let mut plan = ags::plan_pi(store, provider).await?;
+    if interactive() {
+        let open: Vec<(String, Vec<Offer>)> = plan
+            .types
+            .iter()
+            .filter_map(|(provider_type, default)| match default {
+                TypeDefault::Ask(offers) => Some((provider_type.clone(), offers.clone())),
+                _ => None,
+            })
+            .collect();
+        for (provider_type, offers) in open {
+            let offer = ask(
+                &format!("Which {provider_type} provider should pi use?"),
+                offers,
+            )?;
+            eprintln!(
+                "pi now uses {} for {provider_type}. Change it with `ags use pi <provider>`.",
+                offer.id
+            );
+            plan.choose(store, offer)?;
+        }
+    }
+    if let Some(offer) = &plan.requested {
+        set_up_for_launch(credentials, Cli::Pi, offer).await?;
+    }
+    for notice in credentials.pi_notices()? {
+        eprintln!("ags: {notice}");
+    }
+    let launched = ags::launch_pi(store, credentials, &plan, args, None).await?;
+    if let Some(error) = launched.logged_out {
+        eprintln!("ags: {error:#}");
+    }
+    Ok(Exit::As(launched.status))
+}
+
+/// Offers to set up what `cli` needs to run on `offer`, which the launch can't go without.
+async fn set_up_for_launch(
+    credentials: &Credentials,
+    cli: Cli,
+    offer: &Offer,
+) -> anyhow::Result<()> {
     if let Some(need) = Need::of_launch(cli, &offer.provider_type)
         && !credentials.has(&offer.id, &offer.provider_type, need)?
     {
@@ -190,12 +255,7 @@ async fn launch(
             bail!("{id} has no {need}; set it up with `ags setup {id}`");
         }
     }
-    warn(credentials, &offer.id, cli)?;
-    let launched = ags::launch(store, credentials, cli, &offer, args, None).await?;
-    if let Some(error) = launched.logged_out {
-        eprintln!("ags: {error:#}");
-    }
-    Ok(Exit::As(launched.status))
+    Ok(())
 }
 
 /// Tells the user, once, about settings that keep `provider` from using its own sign-in in `cli`.
@@ -470,13 +530,9 @@ fn read_secret(prompt: &str) -> anyhow::Result<String> {
     read_answer(prompt)
 }
 
-fn ask(cli: Cli, offers: Vec<Offer>) -> anyhow::Result<Offer> {
-    if !interactive() {
-        bail!(
-            "{cli} can run on several providers; choose one with `ags use {cli} <provider>`, or for one launch with `ags -p <provider> {cli}` or AGS_PROVIDER"
-        );
-    }
-    eprintln!("Which provider should {cli} use?");
+/// Asks `question` at the terminal, for one of `offers`.
+fn ask(question: &str, offers: Vec<Offer>) -> anyhow::Result<Offer> {
+    eprintln!("{question}");
     for (number, offer) in (1..).zip(&offers) {
         eprintln!("  {number}. {} ({})", offer.id, offer.provider_type);
     }
@@ -506,12 +562,18 @@ fn defaults_table(rows: &[CliDefault]) -> String {
     let mut lines = vec![["CLI", "PROVIDER", "TYPE"].map(str::to_owned)];
     for row in rows {
         let provider = row.provider.as_deref().unwrap_or("—");
-        let provider_type = match (&row.provider, &row.provider_type) {
-            (_, Some(provider_type)) => provider_type,
-            (Some(_), None) => "not granted",
-            (None, None) => "",
+        let provider_type = match (&row.for_type, &row.provider, &row.provider_type) {
+            (Some(for_type), Some(_), Some(provider_type)) if provider_type == for_type => {
+                for_type.clone()
+            }
+            (Some(for_type), Some(_), _) => format!("{for_type} (not granted)"),
+            (Some(for_type), None, _) if !row.granted => format!("{for_type} (none granted)"),
+            (Some(for_type), None, _) => for_type.clone(),
+            (None, _, Some(provider_type)) => provider_type.clone(),
+            (None, Some(_), None) => "not granted".to_owned(),
+            (None, None, None) => String::new(),
         };
-        lines.push([&row.cli.to_string(), provider, provider_type].map(str::to_owned));
+        lines.push([row.cli.to_string(), provider.to_owned(), provider_type]);
     }
     let width = |column: usize| {
         lines
@@ -554,8 +616,11 @@ async fn run(args: Args) -> anyhow::Result<Exit> {
             cli: Some(cli),
             provider: Some(provider),
         } => {
-            ags::use_provider(&store, cli, &provider).await?;
-            println!("{cli} now uses {provider}.");
+            let offer = ags::use_provider(&store, cli, &provider).await?;
+            match cli {
+                Cli::Pi => println!("pi now uses {provider} for {}.", offer.provider_type),
+                _ => println!("{cli} now uses {provider}."),
+            }
         }
         Command::Use { .. } => match ags::cli_defaults(&store).await? {
             Some(rows) => println!("{}", defaults_table(&rows)),
@@ -737,30 +802,42 @@ mod tests {
     }
 
     #[test]
-    fn use_lists_each_cli_with_its_provider() {
+    fn use_lists_each_cli_with_its_provider_and_pis_for_each_type() {
+        use aegis_wire::provider_type::{BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, VERTEX};
+        let row =
+            |cli, for_type: Option<&str>, provider: Option<&str>, provider_type: Option<&str>| {
+                CliDefault {
+                    cli,
+                    for_type: for_type.map(str::to_owned),
+                    provider: provider.map(str::to_owned),
+                    provider_type: provider_type.map(str::to_owned),
+                    granted: for_type != Some(VERTEX),
+                }
+            };
         let rows = [
-            CliDefault {
-                cli: Cli::Claude,
-                provider: Some("claude".into()),
-                provider_type: Some(aegis_wire::provider_type::CLAUDE_SUBSCRIPTION.into()),
-            },
-            CliDefault {
-                cli: Cli::Codex,
-                provider: None,
-                provider_type: None,
-            },
-            CliDefault {
-                cli: Cli::Pi,
-                provider: Some("gone".into()),
-                provider_type: None,
-            },
+            row(Cli::Claude, None, Some("claude"), Some(CLAUDE_SUBSCRIPTION)),
+            row(Cli::Codex, None, None, None),
+            row(Cli::Codex, None, Some("gone"), None),
+            row(
+                Cli::Pi,
+                Some(CLAUDE_SUBSCRIPTION),
+                Some("claude"),
+                Some(CLAUDE_SUBSCRIPTION),
+            ),
+            row(Cli::Pi, Some(CODEX_SUBSCRIPTION), None, None),
+            row(Cli::Pi, Some(BEDROCK), Some("gone"), None),
+            row(Cli::Pi, Some(VERTEX), None, None),
         ];
         assert_eq!(
             defaults_table(&rows),
             "CLI     PROVIDER  TYPE\n\
              claude  claude    claude_subscription\n\
              codex   —\n\
-             pi      gone      not granted"
+             codex   gone      not granted\n\
+             pi      claude    claude_subscription\n\
+             pi      —         codex_subscription\n\
+             pi      gone      bedrock (not granted)\n\
+             pi      —         vertex (none granted)"
         );
     }
 

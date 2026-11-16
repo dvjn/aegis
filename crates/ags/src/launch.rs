@@ -1,5 +1,6 @@
 //! Picks the provider a CLI runs on, and runs it through its own proxy.
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     process::ExitStatus,
 };
@@ -13,8 +14,10 @@ use clap::ValueEnum;
 use crate::{
     Cli, Credentials, LoggedOut, Login, Store,
     clis::{Upstream, stray_model_regions},
-    current_login, defaults, forget,
-    proxy::Proxy,
+    current_login,
+    defaults::{self, Remembered},
+    forget, pi,
+    proxy::{Proxy, Route},
     server::Server,
 };
 
@@ -62,9 +65,73 @@ pub enum Pick {
 /// A CLI's remembered provider; `None` asks on its first launch.
 pub struct CliDefault {
     pub cli: Cli,
+    /// The provider type this default is for, for pi, which keeps one per type.
+    pub for_type: Option<String>,
     pub provider: Option<String>,
     /// `None` when the provider is no longer granted to this machine.
     pub provider_type: Option<String>,
+    /// Whether this machine has a provider of `for_type` that the CLI can run on.
+    pub granted: bool,
+}
+
+/// What pi's own provider of one type uses during a launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeDefault {
+    Use(Offer),
+    /// Several providers fit and none is remembered.
+    Ask(Vec<Offer>),
+    /// No provider of the type is granted.
+    None,
+}
+
+/// The providers of one pi launch.
+pub struct PiPlan {
+    pub(crate) server: String,
+    /// Every provider pi can use, each of which pi offers under its own ID.
+    pub(crate) offers: Vec<Offer>,
+    /// What pi's own provider of each type uses, in the order of pi's types.
+    pub types: Vec<(String, TypeDefault)>,
+    /// The provider named for this launch, which its type uses.
+    pub requested: Option<Offer>,
+    /// pi's remembered provider of each type.
+    remembered: BTreeMap<String, String>,
+}
+
+impl PiPlan {
+    #[cfg(test)]
+    pub(crate) fn of(
+        server: String,
+        offers: Vec<Offer>,
+        types: Vec<(String, TypeDefault)>,
+        requested: Option<Offer>,
+    ) -> Self {
+        Self {
+            server,
+            offers,
+            types,
+            requested,
+            remembered: BTreeMap::new(),
+        }
+    }
+
+    /// Remembers `offer` as pi's provider of its type, and uses it for this launch.
+    pub fn choose(&mut self, store: &Store, offer: Offer) -> Result<()> {
+        self.remembered
+            .insert(offer.provider_type.clone(), offer.id.clone());
+        defaults::set(
+            store.dir(),
+            Cli::Pi,
+            Remembered::ByType(self.remembered.clone()),
+        )?;
+        if let Some((_, default)) = self
+            .types
+            .iter_mut()
+            .find(|(provider_type, _)| *provider_type == offer.provider_type)
+        {
+            *default = TypeDefault::Use(offer);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn not_logged_in() -> anyhow::Error {
@@ -127,7 +194,7 @@ pub async fn pick(store: &Store, cli: Cli, requested: Option<&str>) -> Result<Pi
     }
     let mut offers = offers(&machine, cli, path().as_deref());
     // A remembered provider that no longer fits is asked about again.
-    if let Some(remembered) = defaults::load(store.dir())?.get(&cli.to_string())
+    if let Some(Remembered::One(remembered)) = defaults::load(store.dir())?.get(&cli.to_string())
         && let Some(index) = offers.iter().position(|offer| &offer.id == remembered)
     {
         return Ok(Pick::Use(offers.swap_remove(index)));
@@ -145,40 +212,141 @@ pub async fn pick(store: &Store, cli: Cli, requested: Option<&str>) -> Result<Pi
 
 /// Remembers a provider that `pick` offered.
 pub fn remember(store: &Store, cli: Cli, provider: &str) -> Result<()> {
-    defaults::set(store.dir(), cli, provider)
+    defaults::set(store.dir(), cli, Remembered::One(provider.to_owned()))
 }
 
-/// `ags use <cli> <provider>`: checks the provider, then remembers it.
-pub async fn use_provider(store: &Store, cli: Cli, provider: &str) -> Result<()> {
+/// pi's remembered provider of each type.
+fn pi_defaults(remembered: Option<&Remembered>, machine: &Machine) -> BTreeMap<String, String> {
+    match remembered {
+        Some(Remembered::ByType(by_type)) => by_type.clone(),
+        Some(Remembered::One(id)) => machine
+            .provider_types
+            .get(id)
+            .map(|provider_type| BTreeMap::from([(provider_type.clone(), id.clone())]))
+            .unwrap_or_default(),
+        None => BTreeMap::new(),
+    }
+}
+
+/// `ags use <cli> <provider>`: checks the provider, then remembers it, for pi as the provider of
+/// its type.
+pub async fn use_provider(store: &Store, cli: Cli, provider: &str) -> Result<Offer> {
     let (login, machine) = granted(store).await?.ok_or_else(not_logged_in)?;
-    offer(&machine, &login.server, cli, provider, path().as_deref())?;
-    remember(store, cli, provider)
+    let offer = offer(&machine, &login.server, cli, provider, path().as_deref())?;
+    match cli {
+        Cli::Pi => {
+            let key = cli.to_string();
+            let mut by_type = pi_defaults(defaults::load(store.dir())?.get(&key), &machine);
+            by_type.insert(offer.provider_type.clone(), offer.id.clone());
+            defaults::set(store.dir(), cli, Remembered::ByType(by_type))?;
+        }
+        _ => remember(store, cli, provider)?,
+    }
+    Ok(offer)
 }
 
-/// Every CLI's remembered provider; `None` when this machine is not logged in.
+/// Every CLI's remembered provider, and pi's of each type; `None` when this machine is not
+/// logged in.
 pub async fn cli_defaults(store: &Store) -> Result<Option<Vec<CliDefault>>> {
     let Some((_, machine)) = granted(store).await? else {
         return Ok(None);
     };
     let remembered = defaults::load(store.dir())?;
-    Ok(Some(
-        Cli::value_variants()
-            .iter()
-            .map(|&cli| {
-                let provider = remembered.get(&cli.to_string()).cloned();
-                let provider_type = provider
-                    .as_ref()
-                    .filter(|id| machine.providers.contains(id))
-                    .and_then(|id| machine.provider_types.get(id))
-                    .cloned();
-                CliDefault {
+    let granted_type = |id: &String| {
+        machine
+            .providers
+            .contains(id)
+            .then(|| machine.provider_types.get(id).cloned())
+            .flatten()
+    };
+    let mut rows = vec![];
+    for &cli in Cli::value_variants() {
+        let key = cli.to_string();
+        if cli == Cli::Pi {
+            let by_type = pi_defaults(remembered.get(&key), &machine);
+            let offers = offers(&machine, cli, path().as_deref());
+            for provider_type in cli.provider_types() {
+                let provider = by_type.get(*provider_type).cloned();
+                rows.push(CliDefault {
                     cli,
+                    for_type: Some((*provider_type).to_owned()),
+                    provider_type: provider.as_ref().and_then(granted_type),
                     provider,
-                    provider_type,
-                }
-            })
-            .collect(),
-    ))
+                    granted: offers
+                        .iter()
+                        .any(|offer| offer.provider_type == *provider_type),
+                });
+            }
+            continue;
+        }
+        let provider = match remembered.get(&key) {
+            Some(Remembered::One(id)) => Some(id.clone()),
+            _ => None,
+        };
+        rows.push(CliDefault {
+            cli,
+            for_type: None,
+            provider_type: provider.as_ref().and_then(granted_type),
+            provider,
+            granted: true,
+        });
+    }
+    Ok(Some(rows))
+}
+
+/// pi's providers for one launch: `requested` for its type, else each type's remembered provider,
+/// else its only one.
+pub async fn plan_pi(store: &Store, requested: Option<&str>) -> Result<PiPlan> {
+    let (login, machine) = granted(store).await?.ok_or_else(not_logged_in)?;
+    let path = path();
+    let requested = requested
+        .map(|id| offer(&machine, &login.server, Cli::Pi, id, path.as_deref()))
+        .transpose()?;
+    let offers = offers(&machine, Cli::Pi, path.as_deref());
+    let remembered = pi_defaults(
+        defaults::load(store.dir())?.get(&Cli::Pi.to_string()),
+        &machine,
+    );
+    Ok(pi_plan(login.server, offers, remembered, requested))
+}
+
+fn pi_plan(
+    server: String,
+    offers: Vec<Offer>,
+    remembered: BTreeMap<String, String>,
+    requested: Option<Offer>,
+) -> PiPlan {
+    let types = Cli::Pi
+        .provider_types()
+        .iter()
+        .map(|&provider_type| {
+            let fits: Vec<&Offer> = offers
+                .iter()
+                .filter(|offer| offer.provider_type == provider_type)
+                .collect();
+            let chosen = requested
+                .as_ref()
+                .filter(|offer| offer.provider_type == provider_type)
+                .or_else(|| {
+                    let id = remembered.get(provider_type)?;
+                    fits.iter().copied().find(|offer| &offer.id == id)
+                });
+            let default = match (chosen, fits.as_slice()) {
+                (Some(offer), _) => TypeDefault::Use(offer.clone()),
+                (None, [offer]) => TypeDefault::Use((*offer).clone()),
+                (None, []) => TypeDefault::None,
+                (None, _) => TypeDefault::Ask(fits.into_iter().cloned().collect()),
+            };
+            (provider_type.to_owned(), default)
+        })
+        .collect();
+    PiPlan {
+        server,
+        offers,
+        types,
+        requested,
+        remembered,
+    }
 }
 
 /// How a launched CLI ended.
@@ -203,14 +371,9 @@ pub async fn launch(
     let isolation = credentials.isolate(&offer.id, &offer.provider_type, cli)?;
     // A random UUID carries nothing about the launch, such as when it started.
     let launch_id = uuid::Uuid::new_v4().to_string();
-    let proxy = Proxy::start(
-        store.dir(),
-        login,
-        &offer.id,
-        cli.base_path(&offer.provider_type),
-        &launch_id,
-    )
-    .await?;
+    let base_path = cli.base_path(&offer.provider_type);
+    let route = Route::provider(String::new(), &offer.id, base_path);
+    let proxy = Proxy::start(store.dir(), login, vec![route], &launch_id).await?;
     let project = match offer.provider_type.as_str() {
         VERTEX => Some(credentials.vertex_project(&offer.id)?),
         _ => None,
@@ -223,7 +386,7 @@ pub async fn launch(
     };
     let setup = cli.setup(
         upstream,
-        proxy.base_url(),
+        &format!("{}{base_path}", proxy.origin()),
         proxy.secret(),
         store.dir(),
         |name| std::env::var(name).ok(),
@@ -256,13 +419,59 @@ pub async fn launch(
     for note in &setup_notes {
         eprintln!("ags: {note}");
     }
+    run(store, &server, command, program, proxy).await
+}
+
+/// Runs pi with `args` on the providers of `plan`, in the dir of pi launches, until it exits.
+/// `program` replaces pi's name on `PATH`.
+pub async fn launch_pi(
+    store: &Store,
+    credentials: &Credentials,
+    plan: &PiPlan,
+    args: Vec<OsString>,
+    program: Option<&OsStr>,
+) -> Result<Launched> {
+    let login = current_login(store).await?.ok_or_else(not_logged_in)?;
+    let server = login.server.clone();
+    let isolation = credentials.isolate_pi()?;
+    let (pi, routes) = pi::Launch::new(plan, credentials, |name| std::env::var(name).ok())?;
+    let launch_id = uuid::Uuid::new_v4().to_string();
+    let proxy = Proxy::start(store.dir(), login, routes, &launch_id).await?;
+    let setup = pi.setup(proxy.origin(), proxy.secret(), store.dir())?;
+    let name = OsString::from(Cli::Pi.to_string());
+    let program = program.unwrap_or(&name);
+    let mut command = Command::new(program);
+    command
+        .args(setup.args)
+        .args(args)
+        .envs(isolation.env)
+        .envs(setup.env)
+        .envs(no_proxy(|name| std::env::var(name).ok()))
+        .kill_on_drop(true);
+    for name in &isolation.unset {
+        command.env_remove(name);
+    }
+    for note in &setup.notes {
+        eprintln!("ags: {note}");
+    }
+    run(store, &server, command, program, proxy).await
+}
+
+/// Runs `command` until it exits, then ends `proxy` and checks what it learned about the login.
+async fn run(
+    store: &Store,
+    server: &str,
+    mut command: Command,
+    program: &OsStr,
+    proxy: Proxy,
+) -> Result<Launched> {
     die_with_parent(&mut command);
     let status = wait(command, program).await;
     let ended = proxy.end();
     let status = status?;
     let logged_out = match ended.logged_out {
         Some(error) => Some(error),
-        None if ended.refused => logged_out_of(store, &server).await,
+        None if ended.refused => logged_out_of(store, server).await,
         None => None,
     };
     Ok(Launched { status, logged_out })
@@ -440,6 +649,98 @@ mod tests {
         assert_eq!(
             refused(&old, "aws", Some(&path)),
             "codex can't run on aws until the Aegis server is updated to name its region"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn pi_offer(id: &str, provider_type: &str) -> Offer {
+        Offer {
+            id: id.into(),
+            provider_type: provider_type.into(),
+            region: None,
+        }
+    }
+
+    #[test]
+    fn pi_uses_for_each_type_the_named_then_the_remembered_then_the_only_provider() {
+        use aegis_wire::provider_type::{BEDROCK, CLAUDE_SUBSCRIPTION};
+        let offers = vec![
+            pi_offer("work", CLAUDE_SUBSCRIPTION),
+            pi_offer("aws", BEDROCK),
+            pi_offer("aws2", BEDROCK),
+            pi_offer("gcp", VERTEX),
+        ];
+        let types = |plan: PiPlan| {
+            plan.types
+                .into_iter()
+                .map(|(provider_type, default)| {
+                    let default = match default {
+                        TypeDefault::Use(offer) => offer.id,
+                        TypeDefault::Ask(offers) => {
+                            let ids: Vec<String> =
+                                offers.into_iter().map(|offer| offer.id).collect();
+                            format!("ask {}", ids.join(" "))
+                        }
+                        TypeDefault::None => "none".to_owned(),
+                    };
+                    format!("{provider_type}={default}")
+                })
+                .collect::<Vec<_>>()
+        };
+        let server = || "https://aegis.example".to_owned();
+        assert_eq!(
+            types(pi_plan(server(), offers.clone(), BTreeMap::new(), None)),
+            [
+                "claude_subscription=work",
+                "codex_subscription=none",
+                "bedrock=ask aws aws2",
+                "vertex=gcp"
+            ]
+        );
+        let remembered = BTreeMap::from([
+            (BEDROCK.to_owned(), "aws2".to_owned()),
+            (VERTEX.to_owned(), "gone".to_owned()),
+        ]);
+        assert_eq!(
+            types(pi_plan(server(), offers.clone(), remembered.clone(), None)),
+            [
+                "claude_subscription=work",
+                "codex_subscription=none",
+                "bedrock=aws2",
+                "vertex=gcp"
+            ]
+        );
+        let requested = Some(pi_offer("aws", BEDROCK));
+        assert_eq!(
+            types(pi_plan(server(), offers, remembered, requested))[2],
+            "bedrock=aws"
+        );
+    }
+
+    #[test]
+    fn a_choice_for_one_type_is_remembered_beside_the_others() {
+        use aegis_wire::provider_type::BEDROCK;
+        let dir = crate::store::tests::scratch();
+        let store = Store::at(&dir);
+        let mut machine = cloud_machine(None);
+        let earlier = Remembered::One("gcp".into());
+        let remembered = pi_defaults(Some(&earlier), &machine);
+        assert_eq!(
+            remembered,
+            BTreeMap::from([(VERTEX.to_owned(), "gcp".to_owned())])
+        );
+        machine.providers.retain(|id| id != "gcp");
+        let offers = offers(&machine, Cli::Pi, None);
+        let mut plan = pi_plan("https://aegis.example".into(), offers, remembered, None);
+        assert!(matches!(&plan.types[2].1, TypeDefault::Ask(offers) if offers.len() == 2));
+        plan.choose(&store, pi_offer("vpce", BEDROCK)).unwrap();
+        assert_eq!(plan.types[2].1, TypeDefault::Use(pi_offer("vpce", BEDROCK)));
+        assert_eq!(
+            defaults::load(&dir).unwrap()["pi"],
+            Remembered::ByType(BTreeMap::from([
+                (BEDROCK.to_owned(), "vpce".to_owned()),
+                (VERTEX.to_owned(), "gcp".to_owned()),
+            ]))
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

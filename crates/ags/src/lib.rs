@@ -4,6 +4,7 @@ mod clis;
 mod credentials;
 mod defaults;
 mod launch;
+mod pi;
 mod proxy;
 mod server;
 pub mod store;
@@ -15,7 +16,8 @@ use anyhow::{Result, bail};
 pub use clis::Cli;
 pub use credentials::{Credentials, Home, Need, Step, StepStatus, installed, product, setup_steps};
 pub use launch::{
-    CliDefault, Launched, Offer, Pick, cli_defaults, launch, pick, remember, use_provider,
+    CliDefault, Launched, Offer, PiPlan, Pick, TypeDefault, cli_defaults, launch, launch_pi, pick,
+    plan_pi, remember, use_provider,
 };
 use server::{Poll, Server};
 pub use store::{Login, Store};

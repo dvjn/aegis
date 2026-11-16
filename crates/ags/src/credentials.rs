@@ -25,6 +25,7 @@ use crate::{
 };
 
 const DIR_NAME: &str = "providers";
+const PI_LAUNCH_DIR: &str = "pi";
 const STATE: &str = "state.json";
 const BEDROCK_KEY: &str = "bedrock-api-key";
 const VERTEX_ACCOUNT: &str = "vertex-service-account.json";
@@ -245,8 +246,7 @@ const LAUNCH_ENV: &[&str] = &[
     "AGS_LAUNCH_SECRET",
     "ANTHROPIC_CUSTOM_HEADERS",
     "OPENAI_BASE_URL",
-    "AGS_PI_PROVIDER",
-    "AGS_PI_BASE_URL",
+    "AGS_PI_ROUTES",
     "AWS_REGION",
     "AWS_BEARER_TOKEN_BEDROCK",
     "ANTHROPIC_VERTEX_PROJECT_ID",
@@ -265,11 +265,13 @@ fn from_launch() -> impl Iterator<Item = &'static str> {
         .chain(DIR_VARS.iter().flat_map(|(own, kept)| [*own, *kept]))
 }
 
-/// The provider pi signs in to for a provider of `provider_type`, by its name in pi.
-fn pi_provider(provider_type: &str) -> Option<&'static str> {
+/// pi's own provider for providers of `provider_type`, whose name its sign-ins are kept under.
+pub(crate) fn pi_provider(provider_type: &str) -> Option<&'static str> {
     match provider_type {
         CLAUDE_SUBSCRIPTION => Some("anthropic"),
         CODEX_SUBSCRIPTION => Some("openai-codex"),
+        BEDROCK => Some("amazon-bedrock"),
+        VERTEX => Some("google-vertex"),
         _ => None,
     }
 }
@@ -426,7 +428,7 @@ impl Credentials {
     pub fn new(store: &Store, home: Home) -> Self {
         let dir = store.dir().join(DIR_NAME);
         Self {
-            home: home.resolve(Some(&dir)),
+            home: home.resolve(Some(store.dir())),
             dir,
             store: Store::at(store.dir()),
         }
@@ -500,16 +502,22 @@ impl Credentials {
     /// `prepare`, also naming the user's settings files that the provider holds a different copy of.
     fn prepared(&self, provider: &str, cli: Cli) -> Result<(PathBuf, Links)> {
         let dir = self.cli_dir(provider, cli)?;
-        create_private_dir(&dir)?;
+        let links = self.prepare_dir(&dir, cli)?;
+        Ok((dir, links))
+    }
+
+    /// Creates `dir` for `cli` and brings the user's settings into it.
+    fn prepare_dir(&self, dir: &Path, cli: Cli) -> Result<Links> {
+        create_private_dir(dir)?;
         let links = match self.home.dir(cli) {
-            Some(own) => link(own, &dir, shared(cli))?,
+            Some(own) => link(own, dir, shared(cli))?,
             None => Links::default(),
         };
         // A file shared again is warned about again if it is split off later.
         let stale: Vec<String> = links
             .linked
             .iter()
-            .flat_map(|name| [differs_key(&dir, name), blocked_key(&dir, name)])
+            .flat_map(|name| [differs_key(dir, name), blocked_key(dir, name)])
             .collect();
         if stale
             .iter()
@@ -528,24 +536,36 @@ impl Credentials {
             let _lock = self.store.lock()?;
             share_claude_state(own, &dir.join(CLAUDE_STATE))?;
         }
-        Ok((dir, links))
+        Ok(links)
     }
 
     /// Prepares `provider`'s dir for `cli` and returns what the user has not been told yet about it.
     pub fn notices(&self, provider: &str, cli: Cli) -> Result<Vec<String>> {
         let (dir, links) = self.prepared(provider, cli)?;
+        self.untold(provider, &dir, &links, cli)
+    }
+
+    /// Prepares the dir of pi launches and returns what the user has not been told yet about it.
+    pub fn pi_notices(&self) -> Result<Vec<String>> {
+        let dir = self.pi_dir();
+        let links = self.prepare_dir(&dir, Cli::Pi)?;
+        self.untold("ags", &dir, &links, Cli::Pi)
+    }
+
+    /// What the user has not been told yet about `cli`'s settings in `dir`, which `owner` keeps.
+    fn untold(&self, owner: &str, dir: &Path, links: &Links, cli: Cli) -> Result<Vec<String>> {
         let product = product(cli);
         let differing = links.differing.iter().map(|name| Notice {
-            key: differs_key(&dir, name),
+            key: differs_key(dir, name),
             text: format!(
-                "{provider} keeps its own {name} for {product}, which differs from yours; delete {} to share yours again",
+                "{owner} keeps its own {name} for {product}, which differs from yours; delete {} to share yours again",
                 dir.join(name).display()
             ),
         });
         let blocked = links.blocked.iter().map(|name| Notice {
-            key: blocked_key(&dir, name),
+            key: blocked_key(dir, name),
             text: format!(
-                "{provider} has its own {name} for {product}, so yours is not shared; delete {} to share yours",
+                "{owner} has its own {name} for {product}, so yours is not shared; delete {} to share yours",
                 dir.join(name).display()
             ),
         });
@@ -634,6 +654,44 @@ impl Credentials {
         Ok(isolation)
     }
 
+    /// Points pi at the dir of pi launches, after preparing it. pi reaches each provider's own
+    /// credential through the launch's extension instead.
+    pub(crate) fn isolate_pi(&self) -> Result<Isolation> {
+        let dir = self.pi_dir();
+        self.prepare_dir(&dir, Cli::Pi)?;
+        let mut unset = vec![];
+        for provider_type in Cli::Pi.provider_types() {
+            for name in shared_auth(Cli::Pi, provider_type) {
+                if !unset.contains(&name) {
+                    unset.push(name);
+                }
+            }
+        }
+        let mut env = vec![("PI_CODING_AGENT_DIR", dir.into_os_string())];
+        env.extend(self.home.kept());
+        Ok(Isolation {
+            args: vec![],
+            env,
+            unset,
+        })
+    }
+
+    /// pi's own dir during a launch, with its sessions, whichever providers the launch reaches.
+    fn pi_dir(&self) -> PathBuf {
+        self.store.dir().join(PI_LAUNCH_DIR)
+    }
+
+    /// The file of `provider`'s credential for pi: its pi sign-in, Bedrock API key or Vertex
+    /// service account.
+    pub(crate) fn pi_credential(&self, provider: &str, provider_type: &str) -> Result<PathBuf> {
+        let dir = self.provider_dir(provider)?;
+        Ok(match provider_type {
+            BEDROCK => dir.join(BEDROCK_KEY),
+            VERTEX => dir.join(VERTEX_ACCOUNT),
+            _ => dir.join(Cli::Pi.to_string()).join(PI_AUTH),
+        })
+    }
+
     /// Runs `cli`'s own sign-in in `provider`'s config dir. `program` replaces the CLI's name on `PATH`.
     pub async fn sign_in(
         &self,
@@ -650,7 +708,9 @@ impl Credentials {
             Cli::Claude => command.args(["auth", "login"]),
             Cli::Codex => command.arg("login").args(isolation.args),
             Cli::Pi => {
-                let Some(name) = pi_provider(provider_type) else {
+                let Some(name) = pi_provider(provider_type)
+                    .filter(|_| matches!(provider_type, CLAUDE_SUBSCRIPTION | CODEX_SUBSCRIPTION))
+                else {
                     bail!("pi can't sign in to a {provider_type} provider");
                 };
                 command.args(["auth", "login", name])
@@ -1274,6 +1334,59 @@ mod tests {
     }
 
     #[test]
+    fn a_pi_launch_has_one_dir_of_its_own_and_no_ones_credentials() {
+        let fixture = Fixture::new();
+        fixture.write(".pi/agent/settings.json", "{}");
+        fixture.write(".pi/agent/auth.json", "{}");
+        let credentials = &fixture.credentials;
+        let pi = credentials.isolate_pi().unwrap();
+        let dir = fixture.root.join("ags").join(PI_LAUNCH_DIR);
+        assert_eq!(
+            pi.env[0],
+            ("PI_CODING_AGENT_DIR", dir.clone().into_os_string())
+        );
+        assert!(dir.join("settings.json").is_symlink());
+        assert!(!dir.join("auth.json").exists());
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "AWS_PROFILE",
+            "GOOGLE_CLOUD_API_KEY",
+        ] {
+            assert!(pi.unset.contains(&name), "{name}");
+        }
+        fs::remove_file(dir.join("settings.json")).unwrap();
+        fs::write(dir.join("settings.json"), "{\"mine\":1}").unwrap();
+        let notices = credentials.pi_notices().unwrap();
+        assert_eq!(
+            notices,
+            [format!(
+                "ags keeps its own settings.json for pi, which differs from yours; delete {} to share yours again",
+                dir.join("settings.json").display()
+            )]
+        );
+        assert!(credentials.pi_notices().unwrap().is_empty());
+        assert_eq!(
+            credentials
+                .pi_credential("work", CLAUDE_SUBSCRIPTION)
+                .unwrap(),
+            fixture.provider("work").join("pi").join(PI_AUTH)
+        );
+        assert_eq!(
+            credentials.pi_credential("aws", BEDROCK).unwrap(),
+            fixture.provider("aws").join(BEDROCK_KEY)
+        );
+        // ags run inside a pi launch still finds the user's own pi dir.
+        let nested = Home::from_vars(|name| match name {
+            "HOME" => Some(fixture.home.clone().into_os_string()),
+            "PI_CODING_AGENT_DIR" => Some(dir.clone().into_os_string()),
+            _ => None,
+        })
+        .resolve(Some(&fixture.root.join("ags")));
+        assert_eq!(nested.pi, Some(fixture.home.join(".pi/agent")));
+    }
+
+    #[test]
     fn claude_code_settings_in_its_state_file_follow_the_users_own() {
         let fixture = Fixture::new();
         fixture.write(
@@ -1577,7 +1690,15 @@ mod tests {
             .iter()
             .map(|(name, _)| *name)
             .collect();
+        let pi = fixture.credentials.isolate_pi().unwrap();
+        let pi_set = pi.env.iter().map(|(name, _)| *name);
+        for name in pi_set.chain([crate::pi::ROUTES_ENV, crate::clis::SECRET_ENV]) {
+            assert!(dropped.contains(&name), "pi sets {name}");
+        }
         for cli in Cli::value_variants() {
+            if *cli == Cli::Pi {
+                continue;
+            }
             for provider_type in cli.provider_types() {
                 let setup = cli
                     .setup(
