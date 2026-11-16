@@ -34,10 +34,4 @@ Without `SMTP_HOST`, Aegis writes emails like password-reset links to the log.
 
 ## Logs
 
-`RUST_LOG` controls log filtering:
-
-```sh
-RUST_LOG=aegis=debug aegis serve
-```
-
-The default filter logs Aegis at `info` and its HTTP dependencies at `warn`.
+- `RUST_LOG`: log filter, such as `aegis=debug`; default logs Aegis at `info` and its HTTP dependencies at `warn`
