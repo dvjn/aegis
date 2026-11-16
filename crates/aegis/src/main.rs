@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let database = db::connect(&config.database_url).await?;
     SettingsStore::new(database.clone())
-        .import_config_once(&config)
+        .import_config_once(migration::legacy_config::LegacyConfig::read)
         .await?;
     let result = match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config, database.clone()).await,

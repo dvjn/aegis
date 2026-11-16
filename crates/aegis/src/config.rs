@@ -20,14 +20,12 @@ pub struct Config {
     pub http_addr: SocketAddr,
     pub database_url: String,
     pub max_capture_bytes: usize,
-    pub providers: Vec<ProviderConfig>,
     pub public_url: Option<String>,
     pub registration_enabled: bool,
     pub smtp: Option<SmtpSettings>,
     pub auth: AuthConfig,
     pub oauth: OAuthConfig,
     pub pricing: PricingConfig,
-    pub guardrails: GuardrailsConfig,
     pub secret_placeholder_key: [u8; 32],
 }
 
@@ -92,27 +90,19 @@ impl std::str::FromStr for GuardrailsMode {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, confique::Config)]
 pub struct PricingConfig {
-    #[serde(default = "default_pricing_url")]
-    pub url: String,
-    #[serde(default = "default_pricing_refresh_hours")]
-    pub refresh_hours: u64,
-    #[serde(default = "default_pricing_enabled")]
+    #[config(env = "PRICING_ENABLED", default = true)]
     pub enabled: bool,
-    #[serde(default)]
+    #[config(env = "PRICING_REFRESH_HOURS", default = 12)]
+    pub refresh_hours: u64,
+    #[config(
+        env = "PRICING_URL",
+        default = "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json"
+    )]
+    pub url: String,
+    #[config(default = [])]
     pub overrides: Vec<PriceOverride>,
-}
-
-impl Default for PricingConfig {
-    fn default() -> Self {
-        Self {
-            url: default_pricing_url(),
-            refresh_hours: default_pricing_refresh_hours(),
-            enabled: default_pricing_enabled(),
-            overrides: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -238,51 +228,73 @@ impl ProviderKind {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct FileConfig {
-    #[serde(default = "default_http_addr")]
+/// The server settings in the config file. Each scalar also has an
+/// environment variable, its key path uppercased with sections joined by `_`,
+/// which wins over the file. Unknown keys, such as the `[[providers]]` and
+/// `[guardrails]` of older releases, are ignored.
+#[derive(confique::Config)]
+struct Settings {
+    #[config(env = "HTTP_ADDR", default = "127.0.0.1:8765")]
     http_addr: SocketAddr,
-    #[serde(default = "default_database_url")]
-    database_url: String,
-    #[serde(default = "default_max_capture_bytes")]
-    max_capture_bytes: usize,
-    #[serde(default)]
-    providers: Vec<ProviderConfig>,
-    #[serde(default)]
+    #[config(env = "PUBLIC_URL")]
     public_url: Option<String>,
-    #[serde(default)]
+    #[config(env = "DATABASE_URL", default = "sqlite://data/aegis.db?mode=rwc")]
+    database_url: String,
+    #[config(env = "MAX_CAPTURE_BYTES", default = 16777216)]
+    max_capture_bytes: usize,
+    #[config(env = "REGISTRATION_ENABLED", default = false)]
     registration_enabled: bool,
-    #[serde(default)]
+    #[config(nested)]
+    smtp: Smtp,
+    #[config(nested)]
+    auth: Auth,
+    #[config(nested)]
     pricing: PricingConfig,
-    #[serde(default)]
-    guardrails: GuardrailsConfig,
 }
 
-impl Default for FileConfig {
-    fn default() -> Self {
-        Self {
-            http_addr: default_http_addr(),
-            database_url: default_database_url(),
-            max_capture_bytes: default_max_capture_bytes(),
-            providers: Vec::new(),
-            public_url: None,
-            registration_enabled: false,
-            pricing: PricingConfig::default(),
-            guardrails: GuardrailsConfig::default(),
-        }
-    }
+#[derive(confique::Config)]
+struct Smtp {
+    #[config(env = "SMTP_HOST")]
+    host: Option<String>,
+    #[config(env = "SMTP_PORT", default = 587)]
+    port: u16,
+    #[config(env = "SMTP_FROM")]
+    from: Option<String>,
+    #[config(env = "SMTP_USERNAME")]
+    username: Option<String>,
+    #[config(env = "SMTP_PASSWORD")]
+    password: Option<String>,
+}
+
+#[derive(confique::Config)]
+struct Auth {
+    #[config(env = "AUTH_ACCESS_TOKEN_MINUTES", default = 5)]
+    access_token_minutes: u64,
+}
+
+pub fn file_path() -> String {
+    env::var("AEGIS_CONFIG").unwrap_or_else(|_| "config.toml".into())
+}
+
+/// The file's settings, read as TOML whatever its extension; a missing file
+/// sets nothing.
+fn file_settings(path: &str) -> Result<<Settings as confique::Config>::Layer, confique::Error> {
+    confique::File::with_format(path, confique::FileFormat::Toml).load()
 }
 
 impl Config {
     #[cfg(test)]
     pub fn test_default() -> Self {
+        use confique::{Config as _, Layer as _};
+        let settings =
+            Settings::from_layer(<Settings as confique::Config>::Layer::default_values())
+                .expect("every setting has a default or is optional");
         Self {
-            http_addr: default_http_addr(),
-            database_url: default_database_url(),
-            max_capture_bytes: default_max_capture_bytes(),
-            providers: Vec::new(),
-            public_url: None,
-            registration_enabled: false,
+            http_addr: settings.http_addr,
+            database_url: settings.database_url,
+            max_capture_bytes: settings.max_capture_bytes,
+            public_url: settings.public_url,
+            registration_enabled: settings.registration_enabled,
             smtp: None,
             auth: AuthConfig {
                 session_hmac_key: [1; 32],
@@ -296,77 +308,33 @@ impl Config {
             oauth: OAuthConfig {
                 hmac_key: [3; 32],
                 key_id: "v1".into(),
-                access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+                access_token_lifetime: access_token_lifetime(settings.auth.access_token_minutes)
+                    .expect("the default lifetime is valid"),
             },
-            pricing: PricingConfig::default(),
-            guardrails: GuardrailsConfig::default(),
+            pricing: settings.pricing,
             secret_placeholder_key: [4; 32],
         }
     }
 
     pub fn from_env() -> Result<Self> {
-        let path = env::var("AEGIS_CONFIG").unwrap_or_else(|_| "config.toml".into());
-        let file = if Path::new(&path).exists() {
-            toml::from_str::<FileConfig>(
-                &fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read configuration from {path}"))?,
-            )
-            .with_context(|| format!("failed to parse configuration from {path}"))?
-        } else {
-            FileConfig::default()
-        };
-
-        let http_addr = env::var("HTTP_ADDR")
-            .ok()
-            .map(|value| value.parse())
-            .transpose()
-            .context("HTTP_ADDR must be an IP address and port")?
-            .unwrap_or(file.http_addr);
-        let database_url = env::var("DATABASE_URL").unwrap_or(file.database_url);
-        let max_capture_bytes = env::var("MAX_CAPTURE_BYTES")
-            .ok()
-            .map(|value| value.parse())
-            .transpose()
-            .context("MAX_CAPTURE_BYTES must be a positive integer")?
-            .unwrap_or(file.max_capture_bytes);
-        if max_capture_bytes == 0 {
-            bail!("MAX_CAPTURE_BYTES must be greater than zero");
+        use confique::Config as _;
+        let settings = Settings::builder()
+            .env()
+            .preloaded(file_settings(&file_path())?)
+            .load()?;
+        if settings.max_capture_bytes == 0 {
+            bail!("MAX_CAPTURE_BYTES (max_capture_bytes) must be greater than zero");
         }
-
-        let providers = file.providers;
-        validate_providers(&providers)?;
-
-        let mut pricing = file.pricing;
-        if let Some(url) = optional_var("PRICING_URL")? {
-            pricing.url = url;
-        }
-        if let Some(hours) = optional_var("PRICING_REFRESH_HOURS")? {
-            pricing.refresh_hours = hours
-                .parse()
-                .context("PRICING_REFRESH_HOURS must be a positive integer")?;
-        }
-        if let Some(enabled) = optional_var("PRICING_ENABLED")? {
-            pricing.enabled = enabled
-                .parse()
-                .context("PRICING_ENABLED must be true or false")?;
-        }
-        validate_pricing(&pricing)?;
-
-        let mut guardrails = file.guardrails;
-        apply_guardrails_env(&mut guardrails)?;
-        validate_detectors(&guardrails)?;
-
-        let access_token_lifetime = access_token_lifetime(optional_var("ACCESS_TOKEN_MINUTES")?)?;
-
-        let smtp = smtp_config()?;
+        validate_pricing(&settings.pricing)?;
+        let access_token_lifetime = access_token_lifetime(settings.auth.access_token_minutes)?;
+        let smtp = smtp_settings(settings.smtp)?;
         let root_key = root_key()?;
         Ok(Self {
-            http_addr,
-            database_url,
-            max_capture_bytes,
-            providers,
-            public_url: optional_var("PUBLIC_URL")?.or(file.public_url),
-            registration_enabled: file.registration_enabled,
+            http_addr: settings.http_addr,
+            database_url: settings.database_url,
+            max_capture_bytes: settings.max_capture_bytes,
+            public_url: settings.public_url,
+            registration_enabled: settings.registration_enabled,
             smtp,
             auth: AuthConfig {
                 session_hmac_key: derive_key(&root_key, b"aegis/v1/session-hmac"),
@@ -382,95 +350,57 @@ impl Config {
                 key_id: "v1".into(),
                 access_token_lifetime,
             },
-            pricing,
-            guardrails,
+            pricing: settings.pricing,
             secret_placeholder_key: derive_key(&root_key, b"aegis/v1/secret-placeholder"),
         })
     }
 }
 
-/// Environment variables override the file's guardrails. Both are read only by
-/// the one-time import into the database (see `settings::import_config_once`).
-fn apply_guardrails_env(guardrails: &mut GuardrailsConfig) -> Result<()> {
-    if let Some(enabled) = optional_var("GUARDRAILS_ENABLED")? {
-        guardrails.enabled = enabled
-            .parse()
-            .context("GUARDRAILS_ENABLED must be true or false")?;
-    }
-    if let Some(mode) = optional_var("GUARDRAILS_MODE")? {
-        guardrails.mode = mode.parse()?;
-    }
-    if let Some(enabled) = optional_var("GUARDRAILS_SECRETS_ENABLED")? {
-        guardrails.secrets.enabled = enabled
-            .parse()
-            .context("GUARDRAILS_SECRETS_ENABLED must be true or false")?;
-    }
-    Ok(())
-}
-
-fn smtp_config() -> Result<Option<SmtpSettings>> {
-    let host = match env::var("SMTP_HOST") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(error) => return Err(error).context("SMTP_HOST must be valid Unicode"),
+fn smtp_settings(smtp: Smtp) -> Result<Option<SmtpSettings>> {
+    let Some(host) = smtp.host else {
+        return Ok(None);
     };
     if host.is_empty() {
-        bail!("SMTP_HOST must not be empty");
+        bail!("SMTP_HOST (smtp.host) must not be empty");
     }
-    let port = match env::var("SMTP_PORT") {
-        Ok(value) => value.parse::<u16>().context("SMTP_PORT must be a port")?,
-        Err(env::VarError::NotPresent) => 587,
-        Err(error) => return Err(error).context("SMTP_PORT must be valid Unicode"),
-    };
-    if port == 0 {
-        bail!("SMTP_PORT must be 1..=65535");
+    if smtp.port == 0 {
+        bail!("SMTP_PORT (smtp.port) must be 1..=65535");
     }
-    let username = optional_var("SMTP_USERNAME")?;
-    let password = optional_var("SMTP_PASSWORD")?;
-    if username.is_some() != password.is_some() {
-        bail!("SMTP_USERNAME and SMTP_PASSWORD must be set together");
+    if smtp.username.is_some() != smtp.password.is_some() {
+        bail!(
+            "SMTP_USERNAME (smtp.username) and SMTP_PASSWORD (smtp.password) must be set together"
+        );
     }
-    let from = optional_var("SMTP_FROM")?.context("SMTP_FROM is required when SMTP_HOST is set")?;
+    let from = smtp
+        .from
+        .context("SMTP_FROM (smtp.from) is required when SMTP_HOST (smtp.host) is set")?;
     if from.parse::<email_address::EmailAddress>().is_err() {
-        bail!("SMTP_FROM must be an email address");
+        bail!("SMTP_FROM (smtp.from) must be an email address");
     }
     Ok(Some(SmtpSettings {
         host,
-        port,
-        username,
-        password,
+        port: smtp.port,
+        username: smtp.username,
+        password: smtp.password,
         from,
     }))
 }
 
-fn optional_var(name: &str) -> Result<Option<String>> {
-    match env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("{name} must be valid Unicode")),
-    }
-}
-
-fn access_token_lifetime(minutes: Option<String>) -> Result<Duration> {
-    let Some(minutes) = minutes else {
-        return Ok(OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME);
-    };
-    let minutes: u64 = minutes
-        .parse()
-        .context("ACCESS_TOKEN_MINUTES must be a positive integer")?;
+fn access_token_lifetime(minutes: u64) -> Result<Duration> {
+    const TOO_LARGE: &str = "AUTH_ACCESS_TOKEN_MINUTES (auth.access_token_minutes) is too large";
     if minutes == 0 {
-        bail!("ACCESS_TOKEN_MINUTES must be greater than zero");
+        bail!("AUTH_ACCESS_TOKEN_MINUTES (auth.access_token_minutes) must be greater than zero");
     }
     let lifetime = minutes
         .checked_mul(60)
         .map(Duration::from_secs)
-        .context("ACCESS_TOKEN_MINUTES is too large")?;
+        .context(TOO_LARGE)?;
     let expires = chrono::Duration::from_std(lifetime)
         .ok()
         .and_then(|lifetime| chrono::Utc::now().checked_add_signed(lifetime))
         .filter(|expires| expires.year() <= 9999);
     if expires.is_none() {
-        bail!("ACCESS_TOKEN_MINUTES is too large");
+        bail!(TOO_LARGE);
     }
     Ok(lifetime)
 }
@@ -539,18 +469,6 @@ fn derive_key(root: &[u8; 32], info: &[u8]) -> [u8; 32] {
         .expand(info, &mut output)
         .expect("32 bytes is a valid HKDF output length");
     output
-}
-
-fn default_http_addr() -> SocketAddr {
-    "127.0.0.1:8765".parse().expect("valid default address")
-}
-
-fn default_database_url() -> String {
-    "sqlite://data/aegis.db?mode=rwc".into()
-}
-
-fn default_max_capture_bytes() -> usize {
-    16 * 1024 * 1024
 }
 
 fn default_anthropic_base_url() -> String {
@@ -631,18 +549,6 @@ pub fn vertex_location(base_url: &str) -> Option<&str> {
     is_cloud_region(location).then_some(location)
 }
 
-fn default_pricing_url() -> String {
-    "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json".into()
-}
-
-fn default_pricing_refresh_hours() -> u64 {
-    12
-}
-
-fn default_pricing_enabled() -> bool {
-    true
-}
-
 pub(crate) fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
     let mut ids = HashSet::new();
     for provider in providers {
@@ -674,12 +580,13 @@ pub(crate) fn validate_providers(providers: &[ProviderConfig]) -> Result<()> {
 }
 
 fn validate_pricing(pricing: &PricingConfig) -> Result<()> {
-    let url = url::Url::parse(&pricing.url).context("pricing url is not a valid URL")?;
+    let url =
+        url::Url::parse(&pricing.url).context("PRICING_URL (pricing.url) is not a valid URL")?;
     if url.scheme() != "https" || url.host_str().is_none() {
-        bail!("pricing url must use https and include a host");
+        bail!("PRICING_URL (pricing.url) must use https and include a host");
     }
     if pricing.refresh_hours < 1 {
-        bail!("pricing refresh_hours must be at least 1");
+        bail!("PRICING_REFRESH_HOURS (pricing.refresh_hours) must be at least 1");
     }
     Ok(())
 }
@@ -735,32 +642,223 @@ fn is_snake_case_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use confique::{
+        Config as _,
+        meta::{FieldKind, Meta},
+    };
+
+    type SettingsLayer = <Settings as confique::Config>::Layer;
+
+    /// Keys that only the file sets, because they hold lists.
+    const FILE_ONLY: [&str; 1] = ["pricing.overrides"];
+
+    /// Settings from a config file alone, without the process environment.
+    fn from_file(toml: &str) -> Result<Settings, confique::Error> {
+        Settings::builder()
+            .preloaded(toml::from_str(toml).expect("configuration should parse"))
+            .load()
+    }
+
+    /// Each setting's key path and environment variable.
+    fn settings() -> Vec<(String, Option<&'static str>)> {
+        fn walk(meta: &Meta, prefix: &str, out: &mut Vec<(String, Option<&'static str>)>) {
+            for field in meta.fields {
+                let key = format!("{prefix}{}", field.name);
+                match field.kind {
+                    FieldKind::Leaf { env, .. } => out.push((key, env)),
+                    FieldKind::Nested { meta } => walk(meta, &format!("{key}."), out),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&Settings::META, "", &mut out);
+        out
+    }
 
     #[test]
-    fn access_tokens_last_five_minutes_unless_overridden() {
-        assert_eq!(access_token_lifetime(None).unwrap().as_secs(), 300);
+    fn every_setting_has_its_env_var_and_is_documented() {
+        let docs = include_str!("../../../docs/server-configuration.md");
+        let mut seen = HashSet::new();
+        for (key, env) in settings() {
+            if FILE_ONLY.contains(&key.as_str()) {
+                assert_eq!(env, None, "{key}");
+                continue;
+            }
+            let env = env.unwrap_or_else(|| panic!("{key} has no environment variable"));
+            assert_eq!(env, key.replace('.', "_").to_uppercase(), "{key}");
+            assert!(seen.insert(env), "{env} names two settings");
+            assert!(
+                docs.contains(&format!("`{env}` (`{key}`)")),
+                "{env} ({key}) is not in docs/server-configuration.md"
+            );
+        }
+    }
+
+    /// Prints the settings that the process environment layers over a fixed
+    /// file. Run as a child by [`load_in_child`], with an environment of its own.
+    #[test]
+    #[ignore = "run in a child process by the environment tests"]
+    fn print_settings_from_the_env() {
+        let file = toml::from_str(
+            "[smtp]\nport = 2525\npassword = \"file\"\n[pricing]\nrefresh_hours = 6",
+        )
+        .unwrap();
+        match Settings::builder().env().preloaded(file).load() {
+            Ok(settings) => println!(
+                "settings: password={:?} username={:?} from={:?} port={} refresh_hours={}",
+                settings.smtp.password,
+                settings.smtp.username,
+                settings.smtp.from,
+                settings.smtp.port,
+                settings.pricing.refresh_hours,
+            ),
+            Err(error) => println!("settings: error {error}"),
+        }
+    }
+
+    /// What [`print_settings_from_the_env`] prints with only `vars` set.
+    fn load_in_child(vars: &[(&str, &str)]) -> String {
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::print_settings_from_the_env",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{stdout}");
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("settings: "))
+            .unwrap_or_else(|| panic!("the child printed no settings: {stdout}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn env_vars_win_over_the_file_and_keep_strings_exact() {
         assert_eq!(
-            access_token_lifetime(Some("15".into())).unwrap().as_secs(),
-            900
+            load_in_child(&[
+                ("SMTP_PASSWORD", "12345"),
+                ("SMTP_USERNAME", "true"),
+                ("SMTP_FROM", "\"[quoted]\""),
+                ("PRICING_REFRESH_HOURS", "3"),
+            ]),
+            r#"password=Some("12345") username=Some("true") from=Some("\"[quoted]\"") port=2525 refresh_hours=3"#
+        );
+        let error = load_in_child(&[("SMTP_PORT", "abc")]);
+        assert!(
+            error.starts_with("error ") && error.contains("SMTP_PORT"),
+            "{error}"
         );
     }
 
     #[test]
-    fn access_token_minutes_must_be_a_positive_integer() {
-        for value in [
-            "0",
-            "-5",
-            "abc",
-            "",
-            "1.5",
-            "99999999999999999999",
-            "9999999999999",
-        ] {
-            let error = access_token_lifetime(Some(value.into())).unwrap_err();
+    fn the_file_is_toml_whatever_its_extension_and_optional() {
+        let dir = env::temp_dir().join(format!("aegis-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("aegis.conf");
+        fs::write(&conf, "[smtp]\nport = 2525").unwrap();
+        let load = |path: &Path| {
+            Settings::builder()
+                .preloaded(file_settings(path.to_str().unwrap()).unwrap())
+                .load()
+                .ok()
+                .map(|settings| settings.smtp.port)
+        };
+        assert_eq!(load(&conf), Some(2525));
+        assert_eq!(load(&dir.join("missing")), Some(587));
+        assert_eq!(load(Path::new("/dev/null")), Some(587));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn defaults_apply_and_legacy_tables_are_ignored() {
+        let Ok(settings) = from_file(
+            r#"
+            [guardrails]
+            enabled = true
+            mode = "mask"
+
+            [[providers]]
+            id = "claude"
+            type = "claude_subscription"
+            "#,
+        ) else {
+            panic!("legacy tables should be ignored");
+        };
+        assert_eq!(settings.http_addr.to_string(), "127.0.0.1:8765");
+        assert_eq!(settings.database_url, "sqlite://data/aegis.db?mode=rwc");
+        assert_eq!(settings.max_capture_bytes, 16 * 1024 * 1024);
+        assert_eq!(settings.public_url, None);
+        assert!(!settings.registration_enabled);
+        assert_eq!(settings.smtp.port, 587);
+        assert_eq!(settings.auth.access_token_minutes, 5);
+    }
+
+    #[test]
+    fn access_tokens_last_five_minutes_unless_overridden() {
+        assert_eq!(
+            Config::test_default().oauth.access_token_lifetime.as_secs(),
+            300
+        );
+        assert_eq!(access_token_lifetime(15).unwrap().as_secs(), 900);
+        let Ok(settings) = from_file("[auth]\naccess_token_minutes = 15") else {
+            panic!("configuration should load");
+        };
+        assert_eq!(settings.auth.access_token_minutes, 15);
+    }
+
+    #[test]
+    fn access_token_minutes_must_be_in_range() {
+        for minutes in [0, 9_999_999_999_999, u64::MAX] {
+            let error = access_token_lifetime(minutes).unwrap_err();
             assert!(
-                format!("{error:#}").contains("ACCESS_TOKEN_MINUTES"),
-                "{value}"
+                error.to_string().contains("AUTH_ACCESS_TOKEN_MINUTES"),
+                "{minutes}"
             );
+        }
+        assert!(toml::from_str::<SettingsLayer>("[auth]\naccess_token_minutes = -5").is_err());
+    }
+
+    #[test]
+    fn smtp_is_read_from_the_file_and_validated() {
+        let smtp = |table: &str| {
+            let Ok(settings) = from_file(&format!("[smtp]\n{table}")) else {
+                panic!("{table} should load");
+            };
+            smtp_settings(settings.smtp)
+        };
+        assert!(smtp("port = 25").unwrap().is_none());
+        let settings = smtp("host = \"smtp.example.com\"\nfrom = \"aegis@example.com\"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.host, "smtp.example.com");
+        assert_eq!(settings.port, 587);
+        assert_eq!(settings.from, "aegis@example.com");
+        assert!(settings.username.is_none());
+
+        for (table, named) in [
+            ("host = \"\"\nfrom = \"a@example.com\"", "smtp.host"),
+            ("host = \"h\"", "smtp.from"),
+            ("host = \"h\"\nfrom = \"not an address\"", "smtp.from"),
+            (
+                "host = \"h\"\nfrom = \"a@example.com\"\nport = 0",
+                "smtp.port",
+            ),
+            (
+                "host = \"h\"\nfrom = \"a@example.com\"\nusername = \"u\"",
+                "smtp.password",
+            ),
+        ] {
+            let Err(error) = smtp(table) else {
+                panic!("{table} should be refused");
+            };
+            let error = error.to_string();
+            assert!(error.contains(named), "{table}: {error}");
         }
     }
 
@@ -794,38 +892,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_accounts() {
-        let config: FileConfig = toml::from_str(
-            r#"
-            [[providers]]
-            id = "claude-personal"
-            type = "claude_subscription"
-
-            [[providers]]
-            id = "claude-work"
-            type = "claude_subscription"
-            "#,
-        )
-        .expect("configuration should parse");
-        validate_providers(&config.providers).expect("providers should be valid");
-        assert_eq!(config.providers.len(), 2);
-        assert_eq!(
-            config.providers[0].kind.base_url(),
-            "https://api.anthropic.com"
-        );
-    }
-
-    #[test]
-    fn applies_file_defaults_during_deserialization() {
-        let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
-        assert_eq!(config.http_addr, default_http_addr());
-        assert_eq!(config.database_url, default_database_url());
-        assert!(config.providers.is_empty());
-    }
-
-    #[test]
     fn parses_a_pricing_block_with_overrides() {
-        let config: FileConfig = toml::from_str(
+        let Ok(settings) = from_file(
             r#"
             [pricing]
             url = "https://example.invalid/prices.json"
@@ -838,13 +906,15 @@ mod tests {
             output_per_mtok = 25.0
             cache_read_per_mtok = 0.5
             "#,
-        )
-        .expect("configuration should parse");
-        validate_pricing(&config.pricing).expect("pricing should be valid");
-        assert_eq!(config.pricing.url, "https://example.invalid/prices.json");
-        assert_eq!(config.pricing.refresh_hours, 6);
-        assert!(!config.pricing.enabled);
-        let [override_entry] = config.pricing.overrides.as_slice() else {
+        ) else {
+            panic!("configuration should load");
+        };
+        let pricing = settings.pricing;
+        validate_pricing(&pricing).expect("pricing should be valid");
+        assert_eq!(pricing.url, "https://example.invalid/prices.json");
+        assert_eq!(pricing.refresh_hours, 6);
+        assert!(!pricing.enabled);
+        let [override_entry] = pricing.overrides.as_slice() else {
             panic!("one override should parse");
         };
         assert_eq!(override_entry.model, "claude-opus-4-5");
@@ -854,84 +924,25 @@ mod tests {
 
     #[test]
     fn pricing_falls_back_to_defaults_when_the_section_is_absent() {
-        let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
+        let pricing = Config::test_default().pricing;
         assert_eq!(
-            config.pricing.url,
+            pricing.url,
             "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json"
         );
-        assert_eq!(config.pricing.refresh_hours, 12);
-        assert!(config.pricing.enabled);
-        assert!(config.pricing.overrides.is_empty());
-        validate_pricing(&config.pricing).expect("defaults should be valid");
+        assert_eq!(pricing.refresh_hours, 12);
+        assert!(pricing.enabled);
+        assert!(pricing.overrides.is_empty());
+        validate_pricing(&pricing).expect("defaults should be valid");
     }
 
     #[test]
     fn pricing_rejects_a_plaintext_url_and_a_zero_refresh_interval() {
-        let plaintext = PricingConfig {
-            url: "http://example.invalid/prices.json".into(),
-            ..PricingConfig::default()
-        };
+        let mut plaintext = Config::test_default().pricing;
+        plaintext.url = "http://example.invalid/prices.json".into();
         assert!(validate_pricing(&plaintext).is_err());
 
-        let never_refreshed = PricingConfig {
-            refresh_hours: 0,
-            ..PricingConfig::default()
-        };
+        let mut never_refreshed = Config::test_default().pricing;
+        never_refreshed.refresh_hours = 0;
         assert!(validate_pricing(&never_refreshed).is_err());
-    }
-
-    #[test]
-    fn guardrails_default_to_disabled_observation_and_parse_mask_mode() {
-        let config: FileConfig = toml::from_str("").expect("empty configuration should parse");
-        assert!(!config.guardrails.enabled);
-        assert_eq!(config.guardrails.mode, GuardrailsMode::Observe);
-
-        let config: FileConfig = toml::from_str(
-            r#"
-            [guardrails]
-            enabled = true
-            mode = "mask"
-            "#,
-        )
-        .expect("configuration should parse");
-        assert!(config.guardrails.enabled);
-        assert_eq!(config.guardrails.mode, GuardrailsMode::Mask);
-        assert!(toml::from_str::<FileConfig>("[guardrails]\nmode = \"block\"").is_err());
-        assert!("block".parse::<GuardrailsMode>().is_err());
-    }
-
-    #[test]
-    fn regex_detectors_parse_and_are_refused_when_misnamed_or_broken() {
-        let parsed = |detectors: &str| {
-            let config: FileConfig = toml::from_str(&format!(
-                "[guardrails.regex]\nenabled = true\n[guardrails.regex.detectors]\n{detectors}"
-            ))
-            .expect("configuration should parse");
-            validate_detectors(&config.guardrails)
-        };
-        let empty: FileConfig = toml::from_str("").unwrap();
-        assert!(!empty.guardrails.regex.enabled);
-        assert!(empty.guardrails.regex.detectors.is_empty());
-
-        let ok =
-            parsed("internal_token = '\\bint_[a-z0-9]{32}\\b'\nemployee_id = '\\bEMP-\\d{6}\\b'");
-        assert!(ok.is_ok(), "{ok:?}");
-
-        let misnamed = parsed("Internal-Token = 'x'").unwrap_err().to_string();
-        assert!(misnamed.contains("\"Internal-Token\""), "{misnamed}");
-        assert!(misnamed.contains("snake_case"), "{misnamed}");
-
-        let collision = parsed("github_token = 'x'").unwrap_err().to_string();
-        assert!(collision.contains("\"github_token\""), "{collision}");
-        assert!(collision.contains("built-in secrets"), "{collision}");
-
-        let broken = format!("{:#}", parsed("open_group = '('").unwrap_err());
-        assert!(broken.contains("\"open_group\""), "{broken}");
-        assert!(broken.contains("does not compile"), "{broken}");
-    }
-
-    #[test]
-    fn default_listener_uses_the_documented_port() {
-        assert_eq!(default_http_addr().to_string(), "127.0.0.1:8765");
     }
 }

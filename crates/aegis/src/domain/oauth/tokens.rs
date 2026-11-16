@@ -104,7 +104,9 @@ mod tests {
             (
                 &oauth,
                 "usage:read offline_access",
-                OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+                crate::config::Config::test_default()
+                    .oauth
+                    .access_token_lifetime,
             ),
             (
                 &custom,

@@ -632,7 +632,10 @@ mod tests {
         assert!(token.refresh_token().is_some());
         assert_eq!(
             token.expires_in(),
-            OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME.as_secs()
+            crate::config::Config::test_default()
+                .oauth
+                .access_token_lifetime
+                .as_secs()
         );
         assert!(matches!(
             oauth.redeem_device_code(request()).await,

@@ -107,7 +107,6 @@ impl OAuthConfig {
     pub const CODE_LIFETIME: Duration = Duration::from_secs(5 * 60);
     pub const DEVICE_LIFETIME: Duration = Duration::from_secs(10 * 60);
     pub const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-    pub const DEFAULT_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
     pub const UNREFRESHABLE_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
     pub const REFRESH_IDLE_LIFETIME: Duration = Duration::from_secs(180 * 24 * 60 * 60);
     pub const REFRESH_ABSOLUTE_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -456,7 +455,9 @@ pub(super) mod tests {
         OAuthConfig {
             hmac_key: [8; 32],
             key_id: "oauth-1".into(),
-            access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+            access_token_lifetime: crate::config::Config::test_default()
+                .oauth
+                .access_token_lifetime,
         }
     }
 
