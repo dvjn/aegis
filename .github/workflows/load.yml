@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: load-${{ github.workflow }}-${{ github.ref }}
+  group: load-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
