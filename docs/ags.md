@@ -4,7 +4,13 @@
 
 ## Install
 
-GitHub releases include an `ags` tarball for Linux on `x86_64` and `aarch64`:
+With [mise](https://mise.jdx.dev):
+
+```sh
+mise use -g "github:dvjn/aegis[matching=ags-]"
+```
+
+Or from the GitHub release, for Linux on `x86_64` and `aarch64`:
 
 ```sh
 tag=vX.Y.Z                         # the release
