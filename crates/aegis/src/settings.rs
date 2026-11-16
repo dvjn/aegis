@@ -541,18 +541,27 @@ impl SettingsStore {
         Ok(())
     }
 
-    /// Imports the configuration file's providers and guardrails into the
-    /// instance layer, once, for a database the providers migration marked as
-    /// coming from an older release. Returns whether it imported.
-    pub async fn import_config_once(&self, config: &LegacyConfig) -> anyhow::Result<bool> {
+    /// Imports the configuration file's providers and guardrails, as `legacy`
+    /// reads them, into the instance layer, once, for a database the providers
+    /// migration marked as coming from an older release. Returns whether it
+    /// imported. Otherwise they are only looked for, and an invalid leftover
+    /// never stops startup.
+    pub async fn import_config_once(
+        &self,
+        legacy: impl FnOnce() -> anyhow::Result<LegacyConfig>,
+    ) -> anyhow::Result<bool> {
         if self.setting(IMPORT_PENDING).await?.is_none() {
-            if !config.providers.is_empty() || config.guardrails.enabled {
+            let leftover = legacy().map_or(true, |config| {
+                !config.providers.is_empty() || config.guardrails.enabled
+            });
+            if leftover {
                 tracing::warn!(
                     "providers and guardrails in the configuration file are ignored; manage them in the web interface or with `aegis provider` and `aegis guardrails`"
                 );
             }
             return Ok(false);
         }
+        let config = legacy()?;
         validate_providers(&config.providers)?;
         let tx = crate::db::begin_immediate(&self.database).await?;
         let now = timestamp();
@@ -689,7 +698,10 @@ pub fn effective_guardrails(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
     async fn store() -> (SettingsStore, DatabaseConnection) {
         use sea_orm_migration::MigratorTrait;
@@ -861,7 +873,9 @@ mod tests {
             crate::domain::OAuthConfig {
                 hmac_key: [8; 32],
                 key_id: "v1".into(),
-                access_token_lifetime: crate::domain::OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+                access_token_lifetime: crate::config::Config::test_default()
+                    .oauth
+                    .access_token_lifetime,
             },
         )
         .unwrap();
@@ -946,28 +960,69 @@ mod tests {
     #[tokio::test]
     async fn the_import_runs_only_for_databases_from_an_older_release() {
         let (store, database) = store().await;
-        let config = LegacyConfig {
-            providers: vec![claude("claude")],
-            guardrails: GuardrailsConfig {
-                enabled: true,
-                ..GuardrailsConfig::default()
-            },
+        let legacy = || {
+            Ok(LegacyConfig {
+                providers: vec![claude("claude")],
+                guardrails: GuardrailsConfig {
+                    enabled: true,
+                    ..GuardrailsConfig::default()
+                },
+            })
         };
         // A new database: the migration ran before any user existed.
-        assert!(!store.import_config_once(&config).await.unwrap());
+        assert!(!store.import_config_once(legacy).await.unwrap());
         assert!(store.providers(Scope::Instance).await.unwrap().is_empty());
 
         // An upgraded database: the migration marked it.
+        mark_import_pending(&database).await;
+        assert!(store.import_config_once(legacy).await.unwrap());
+        assert_eq!(store.providers(Scope::Instance).await.unwrap().len(), 1);
+        assert!(store.instance_guardrails().await.unwrap().enabled);
+        assert!(!store.import_config_once(legacy).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_leftover_stops_only_a_pending_import() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let writer = log.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let (store, database) = store().await;
+        let invalid = || anyhow::bail!("guardrails mode \"block\" must be observe or mask");
+
+        assert!(!store.import_config_once(invalid).await.unwrap());
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("in the configuration file are ignored"),
+            "{logged}"
+        );
+
+        mark_import_pending(&database).await;
+        assert!(store.import_config_once(invalid).await.is_err());
+    }
+
+    async fn mark_import_pending(database: &DatabaseConnection) {
         database
             .execute_unprepared(
                 "INSERT INTO settings (key, value, updated_at) VALUES ('config_import_pending', '', '')",
             )
             .await
             .unwrap();
-        assert!(store.import_config_once(&config).await.unwrap());
-        assert_eq!(store.providers(Scope::Instance).await.unwrap().len(), 1);
-        assert!(store.instance_guardrails().await.unwrap().enabled);
-        assert!(!store.import_config_once(&config).await.unwrap());
     }
 
     #[tokio::test]

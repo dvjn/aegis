@@ -896,7 +896,9 @@ mod tests {
             OAuthConfig {
                 hmac_key: [8; 32],
                 key_id: "oauth-2".into(),
-                access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+                access_token_lifetime: crate::config::Config::test_default()
+                    .oauth
+                    .access_token_lifetime,
             },
             clock.clone(),
         )

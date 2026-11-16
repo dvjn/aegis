@@ -268,13 +268,18 @@ struct Smtp {
 
 #[derive(confique::Config)]
 struct Auth {
-    #[config(env = "AUTH_ACCESS_TOKEN_MINUTES")]
-    access_token_minutes: Option<u64>,
+    #[config(env = "AUTH_ACCESS_TOKEN_MINUTES", default = 5)]
+    access_token_minutes: u64,
 }
 
-/// The config file's path.
 pub fn file_path() -> String {
     env::var("AEGIS_CONFIG").unwrap_or_else(|_| "config.toml".into())
+}
+
+/// The file's settings, read as TOML whatever its extension; a missing file
+/// sets nothing.
+fn file_settings(path: &str) -> Result<<Settings as confique::Config>::Layer, confique::Error> {
+    confique::File::with_format(path, confique::FileFormat::Toml).load()
 }
 
 impl Config {
@@ -288,8 +293,8 @@ impl Config {
             http_addr: settings.http_addr,
             database_url: settings.database_url,
             max_capture_bytes: settings.max_capture_bytes,
-            public_url: None,
-            registration_enabled: false,
+            public_url: settings.public_url,
+            registration_enabled: settings.registration_enabled,
             smtp: None,
             auth: AuthConfig {
                 session_hmac_key: [1; 32],
@@ -303,7 +308,8 @@ impl Config {
             oauth: OAuthConfig {
                 hmac_key: [3; 32],
                 key_id: "v1".into(),
-                access_token_lifetime: OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME,
+                access_token_lifetime: access_token_lifetime(settings.auth.access_token_minutes)
+                    .expect("the default lifetime is valid"),
             },
             pricing: settings.pricing,
             secret_placeholder_key: [4; 32],
@@ -312,7 +318,10 @@ impl Config {
 
     pub fn from_env() -> Result<Self> {
         use confique::Config as _;
-        let settings = Settings::builder().env().file(file_path()).load()?;
+        let settings = Settings::builder()
+            .env()
+            .preloaded(file_settings(&file_path())?)
+            .load()?;
         if settings.max_capture_bytes == 0 {
             bail!("MAX_CAPTURE_BYTES (max_capture_bytes) must be greater than zero");
         }
@@ -377,11 +386,8 @@ fn smtp_settings(smtp: Smtp) -> Result<Option<SmtpSettings>> {
     }))
 }
 
-fn access_token_lifetime(minutes: Option<u64>) -> Result<Duration> {
+fn access_token_lifetime(minutes: u64) -> Result<Duration> {
     const TOO_LARGE: &str = "AUTH_ACCESS_TOKEN_MINUTES (auth.access_token_minutes) is too large";
-    let Some(minutes) = minutes else {
-        return Ok(OAuthConfig::DEFAULT_ACCESS_TOKEN_LIFETIME);
-    };
     if minutes == 0 {
         bail!("AUTH_ACCESS_TOKEN_MINUTES (auth.access_token_minutes) must be greater than zero");
     }
@@ -688,52 +694,85 @@ mod tests {
         }
     }
 
+    /// Prints the settings that the process environment layers over a fixed
+    /// file. Run as a child by [`load_in_child`], with an environment of its own.
+    #[test]
+    #[ignore = "run in a child process by the environment tests"]
+    fn print_settings_from_the_env() {
+        let file = toml::from_str(
+            "[smtp]\nport = 2525\npassword = \"file\"\n[pricing]\nrefresh_hours = 6",
+        )
+        .unwrap();
+        match Settings::builder().env().preloaded(file).load() {
+            Ok(settings) => println!(
+                "settings: password={:?} username={:?} from={:?} port={} refresh_hours={}",
+                settings.smtp.password,
+                settings.smtp.username,
+                settings.smtp.from,
+                settings.smtp.port,
+                settings.pricing.refresh_hours,
+            ),
+            Err(error) => println!("settings: error {error}"),
+        }
+    }
+
+    /// What [`print_settings_from_the_env`] prints with only `vars` set.
+    fn load_in_child(vars: &[(&str, &str)]) -> String {
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::print_settings_from_the_env",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{stdout}");
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("settings: "))
+            .unwrap_or_else(|| panic!("the child printed no settings: {stdout}"))
+            .to_owned()
+    }
+
     #[test]
     fn env_vars_win_over_the_file_and_keep_strings_exact() {
-        let set = |name: &str, value: Option<&str>| {
-            // SAFETY: tests run under nextest, one process per test, and no
-            // other test reads these variables.
-            unsafe {
-                match value {
-                    Some(value) => env::set_var(name, value),
-                    None => env::remove_var(name),
-                }
-            }
-        };
-        for (_, env) in settings() {
-            if let Some(env) = env {
-                set(env, None);
-            }
-        }
-        let load = || {
-            Settings::builder()
-                .env()
-                .preloaded(
-                    toml::from_str(
-                        "[smtp]\nport = 2525\npassword = \"file\"\n[pricing]\nrefresh_hours = 6",
-                    )
-                    .unwrap(),
-                )
-                .load()
-        };
-        set("SMTP_PASSWORD", Some("12345"));
-        set("SMTP_USERNAME", Some("true"));
-        set("SMTP_FROM", Some("\"[quoted]\""));
-        set("PRICING_REFRESH_HOURS", Some("3"));
-        let Ok(settings) = load() else {
-            panic!("settings should load");
-        };
-        assert_eq!(settings.smtp.password.as_deref(), Some("12345"));
-        assert_eq!(settings.smtp.username.as_deref(), Some("true"));
-        assert_eq!(settings.smtp.from.as_deref(), Some("\"[quoted]\""));
-        assert_eq!(settings.smtp.port, 2525);
-        assert_eq!(settings.pricing.refresh_hours, 3);
+        assert_eq!(
+            load_in_child(&[
+                ("SMTP_PASSWORD", "12345"),
+                ("SMTP_USERNAME", "true"),
+                ("SMTP_FROM", "\"[quoted]\""),
+                ("PRICING_REFRESH_HOURS", "3"),
+            ]),
+            r#"password=Some("12345") username=Some("true") from=Some("\"[quoted]\"") port=2525 refresh_hours=3"#
+        );
+        let error = load_in_child(&[("SMTP_PORT", "abc")]);
+        assert!(
+            error.starts_with("error ") && error.contains("SMTP_PORT"),
+            "{error}"
+        );
+    }
 
-        set("SMTP_PORT", Some("abc"));
-        let Err(error) = load() else {
-            panic!("SMTP_PORT=abc should be refused");
+    #[test]
+    fn the_file_is_toml_whatever_its_extension_and_optional() {
+        let dir = env::temp_dir().join(format!("aegis-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("aegis.conf");
+        fs::write(&conf, "[smtp]\nport = 2525").unwrap();
+        let load = |path: &Path| {
+            Settings::builder()
+                .preloaded(file_settings(path.to_str().unwrap()).unwrap())
+                .load()
+                .ok()
+                .map(|settings| settings.smtp.port)
         };
-        assert!(error.to_string().contains("SMTP_PORT"), "{error}");
+        assert_eq!(load(&conf), Some(2525));
+        assert_eq!(load(&dir.join("missing")), Some(587));
+        assert_eq!(load(Path::new("/dev/null")), Some(587));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -757,23 +796,26 @@ mod tests {
         assert_eq!(settings.public_url, None);
         assert!(!settings.registration_enabled);
         assert_eq!(settings.smtp.port, 587);
-        assert_eq!(settings.auth.access_token_minutes, None);
+        assert_eq!(settings.auth.access_token_minutes, 5);
     }
 
     #[test]
     fn access_tokens_last_five_minutes_unless_overridden() {
-        assert_eq!(access_token_lifetime(None).unwrap().as_secs(), 300);
-        assert_eq!(access_token_lifetime(Some(15)).unwrap().as_secs(), 900);
+        assert_eq!(
+            Config::test_default().oauth.access_token_lifetime.as_secs(),
+            300
+        );
+        assert_eq!(access_token_lifetime(15).unwrap().as_secs(), 900);
         let Ok(settings) = from_file("[auth]\naccess_token_minutes = 15") else {
             panic!("configuration should load");
         };
-        assert_eq!(settings.auth.access_token_minutes, Some(15));
+        assert_eq!(settings.auth.access_token_minutes, 15);
     }
 
     #[test]
     fn access_token_minutes_must_be_in_range() {
         for minutes in [0, 9_999_999_999_999, u64::MAX] {
-            let error = access_token_lifetime(Some(minutes)).unwrap_err();
+            let error = access_token_lifetime(minutes).unwrap_err();
             assert!(
                 error.to_string().contains("AUTH_ACCESS_TOKEN_MINUTES"),
                 "{minutes}"
