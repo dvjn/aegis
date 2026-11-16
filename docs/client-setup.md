@@ -69,7 +69,7 @@ cargo install --locked --git https://github.com/dvjn/aegis ags
 
 ## Providers
 
-| CLI | Claude subscription | ChatGPT subscription | Bedrock | Vertex |
+| CLI | Claude subscription | ChatGPT subscription | AWS Bedrock | GCP Vertex AI |
 | --- | --- | --- | --- | --- |
 | `claude` | yes | | yes | yes |
 | `codex` | | yes | yes | yes |
