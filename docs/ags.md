@@ -45,7 +45,7 @@ ags prints an approval URL and a code, and opens the browser when it can. On the
 
 The URL must be the server's own address, its [`public_url`](configuration/README.md#config-file), and must use `https` unless it is on loopback.
 
-After approval, login installs the [shims](#shims), then runs `ags setup` in a terminal. A machine pairs with one server at a time; run `ags logout` before logging in to another. To grant more providers, log out and log in again.
+After approval, login installs the [shims](#shims), then runs `ags setup` in a terminal. A machine pairs with one server at a time; run `ags logout` before logging in to another. Change a machine's providers with **Edit** under **Connected apps**.
 
 ags refreshes the machine's token by itself. If the server revokes the machine, ags forgets the login and asks you to log in again.
 
@@ -174,7 +174,7 @@ When a provider's directory holds a different copy of a shared file, for example
 | Type | Credential | Where the request goes |
 | --- | --- | --- |
 | `bedrock` | Bedrock API key | The provider's region, else `AWS_REGION` or `AWS_DEFAULT_REGION` |
-| `vertex` | Service account key file; its `project_id` is the project | The provider's region if it has one, else `CLOUD_ML_REGION` for Claude Code or `GOOGLE_CLOUD_LOCATION` for Codex and pi, else `global` |
+| `vertex` | Service account key file; its `project_id` is the project | The provider's location if it has one, else `CLOUD_ML_REGION` for Claude Code or `GOOGLE_CLOUD_LOCATION` for Codex and pi, else `global` |
 
 ags keeps the credential in the provider's directory and gives it only to that provider's launches. Your own AWS credentials and `GOOGLE_CLOUD_API_KEY` are unset during them.
 
@@ -186,7 +186,7 @@ Codex on Bedrock needs a provider whose endpoint names its region. Codex on Vert
 
 pi's own `anthropic`, `openai-codex`, `amazon-bedrock` and `google-vertex` providers go to one provider of their type: the only one, or the one chosen with `ags use pi <provider>`, which sets the provider for that type. The first launch asks once for each type with several. `-p` sets the provider of its type for one launch.
 
-pi's other providers, including those in `models.json`, are off during `ags pi`. Its sessions are kept in the `pi` directory of the ags directory.
+pi's other providers, including those in `models.json` when pi starts, are off during `ags pi`. Its sessions are kept in the `pi` directory of the ags directory.
 
 ## Environment variables
 
@@ -197,7 +197,7 @@ pi's other providers, including those in `models.json`, are off during `ags pi`.
 | `XDG_CONFIG_HOME` | the ags directory on Linux |
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` | your own CLI settings to share |
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | the Bedrock region, when the provider names none |
-| `CLOUD_ML_REGION`, `GOOGLE_CLOUD_LOCATION` | the Vertex location, when the provider has no region |
+| `CLOUD_ML_REGION`, `GOOGLE_CLOUD_LOCATION` | the Vertex location, when the provider has none |
 
 During a launch, ags points `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR` at the provider's directory, and adds `127.0.0.1` and `localhost` to `NO_PROXY`.
 
@@ -225,6 +225,6 @@ It holds, readable only by you:
 
 ## Limits
 
-- A pi extension can register providers of its own, which don't go through Aegis.
+- During `ags pi`, providers that another pi extension registers, or that are added to `models.json` while pi runs, don't go through Aegis.
 - Windows has no shims and doesn't share your settings files with providers; run `ags claude` and the others directly.
 - ags launches only Claude Code, Codex and pi. Configure other clients, including TypeSafe, [by hand](clients.md).
