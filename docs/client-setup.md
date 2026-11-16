@@ -67,12 +67,20 @@ cargo install --locked --git https://github.com/dvjn/aegis ags
 
    When several providers fit, ags asks once which to use. Change it with `ags use claude <provider>`, or pick one for a single run with `ags -p <provider> claude`.
 
-## Providers
+## Supported CLIs
 
-| CLI | Claude subscription | ChatGPT subscription | AWS Bedrock | GCP Vertex AI |
-| --- | --- | --- | --- | --- |
-| `claude` | yes | | yes | yes |
-| `codex` | | yes | yes | yes |
-| `pi` | yes | yes | yes | yes |
+- Claude Code (`claude`)
+  - Claude subscription
+  - AWS Bedrock
+  - GCP Vertex AI
+- Codex (`codex`)
+  - ChatGPT subscription
+  - AWS Bedrock
+  - GCP Vertex AI
+- pi (`pi`)
+  - Claude subscription
+  - ChatGPT subscription
+  - AWS Bedrock
+  - GCP Vertex AI
 
 `ags pi` reaches every granted provider in one launch, each under its own name. pi's other providers are off during it.

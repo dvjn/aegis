@@ -4,7 +4,7 @@
 
 - Docker
 - Credentials for a configured provider
-- A [supported CLI](client-setup.md#providers)
+- A [supported CLI](client-setup.md#supported-clis)
 
 ## 1. Create the first account
 
