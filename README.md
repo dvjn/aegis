@@ -12,11 +12,12 @@ The local bootstrap task creates a development account and API key. See the comm
 
 ## Documentation
 
-- [Quick start](docs/quick-start.md) - run Aegis and connect a client.
+- [Quick start](docs/quick-start.md) - run Aegis and run a CLI through it.
+- [ags](docs/ags.md) - the command-line client that runs Claude Code, Codex and pi through Aegis.
 - [Server deployment](docs/deployment/README.md) - run the container and operate the service.
 - [Server configuration](docs/configuration/README.md) - config file fields and environment variables.
 - [Providers, guardrails and API keys](docs/providers.md) - what clients reach and how requests are protected.
-- [Client configuration](docs/clients.md) - configure Claude Code, Codex, and pi.
+- [Client configuration](docs/clients.md) - configure clients by hand, with an API key.
 
 ## License
 

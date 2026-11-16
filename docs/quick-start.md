@@ -4,6 +4,7 @@
 
 - Podman or Docker
 - Credentials for a configured provider
+- Claude Code, Codex or pi
 
 The commands below use Podman. Replace `podman` with `docker` if needed.
 
@@ -45,16 +46,36 @@ podman run --rm --name aegis \
 
 Open <http://127.0.0.1:8765> and sign in. The first account is a superuser.
 
-Add a provider and create an API key granted to it. Provider IDs become part of the gateway URL. See [Providers, guardrails and API keys](providers.md).
+Add a provider. Provider IDs become part of the gateway URL. See [Providers, guardrails and API keys](providers.md).
 
-## 4. Connect a client
+## 4. Run a CLI through Aegis
 
-Follow [Client configuration](clients.md) for Claude Code, Codex, or pi.
+Install [ags](ags.md#install), then pair this machine:
 
-Aegis is bring your own credentials. Provider credentials stay in the client and Aegis does not store them.
+```sh
+ags login http://127.0.0.1:8765
+```
+
+Approve the machine in the browser and choose its providers. ags then signs in to each provider in the terminal.
+
+To run plain `claude`, `codex` and `pi` through ags, run this line and add it to `~/.bashrc` ([other shells](ags.md#init)):
+
+```sh
+eval "$(ags init bash)"
+```
+
+Then run the CLI as usual:
+
+```sh
+claude
+```
+
+Aegis is bring your own credentials. Provider credentials stay on the machine, and Aegis does not store them.
+
+For clients and automation that can't use ags, [configure the client by hand](clients.md) with an API key.
 
 ## Next steps
 
-- [Configure a client](clients.md).
+- [Use ags](ags.md).
 - [Configure Aegis](configuration/README.md).
 - [Operate the container](deployment/container.md).

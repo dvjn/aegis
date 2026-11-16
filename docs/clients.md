@@ -1,6 +1,8 @@
 # Client configuration
 
-Configure each client for its provider as usual; its credentials pass through Aegis, which never stores them. Pointing a client at Aegis needs only its base URL and the `x-aegis-api-key` header, with an API key granted that provider (see [API keys](providers.md#api-keys)).
+[ags](ags.md) runs Claude Code, Codex and pi through Aegis with nothing to configure. Use it where you can.
+
+Configure a client by hand for automation, TypeSafe, or anywhere ags can't run. Set the client up for its provider as usual; its credentials pass through Aegis, which never stores them. Pointing a client at Aegis needs only its base URL and the `x-aegis-api-key` header, with an API key granted that provider (see [API keys](providers.md#api-keys)).
 
 The examples assume Aegis at `http://127.0.0.1:8765`, providers named `claude`, `codex`, `aws` (Bedrock), `gcp` (Vertex) and `typesafe`, and the key in the environment:
 
