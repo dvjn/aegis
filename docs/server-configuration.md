@@ -34,7 +34,9 @@ Without `SMTP_HOST`, Aegis writes emails like password-reset links to the log.
 
 ## Config file
 
-- `AEGIS_CONFIG`: path to the config file, example `config.toml`
+- `AEGIS_CONFIG`: path to the config file
+
+Example `config.toml`:
 
 ```toml
 public_url = "https://aegis.example.com"

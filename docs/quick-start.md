@@ -25,7 +25,7 @@ docker run --rm --name aegis -p 127.0.0.1:8765:8765 -v aegis-data:/data \
 
 Open <http://127.0.0.1:8765> and sign in. The first account is a superuser.
 
-Add a provider. Provider IDs become part of the gateway URL. See [Providers, guardrails and API keys](providers.md).
+Add a provider in the web interface.
 
 ## 3. Run a CLI through Aegis
 
