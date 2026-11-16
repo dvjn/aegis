@@ -6,39 +6,20 @@
 - Credentials for a configured provider
 - Claude Code, Codex or pi
 
-## 1. Create the configuration
-
-Create `config.toml` from the complete example in [Configuration](configuration/README.md#config-file).
-
-Set `public_url` when clients will reach Aegis through a URL other than `http://127.0.0.1:8765`.
+## 1. Create the first account
 
 ```sh
 docker volume create aegis-data
-```
-
-Keep the configuration file and the `aegis-data` volume when you restart or upgrade Aegis.
-
-## 2. Create the first account
-
-```sh
-docker run --rm -it \
-  -v aegis-data:/data \
-  -v "$PWD/config.toml:/etc/aegis.toml:ro" \
-  -e AEGIS_CONFIG=/etc/aegis.toml \
-  ghcr.io/dvjn/aegis:latest \
+docker run --rm -it -v aegis-data:/data ghcr.io/dvjn/aegis:latest \
   bootstrap-user --email you@example.com
 ```
 
-Enter the password when prompted.
+Enter the password when prompted. Keep the `aegis-data` volume when you restart or upgrade Aegis.
 
-## 3. Start the server
+## 2. Start the server
 
 ```sh
-docker run --rm --name aegis \
-  -p 127.0.0.1:8765:8765 \
-  -v aegis-data:/data \
-  -v "$PWD/config.toml:/etc/aegis.toml:ro" \
-  -e AEGIS_CONFIG=/etc/aegis.toml \
+docker run --rm --name aegis -p 127.0.0.1:8765:8765 -v aegis-data:/data \
   ghcr.io/dvjn/aegis:latest
 ```
 
@@ -46,7 +27,7 @@ Open <http://127.0.0.1:8765> and sign in. The first account is a superuser.
 
 Add a provider. Provider IDs become part of the gateway URL. See [Providers, guardrails and API keys](providers.md).
 
-## 4. Run a CLI through Aegis
+## 3. Run a CLI through Aegis
 
 Install the client, `ags` ([other ways](client.md#install)), and pair this machine:
 
