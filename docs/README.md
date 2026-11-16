@@ -8,7 +8,7 @@
 ## Deployment
 
 - [Overview](deployment/README.md) - deployment requirements and storage.
-- [Container](deployment/container.md) - run Aegis with Podman or Docker.
+- [Container](deployment/container.md) - run Aegis with Docker.
 
 ## Reference
 

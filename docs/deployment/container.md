@@ -7,7 +7,7 @@ Create `config.toml`. At minimum, set the public URL. See [Configuration](../con
 Create persistent storage:
 
 ```sh
-podman volume create aegis-data
+docker volume create aegis-data
 ```
 
 ## 2. Create the first account
@@ -15,7 +15,7 @@ podman volume create aegis-data
 Run this once before starting the server:
 
 ```sh
-podman run --rm -it \
+docker run --rm -it \
   -v aegis-data:/data \
   -v "$PWD/config.toml:/etc/aegis.toml:ro" \
   -e AEGIS_CONFIG=/etc/aegis.toml \
@@ -26,7 +26,7 @@ podman run --rm -it \
 ## 3. Run
 
 ```sh
-podman run -d --name aegis --restart=unless-stopped \
+docker run -d --name aegis --restart=unless-stopped \
   -p 127.0.0.1:8765:8765 \
   -v aegis-data:/data \
   -v "$PWD/config.toml:/etc/aegis.toml:ro" \
@@ -39,9 +39,9 @@ Bind to a private address when a reverse proxy runs on another host. Set `public
 ## Operating
 
 ```sh
-podman logs -f aegis
+docker logs -f aegis
 curl -fsS http://127.0.0.1:8765/healthz
-podman restart aegis
+docker restart aegis
 ```
 
 Back up the `aegis-data` volume while Aegis is stopped. The volume contains the SQLite database and `root.key`. Losing `root.key` invalidates password and OAuth secrets derived from it.
