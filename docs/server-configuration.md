@@ -51,12 +51,4 @@ registration_enabled = false   # allow sign-up through the web form
 enabled = true
 refresh_hours = 12
 url = "https://raw.githubusercontent.com/dvjn/aegis/main/pricing/model_prices.json"
-
-# One table per model whose price Aegis should override.
-# [[pricing.overrides]]
-# model = "example-model"
-# input_per_mtok = 1.0
-# output_per_mtok = 5.0
-# cache_read_per_mtok = 0.1
-# cache_write_per_mtok = 1.25
 ```
