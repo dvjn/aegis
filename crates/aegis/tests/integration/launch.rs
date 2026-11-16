@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ags::{Cli, Offer, Pick, Store};
+use ags::{Cli, Credentials, Home, Need, Offer, Pick, Step, StepStatus, Store};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
 use crate::{pairing::approve, shared::gateway::Gateway};
@@ -68,6 +68,7 @@ async fn a_launched_cli_reaches_its_provider_only_through_its_own_proxy() {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let store = Store::at(dir.join("ags"));
+    let credentials = Credentials::new(&store, Home::at(&dir.join("home")));
     let mut approval = None;
     ags::login(&store, &base, |request| {
         approval = Some(tokio::spawn(approve(
@@ -119,12 +120,59 @@ async fn a_launched_cli_reaches_its_provider_only_through_its_own_proxy() {
         assert_eq!(refused.to_string(), error);
     }
 
+    // Each granted subscription needs a sign-in for every CLI that runs on it.
+    let step = |provider: &str, provider_type: &str, need| Step {
+        provider: provider.to_owned(),
+        provider_type: provider_type.to_owned(),
+        need,
+        status: StepStatus::Missing,
+    };
+    let steps = ags::setup_steps(&store, &credentials, None).await.unwrap();
+    assert_eq!(
+        steps,
+        [
+            step("claude", "claude_subscription", Need::SignIn(Cli::Claude)),
+            step("claude", "claude_subscription", Need::SignIn(Cli::Pi)),
+            step("codex", "codex_subscription", Need::SignIn(Cli::Codex)),
+            step("codex", "codex_subscription", Need::SignIn(Cli::Pi)),
+        ]
+    );
+    let claude_dir = credentials.cli_dir("claude", Cli::Claude).unwrap();
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join(".credentials.json"),
+        r#"{"claudeAiOauth":{}}"#,
+    )
+    .unwrap();
+    credentials.skip("claude", Need::SignIn(Cli::Pi)).unwrap();
+    let steps = ags::setup_steps(&store, &credentials, Some("claude"))
+        .await
+        .unwrap();
+    let statuses: Vec<_> = steps.iter().map(|step| step.status).collect();
+    let signed_in = if cfg!(target_os = "macos") {
+        StepStatus::Missing
+    } else {
+        StepStatus::Done
+    };
+    assert_eq!(statuses, [signed_in, StepStatus::Skipped]);
+    credentials.unskip("claude", Need::SignIn(Cli::Pi)).unwrap();
+    let steps = ags::setup_steps(&store, &credentials, Some("claude"))
+        .await
+        .unwrap();
+    assert_eq!(steps[1].status, StepStatus::Missing);
+    let refused = ags::setup_steps(&store, &credentials, Some("typesafe"))
+        .await
+        .err()
+        .unwrap();
+    assert!(refused.to_string().starts_with("typesafe is not granted"));
+
     std::fs::write(bin.join("body"), gateway.text_body(false)).unwrap();
     let claude_code = stub(
         &bin,
         "claude",
         r#"printf '%s\n' "$@" > "$out/args"
 printf '%s' "$ANTHROPIC_BASE_URL" > "$out/base"
+printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config"
 secret="$(printf '%s\n' "$ANTHROPIC_CUSTOM_HEADERS" | grep '^x-ags-launch-secret: ')"
 printf '%s' "$secret" > "$out/secret"
 call -X POST "$ANTHROPIC_BASE_URL/v1/messages" -H 'content-type: application/json' \
@@ -139,6 +187,7 @@ exit 7"#,
     let args = ["--resume", "-p", "--", "two words", "--help"];
     let launched = ags::launch(
         &store,
+        &credentials,
         Cli::Claude,
         &claude,
         args.iter().map(OsString::from).collect(),
@@ -154,6 +203,7 @@ exit 7"#,
     );
     assert!(launched.logged_out.is_none());
     assert_eq!(read(&bin, "args"), format!("{}\n", args.join("\n")));
+    assert_eq!(read(&bin, "config"), claude_dir.to_str().unwrap());
     let proxy = read(&bin, "base");
     assert!(proxy.starts_with("http://127.0.0.1:"), "{proxy}");
     assert!(!proxy.contains(&token));
@@ -194,6 +244,7 @@ exit 7"#,
         "pi",
         r#"printf '%s\n' "$@" > "$out/pi-args"
 printf '%s' "$AGS_PI_PROVIDER" > "$out/pi-provider"
+printf '%s' "$PI_CODING_AGENT_DIR" > "$out/pi-config"
 call -X POST "$AGS_PI_BASE_URL/responses" -H 'content-type: application/json' \
   -H "x-ags-launch-secret: $AGS_LAUNCH_SECRET" \
   --data '{"model":"gpt-test","input":"hi"}' > "$out/pi-status"
@@ -201,6 +252,7 @@ kill -TERM $$"#,
     );
     let launched = ags::launch(
         &store,
+        &credentials,
         Cli::Pi,
         &offer("codex", "codex_subscription"),
         vec!["--print".into()],
@@ -220,6 +272,14 @@ kill -TERM $$"#,
     assert!(pi_args[1].ends_with("pi-extension.js"));
     assert_eq!(pi_args[2..], ["--print"]);
     assert_eq!(read(&bin, "pi-provider"), "openai-codex");
+    assert_eq!(
+        read(&bin, "pi-config"),
+        credentials
+            .cli_dir("codex", Cli::Pi)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
     assert_eq!(read(&bin, "pi-status"), "200");
     let received = gateway.upstream.received();
     assert_eq!(received.last().unwrap().path, "/responses");
@@ -256,6 +316,7 @@ kill -TERM $$"#,
         .unwrap();
     let launched = ags::launch(
         &store,
+        &credentials,
         Cli::Claude,
         &claude,
         vec![],

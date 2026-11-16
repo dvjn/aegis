@@ -11,7 +11,8 @@ use tokio::process::Command;
 use clap::ValueEnum;
 
 use crate::{
-    Cli, LoggedOut, Login, Store, current_login, defaults, forget, proxy::Proxy, server::Server,
+    Cli, Credentials, LoggedOut, Login, Store, current_login, defaults, forget, proxy::Proxy,
+    server::Server,
 };
 
 /// A provider granted to this machine that a CLI can run on.
@@ -35,11 +36,11 @@ pub struct CliDefault {
     pub provider_type: Option<String>,
 }
 
-fn not_logged_in() -> anyhow::Error {
+pub(crate) fn not_logged_in() -> anyhow::Error {
     anyhow!("not logged in; run `ags login <URL>` first")
 }
 
-async fn granted(store: &Store) -> Result<Option<(Login, Machine)>> {
+pub(crate) async fn granted(store: &Store) -> Result<Option<(Login, Machine)>> {
     let Some(login) = current_login(store).await? else {
         return Ok(None);
     };
@@ -151,9 +152,11 @@ pub struct Launched {
     pub logged_out: Option<anyhow::Error>,
 }
 
-/// Runs `cli` with `args` on `offer` until it exits. `program` replaces the CLI's name on `PATH`.
+/// Runs `cli` with `args` on `offer`, in the provider's own config dir, until it exits.
+/// `program` replaces the CLI's name on `PATH`.
 pub async fn launch(
     store: &Store,
+    credentials: &Credentials,
     cli: Cli,
     offer: &Offer,
     args: Vec<OsString>,
@@ -161,6 +164,7 @@ pub async fn launch(
 ) -> Result<Launched> {
     let login = current_login(store).await?.ok_or_else(not_logged_in)?;
     let server = login.server.clone();
+    let isolation = credentials.isolate(&offer.id, &offer.provider_type, cli)?;
     // A random UUID carries nothing about the launch, such as when it started.
     let launch_id = uuid::Uuid::new_v4().to_string();
     let proxy = Proxy::start(
@@ -182,12 +186,14 @@ pub async fn launch(
     let program = program.unwrap_or(&name);
     let mut command = Command::new(program);
     command
+        .args(isolation.args)
         .args(setup.args)
         .args(args)
+        .envs(isolation.env)
         .envs(setup.env)
         .envs(no_proxy(|name| std::env::var(name).ok()))
         .kill_on_drop(true);
-    for name in setup.unset {
+    for name in isolation.unset.iter().chain(setup.unset) {
         command.env_remove(name);
     }
     die_with_parent(&mut command);
@@ -215,7 +221,7 @@ async fn logged_out_of(store: &Store, server: &str) -> Option<anyhow::Error> {
 }
 
 /// The CLI reaches the proxy directly, even when told to use an HTTP proxy.
-fn no_proxy(inherited: impl Fn(&str) -> Option<String>) -> [(&'static str, String); 2] {
+pub(crate) fn no_proxy(inherited: impl Fn(&str) -> Option<String>) -> [(&'static str, String); 2] {
     let names = ["NO_PROXY", "no_proxy"];
     let inherited: Vec<String> = names.iter().filter_map(|name| inherited(name)).collect();
     let mut hosts: Vec<String> = Vec::new();
@@ -255,7 +261,7 @@ fn die_with_parent(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn die_with_parent(_command: &mut Command) {}
 
-fn spawn(mut command: Command, program: &OsStr) -> Result<tokio::process::Child> {
+pub(crate) fn spawn(mut command: Command, program: &OsStr) -> Result<tokio::process::Child> {
     command.spawn().map_err(|error| {
         let program = program.to_string_lossy();
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -268,7 +274,7 @@ fn spawn(mut command: Command, program: &OsStr) -> Result<tokio::process::Child>
 
 /// The terminal sends interrupts to the CLI as well; ags outlives them to keep the proxy up.
 #[cfg(unix)]
-async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus> {
+pub(crate) async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut quit = signal(SignalKind::quit())?;
@@ -293,7 +299,7 @@ async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus> {
 }
 
 #[cfg(not(unix))]
-async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus> {
+pub(crate) async fn wait(command: Command, program: &OsStr) -> Result<ExitStatus> {
     let mut child = spawn(command, program)?;
     loop {
         tokio::select! {

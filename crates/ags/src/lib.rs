@@ -1,6 +1,7 @@
 //! Pairs this machine with one Aegis server, keeps its tokens fresh, and launches CLIs through it.
 
 mod clis;
+mod credentials;
 mod defaults;
 mod launch;
 mod proxy;
@@ -12,6 +13,7 @@ use std::{fmt, time::Duration};
 use aegis_wire::{Machine, TokenResponse};
 use anyhow::{Result, bail};
 pub use clis::Cli;
+pub use credentials::{Credentials, Home, Need, Step, StepStatus, installed, product, setup_steps};
 pub use launch::{
     CliDefault, Launched, Offer, Pick, cli_defaults, launch, pick, remember, use_provider,
 };

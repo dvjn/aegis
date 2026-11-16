@@ -129,7 +129,7 @@ pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<Path
     written.map(|()| path)
 }
 
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

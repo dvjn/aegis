@@ -4,7 +4,10 @@ use std::{
     process::{ExitCode, ExitStatus, Stdio},
 };
 
-use ags::{Approval, Cli, CliDefault, Logout, Offer, Pick, Store, provider_text};
+use ags::{
+    Approval, Cli, CliDefault, Credentials, Home, Logout, Need, Offer, Pick, Step, StepStatus,
+    Store, product, provider_text,
+};
 use anyhow::bail;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -30,6 +33,11 @@ enum Command {
     Logout,
     /// Show the server, account and providers of this machine
     Status,
+    /// Sign in to each provider that needs it, or again to one provider
+    Setup {
+        /// Set up only this provider, again if it was set up before
+        provider: Option<String>,
+    },
     /// Set the provider a CLI uses, or list the provider of each CLI
     Use {
         #[arg(requires = "provider")]
@@ -145,6 +153,7 @@ fn exit_code(status: ExitStatus) -> ExitCode {
 
 async fn launch(
     store: &Store,
+    credentials: &Credentials,
     cli: Cli,
     provider: Option<String>,
     args: Vec<OsString>,
@@ -163,15 +172,306 @@ async fn launch(
             offer
         }
     };
-    let launched = ags::launch(store, cli, &offer, args, None).await?;
+    if let Some(need) = Need::of_launch(cli, &offer.provider_type)
+        && !credentials.has(&offer.id, &offer.provider_type, need)?
+    {
+        let id = &offer.id;
+        if !interactive() {
+            bail!("{id} has no {need} yet; run `ags setup {id}` first");
+        }
+        eprintln!("{id} has no {need} yet.");
+        let step = Step {
+            provider: offer.id.clone(),
+            provider_type: offer.provider_type.clone(),
+            need,
+            status: StepStatus::Missing,
+        };
+        if set_up(credentials, &step).await? != Outcome::Done {
+            bail!("{id} has no {need}; set it up with `ags setup {id}`");
+        }
+    }
+    warn(credentials, &offer.id, cli)?;
+    let launched = ags::launch(store, credentials, cli, &offer, args, None).await?;
     if let Some(error) = launched.logged_out {
         eprintln!("ags: {error:#}");
     }
     Ok(Exit::As(launched.status))
 }
 
+/// Tells the user, once, about settings that keep `provider` from using its own sign-in in `cli`.
+fn warn(credentials: &Credentials, provider: &str, cli: Cli) -> anyhow::Result<()> {
+    for notice in credentials.notices(provider, cli)? {
+        eprintln!("ags: {notice}");
+    }
+    Ok(())
+}
+
+fn interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// `ags setup`: walks the credentials that are missing, or every one of `only`.
+async fn setup(
+    store: &Store,
+    credentials: &Credentials,
+    only: Option<&str>,
+) -> anyhow::Result<bool> {
+    let steps = ags::setup_steps(store, credentials, only).await?;
+    if let Some(id) = only
+        && steps.is_empty()
+    {
+        println!("{id} needs nothing set up.");
+        return Ok(true);
+    }
+    let redo = only.is_some();
+    // `absent` sign-ins are for CLIs that are not installed.
+    let (mut todo, mut absent, mut skipped) = (vec![], vec![], vec![]);
+    for step in steps {
+        match step.status {
+            StepStatus::Done if !redo || !installed(&step) => {}
+            StepStatus::Skipped if !redo => skipped.push(step),
+            _ if !installed(&step) => absent.push(step),
+            _ => todo.push(step),
+        }
+    }
+    if !todo.is_empty() && !interactive() {
+        bail!("setting up providers needs a terminal");
+    }
+    let mut failed = vec![];
+    let mut waiting = vec![];
+    for step in &absent {
+        let Need::SignIn(cli) = step.need else {
+            continue;
+        };
+        if interactive() {
+            println!();
+            println!("{} ({}): {}", step.provider, step.provider_type, step.need);
+            let name = product(cli);
+            if !confirm(&format!(
+                "{name} is not installed. Sign in to it for {} once it is?",
+                step.provider
+            ))? {
+                credentials.skip(&step.provider, step.need)?;
+                skipped.push(step.clone());
+                continue;
+            }
+            credentials.unskip(&step.provider, step.need)?;
+        }
+        waiting.push(step.clone());
+    }
+    for step in &todo {
+        println!();
+        println!("{} ({}): {}", step.provider, step.provider_type, step.need);
+        let outcome = set_up(credentials, step).await.unwrap_or_else(|error| {
+            eprintln!("ags: {error:#}");
+            Outcome::Failed
+        });
+        match outcome {
+            Outcome::Done | Outcome::Kept => {}
+            Outcome::Skipped => skipped.push(step.clone()),
+            Outcome::Failed => failed.push(step.clone()),
+        }
+    }
+    if !todo.is_empty() || (!absent.is_empty() && interactive()) {
+        println!();
+    }
+    let list = |steps: &[Step]| {
+        steps
+            .iter()
+            .map(|step| format!("{} ({})", step.provider, step.need))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !failed.is_empty() {
+        match only {
+            Some(id) => println!("Could not set up {id}. Run `ags setup {id}` to try again."),
+            None => println!("Not set up: {}. Run `ags setup` to finish.", list(&failed)),
+        }
+    }
+    if !skipped.is_empty() {
+        println!(
+            "Skipped: {}. Set one up with `ags setup <provider>`.",
+            list(&skipped)
+        );
+    }
+    for step in &waiting {
+        if let Need::SignIn(cli) = step.need {
+            println!(
+                "Install {}, then run `ags setup {}` to sign in to it.",
+                product(cli),
+                step.provider
+            );
+        }
+    }
+    if failed.is_empty() && skipped.is_empty() && waiting.is_empty() {
+        match only {
+            Some(id) => println!("{id} is set up."),
+            None if todo.is_empty() => {
+                println!("Every provider is set up. Redo one with `ags setup <provider>`.");
+            }
+            None => println!("Every provider is set up."),
+        }
+    }
+    Ok(failed.is_empty())
+}
+
+/// Whether the CLI a step signs in to is installed; other steps need no CLI.
+fn installed(step: &Step) -> bool {
+    match step.need {
+        Need::SignIn(cli) => ags::installed(cli),
+        _ => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Done,
+    /// Declined, with the earlier credential still in place.
+    Kept,
+    Skipped,
+    Failed,
+}
+
+/// Sets up one credential at the terminal. Declining a missing one is remembered.
+async fn set_up(credentials: &Credentials, step: &Step) -> anyhow::Result<Outcome> {
+    let (id, provider_type, need) = (&step.provider, &step.provider_type, step.need);
+    let answered = match need {
+        Need::SignIn(cli) => {
+            let name = product(cli);
+            if !confirm(&format!("Sign in to {name} for {id} now?"))? {
+                None
+            } else {
+                warn(credentials, id, cli)?;
+                credentials.sign_in(id, provider_type, cli, None).await?;
+                if !credentials.has(id, provider_type, need)? {
+                    eprintln!("ags: {id} is not signed in to {name}");
+                    return Ok(Outcome::Failed);
+                }
+                Some(format!("{id} is signed in to {name}."))
+            }
+        }
+        Need::BedrockKey => {
+            let key = read_secret(&format!("Bedrock API key for {id}: "))?;
+            if key.is_empty() {
+                None
+            } else {
+                credentials.save_bedrock_key(id, &key)?;
+                Some(format!("Saved the Bedrock API key for {id}."))
+            }
+        }
+        Need::VertexAccount => {
+            let path = read_answer(&format!("Service account key file for {id}: "))?;
+            if path.is_empty() {
+                None
+            } else {
+                credentials.save_vertex_account(id, std::path::Path::new(&path))?;
+                Some(format!("Saved a copy of the service account key for {id}."))
+            }
+        }
+    };
+    match answered {
+        Some(done) => {
+            credentials.unskip(id, need)?;
+            println!("{done}");
+            Ok(Outcome::Done)
+        }
+        None if step.status == StepStatus::Done => Ok(Outcome::Kept),
+        None => {
+            credentials.skip(id, need)?;
+            Ok(Outcome::Skipped)
+        }
+    }
+}
+
+/// Asks a yes-or-no question; an empty answer is yes.
+fn confirm(question: &str) -> anyhow::Result<bool> {
+    loop {
+        let answer = read_answer(&format!("{question} [Y/n] "))?.to_ascii_lowercase();
+        match answer.as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+fn read_answer(prompt: &str) -> anyhow::Result<String> {
+    eprint!("{prompt}");
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        bail!("no answer");
+    }
+    Ok(line.trim().to_owned())
+}
+
+/// Reads a line from the terminal without showing it. Ctrl-C restores the terminal before it ends ags.
+#[cfg(unix)]
+fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    use std::{io::Read, os::fd::AsRawFd};
+
+    /// Puts the terminal back as it was, however reading ends.
+    struct Restore(libc::c_int, libc::termios);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: the fd is stdin and the settings came from tcgetattr.
+            unsafe { libc::tcsetattr(self.0, libc::TCSANOW, &raw const self.1) };
+        }
+    }
+
+    let fd = std::io::stdin().as_raw_fd();
+    // SAFETY: termios is plain data, filled in by tcgetattr before it is read.
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is this process's stdin and `saved` outlives the call.
+    if unsafe { libc::tcgetattr(fd, &raw mut saved) } != 0 {
+        return read_answer(prompt);
+    }
+    let mut raw = saved;
+    raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    eprint!("{prompt}");
+    let restore = Restore(fd, saved);
+    // SAFETY: as above; `restore` puts the saved settings back.
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) };
+    let mut line = Vec::new();
+    let mut stdin = std::io::stdin().lock();
+    let mut byte = [0_u8; 1];
+    loop {
+        if stdin.read(&mut byte)? == 0 {
+            bail!("no answer");
+        }
+        match byte[0] {
+            b'\r' | b'\n' => break,
+            // Ctrl-C
+            0x03 => {
+                drop(restore);
+                eprintln!();
+                // SAFETY: raise only sends this process the signal Ctrl-C would have.
+                unsafe { libc::raise(libc::SIGINT) };
+                bail!("interrupted");
+            }
+            // Ctrl-D
+            0x04 if line.is_empty() => bail!("no answer"),
+            // Backspace and Delete remove a whole character.
+            0x08 | 0x7f => while line.pop().is_some_and(|byte| byte & 0xc0 == 0x80) {},
+            // Ctrl-U
+            0x15 => line.clear(),
+            byte if byte < 0x20 => {}
+            byte => line.push(byte),
+        }
+    }
+    drop(restore);
+    eprintln!();
+    Ok(String::from_utf8_lossy(&line).trim().to_owned())
+}
+
+#[cfg(not(unix))]
+fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    read_answer(prompt)
+}
+
 fn ask(cli: Cli, offers: Vec<Offer>) -> anyhow::Result<Offer> {
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if !interactive() {
         bail!(
             "{cli} can run on several providers; choose one with `ags use {cli} <provider>`, or for one launch with `ags -p <provider> {cli}` or AGS_PROVIDER"
         );
@@ -234,15 +534,21 @@ fn defaults_table(rows: &[CliDefault]) -> String {
 
 async fn run(args: Args) -> anyhow::Result<Exit> {
     let store = Store::default_location()?;
+    let credentials = Credentials::new(&store, Home::from_env());
     match args.command {
         Command::Claude { args: cli_args } => {
-            return launch(&store, Cli::Claude, args.provider, cli_args).await;
+            return launch(&store, &credentials, Cli::Claude, args.provider, cli_args).await;
         }
         Command::Codex { args: cli_args } => {
-            return launch(&store, Cli::Codex, args.provider, cli_args).await;
+            return launch(&store, &credentials, Cli::Codex, args.provider, cli_args).await;
         }
         Command::Pi { args: cli_args } => {
-            return launch(&store, Cli::Pi, args.provider, cli_args).await;
+            return launch(&store, &credentials, Cli::Pi, args.provider, cli_args).await;
+        }
+        Command::Setup { provider } => {
+            if !setup(&store, &credentials, provider.as_deref()).await? {
+                return Ok(Exit::Code(ExitCode::FAILURE));
+            }
         }
         Command::Use {
             cli: Some(cli),
@@ -262,6 +568,15 @@ async fn run(args: Args) -> anyhow::Result<Exit> {
             let status = ags::login(&store, &url, show_approval).await?;
             println!("Logged in to {} as {}.", status.server, status.account);
             println!("Providers: {}", provider_text(&status.providers));
+            if interactive() {
+                setup(&store, &credentials, None).await?;
+            } else if ags::setup_steps(&store, &credentials, None)
+                .await?
+                .iter()
+                .any(|step| step.status == StepStatus::Missing && installed(step))
+            {
+                println!("Run `ags setup` in a terminal to sign in to each provider.");
+            }
         }
         Command::Logout => match ags::logout(&store).await? {
             None => println!("Not logged in."),
@@ -470,6 +785,18 @@ mod tests {
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
         assert!(error.to_string().contains("Usage: ags"));
+    }
+
+    #[test]
+    fn setup_walks_every_provider_or_redoes_one() {
+        assert!(matches!(
+            parse(&["ags", "setup"]).unwrap().command,
+            Command::Setup { provider: None }
+        ));
+        assert!(matches!(
+            parse(&["ags", "setup", "aws"]).unwrap().command,
+            Command::Setup { provider: Some(provider) } if provider == "aws"
+        ));
     }
 
     #[test]
