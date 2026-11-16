@@ -4,7 +4,7 @@
 
 - Docker
 - Credentials for a configured provider
-- Claude Code, Codex or pi
+- A [supported CLI](client-setup.md#providers)
 
 ## 1. Create the first account
 
@@ -35,7 +35,7 @@ Install the client, `ags` ([other ways](client-setup.md#install)):
 mise use -g "github:dvjn/aegis[matching=ags-]"
 ```
 
-To run plain `claude`, `codex` and `pi` through ags, add the line for your shell to its startup file, then open a new shell:
+To run your CLIs through ags, add the line for your shell to its startup file, then open a new shell:
 
 ```sh
 # Fish Shell, ~/.config/fish/config.fish
