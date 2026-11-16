@@ -1,16 +1,6 @@
-# Aegis documentation
+# Aegis Documentation
 
-## Start here
-
-- [Quick start](quick-start.md) - run one container and connect a client.
-- [Client configuration](clients.md) - configure Claude Code, Codex, and pi.
-
-## Deployment
-
-- [Overview](deployment/README.md) - deployment requirements and storage.
-- [Container](deployment/container.md) - run Aegis with Podman or Docker.
-
-## Reference
-
-- [Providers, guardrails and API keys](providers.md) - provider types, guardrails, keys, and their commands.
-- [Configuration](configuration/README.md) - config file fields and environment variables.
+- [Quick Start](quick-start.md) - run one container and run a CLI through it
+- [Server Deployment](server-deployment.md) - run the aegis server
+- [Server Configuration](server-configuration.md) - configure the aegis server
+- [Client Setup](client-setup.md) - setup local `ags` cli client
