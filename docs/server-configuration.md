@@ -1,48 +1,40 @@
 # Server Configuration
 
+Aegis reads environment variables, and optionally a config file. A variable overrides its config key.
+
 ## Config file
 
-| Variable | Required | Default | Sets |
-| --- | --- | --- | --- |
-| `AEGIS_CONFIG` | no | `config.toml` | path to the config file |
+- `AEGIS_CONFIG`: path to the config file, default `config.toml`
 
-## Server overrides
+## Server
 
-| Variable | Required | Default | Overrides |
-| --- | --- | --- | --- |
-| `HTTP_ADDR` | no | config file | `http_addr` |
-| `PUBLIC_URL` | no | config file | `public_url` |
-| `DATABASE_URL` | no | config file | `database_url` |
-| `MAX_CAPTURE_BYTES` | no | config file | `max_capture_bytes` |
+- `HTTP_ADDR` (`http_addr`): listen address, default `127.0.0.1:8765` (`0.0.0.0:8765` in the container)
+- `PUBLIC_URL` (`public_url`): the URL clients reach Aegis at; set it behind a reverse proxy
+- `DATABASE_URL` (`database_url`): SQLite URL, default `sqlite://data/aegis.db?mode=rwc` (`/data/aegis.db` in the container)
+- `MAX_CAPTURE_BYTES` (`max_capture_bytes`): largest response body kept in usage records, default 16 MiB
 
 ## Mail
 
-| Variable | Required | Default | Sets |
-| --- | --- | --- | --- |
-| `SMTP_HOST` | no | unset | SMTP server for sending mail |
-| `SMTP_PORT` | no | `587` | SMTP server port |
-| `SMTP_FROM` | with `SMTP_HOST` | unset | sender address |
-| `SMTP_USERNAME`, `SMTP_PASSWORD` | no | unset | credentials; set both or neither |
+- `SMTP_HOST`: SMTP server for sending mail
+- `SMTP_PORT`: SMTP server port, default `587`
+- `SMTP_FROM`: sender address, required with `SMTP_HOST`
+- `SMTP_USERNAME`, `SMTP_PASSWORD`: credentials; set both or neither
 
 Without `SMTP_HOST`, Aegis writes emails like password-reset links to the log.
 
 ## Authentication
 
-| Variable | Required | Default | Sets |
-| --- | --- | --- | --- |
-| `ACCESS_TOKEN_MINUTES` | no | `5` | lifetime in minutes of access tokens issued with a refresh token; others last 1 hour |
+- `ACCESS_TOKEN_MINUTES`: lifetime of access tokens issued with a refresh token, default `5`; others last 1 hour
 
-## Pricing overrides
+## Pricing
 
-| Variable | Required | Default | Overrides |
-| --- | --- | --- | --- |
-| `PRICING_ENABLED` | no | config file | `pricing.enabled` |
-| `PRICING_REFRESH_HOURS` | no | config file | `pricing.refresh_hours` |
-| `PRICING_URL` | no | config file | `pricing.url` |
+- `PRICING_ENABLED` (`pricing.enabled`): refresh model prices, default `true`
+- `PRICING_REFRESH_HOURS` (`pricing.refresh_hours`): hours between refreshes, default `12`
+- `PRICING_URL` (`pricing.url`): price map URL, default the one in this repository
 
 ## Logs
 
-`RUST_LOG` is optional and controls log filtering:
+`RUST_LOG` controls log filtering:
 
 ```sh
 RUST_LOG=aegis=debug aegis serve
