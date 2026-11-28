@@ -23,6 +23,8 @@ pub const BYPASS: &str = "AGS_BYPASS";
 pub const LAUNCHED: &str = "AGS_LAUNCHED";
 /// The most CLIs ags runs one inside another; it refuses a deeper one, which ends any loop.
 pub const MAX_CHAIN: usize = 3;
+/// How many processes above ags it looks through for its shell, past wrappers such as `env`.
+const ANCESTORS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Shell {
@@ -32,10 +34,43 @@ pub enum Shell {
 }
 
 impl Shell {
-    /// The shell `SHELL` names, if ags knows it.
-    pub fn from_env() -> Option<Self> {
-        let shell = PathBuf::from(std::env::var_os("SHELL")?);
-        Self::from_str(shell.file_name()?.to_str()?, false).ok()
+    /// The shell ags runs in: the nearest one above it, else the one `SHELL` names.
+    pub fn of_user() -> Option<Self> {
+        Self::detect(
+            std::process::id(),
+            process,
+            std::env::var_os("SHELL").as_deref(),
+        )
+    }
+
+    /// The nearest shell above `pid`, given each process's parent and name, else `login`'s.
+    fn detect(
+        pid: u32,
+        process: impl Fn(u32) -> Option<(u32, String)>,
+        login: Option<&OsStr>,
+    ) -> Option<Self> {
+        Self::ancestor(pid, process).or_else(|| Self::named(login?.to_str()?))
+    }
+
+    fn ancestor(pid: u32, process: impl Fn(u32) -> Option<(u32, String)>) -> Option<Self> {
+        let mut pid = process(pid)?.0;
+        for _ in 0..ANCESTORS {
+            if pid == 0 {
+                return None;
+            }
+            let (parent, name) = process(pid)?;
+            if let Some(shell) = Self::named(&name) {
+                return Some(shell);
+            }
+            pid = parent;
+        }
+        None
+    }
+
+    /// The shell a program is, by its file name; a login shell's name starts with `-`.
+    fn named(program: &str) -> Option<Self> {
+        let name = program.rsplit('/').next()?.trim_start_matches('-');
+        Self::from_str(name, false).ok()
     }
 
     /// The line that runs `ags init` for this shell.
@@ -209,6 +244,52 @@ fn running(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+/// The parent and program name of process `pid`.
+#[cfg(target_os = "linux")]
+fn process(pid: u32) -> Option<(u32, String)> {
+    let parent = stat_parent(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+    let name = fs::read(format!("/proc/{pid}/comm")).ok()?;
+    Some((
+        parent,
+        String::from_utf8_lossy(&name)
+            .trim_end_matches('\n')
+            .to_owned(),
+    ))
+}
+
+/// The parent in a `/proc/<pid>/stat`, whose fields follow the name's last `)`.
+#[cfg(target_os = "linux")]
+fn stat_parent(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// The parent and program name of process `pid`.
+#[cfg(target_os = "macos")]
+fn process(pid: u32) -> Option<(u32, String)> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "ppid=,comm=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let (parent, name) = text.trim().split_once(char::is_whitespace)?;
+    Some((parent.parse().ok()?, name.trim_start().to_owned()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process(_pid: u32) -> Option<(u32, String)> {
+    None
 }
 
 /// Whether every shim is in place and runs `ags`.
@@ -667,6 +748,125 @@ mod tests {
             error.to_string(),
             "claude would be 4 CLIs deep through ags, which looks like a loop; set AGS_BYPASS=1 to run it anyway"
         );
+    }
+
+    /// Processes as `(pid, parent, name)`, read the way `process` reads one.
+    fn tree(processes: &[(u32, u32, &str)]) -> impl Fn(u32) -> Option<(u32, String)> {
+        let processes: Vec<_> = processes
+            .iter()
+            .map(|&(pid, parent, name)| (pid, parent, name.to_owned()))
+            .collect();
+        move |pid| {
+            processes
+                .iter()
+                .find(|process| process.0 == pid)
+                .map(|(_, parent, name)| (*parent, name.clone()))
+        }
+    }
+
+    #[test]
+    fn the_shell_is_the_nearest_one_above_ags_past_any_wrapper() {
+        let bash = Some(OsStr::new("/bin/bash"));
+        let fish = [
+            (1, 0, "systemd"),
+            (10, 1, "bash"),
+            (20, 10, "fish"),
+            (30, 20, "ags"),
+        ];
+        assert_eq!(Shell::detect(30, tree(&fish), bash), Some(Shell::Fish));
+        let wrapped = [
+            (1, 0, "systemd"),
+            (20, 1, "-zsh"),
+            (21, 20, "sudo"),
+            (22, 21, "env"),
+            (23, 22, "mise"),
+            (30, 23, "ags"),
+        ];
+        assert_eq!(Shell::detect(30, tree(&wrapped), bash), Some(Shell::Zsh));
+        let named = [(20, 1, "/usr/local/bin/fish"), (30, 20, "ags")];
+        assert_eq!(Shell::detect(30, tree(&named), None), Some(Shell::Fish));
+        let ags_is_no_shell = [(20, 1, "bash"), (30, 20, "fish")];
+        assert_eq!(
+            Shell::detect(30, tree(&ags_is_no_shell), None),
+            Some(Shell::Bash)
+        );
+    }
+
+    #[test]
+    fn without_a_shell_above_ags_shell_names_it_else_none_does() {
+        let fish = Some(OsStr::new("/usr/bin/fish"));
+        let none = [(1, 0, "init"), (20, 1, "sshd"), (30, 20, "ags")];
+        assert_eq!(Shell::detect(30, tree(&none), fish), Some(Shell::Fish));
+        assert_eq!(Shell::detect(30, tree(&none), None), None);
+        assert_eq!(
+            Shell::detect(30, tree(&none), Some(OsStr::new("/bin/tcsh"))),
+            None
+        );
+        let unreadable = [(20, 19, "env"), (30, 20, "ags")];
+        assert_eq!(
+            Shell::detect(30, tree(&unreadable), fish),
+            Some(Shell::Fish)
+        );
+        assert_eq!(Shell::detect(30, |_| None, fish), Some(Shell::Fish));
+    }
+
+    #[test]
+    fn the_walk_ends_within_its_bound() {
+        let looked = std::cell::Cell::new(0);
+        let endless = |pid: u32| {
+            looked.set(looked.get() + 1);
+            Some((pid + 1, "env".to_owned()))
+        };
+        assert_eq!(Shell::detect(30, endless, None), None);
+        assert_eq!(looked.get(), ANCESTORS + 1);
+        // ags is process 100, under wrappers, with bash `depth` processes above it.
+        let bash_above = |depth: u32| {
+            let processes: Vec<_> = (100 - depth..=100)
+                .map(|pid| {
+                    (
+                        pid,
+                        pid - 1,
+                        if pid == 100 - depth { "bash" } else { "env" },
+                    )
+                })
+                .collect();
+            Shell::detect(100, tree(&processes), None)
+        };
+        assert_eq!(bash_above(ANCESTORS as u32), Some(Shell::Bash));
+        assert_eq!(bash_above(ANCESTORS as u32 + 1), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_is_read_with_its_parent_and_name() {
+        let me = std::process::id();
+        assert_eq!(
+            process(me).map(|(parent, _)| parent),
+            Some(std::os::unix::process::parent_id())
+        );
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The kernel can resume the parent before it renames the child; an echo shows `cat` runs.
+        let mut stdin = child.stdin.take().unwrap();
+        io::Write::write_all(&mut stdin, b"x").unwrap();
+        child.stdout.take().unwrap().read_exact(&mut [0]).unwrap();
+        let read = process(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (parent, name) = read.unwrap();
+        assert_eq!(parent, me);
+        assert_eq!(name.rsplit('/').next(), Some("cat"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stat_gives_the_parent_past_any_name() {
+        assert_eq!(stat_parent("42 (bash) S 7 42 42 0"), Some(7));
+        assert_eq!(stat_parent("42 (a) S 9 (b)) R 7 42 42 0"), Some(7));
+        assert_eq!(stat_parent("42 (bash"), None);
     }
 
     #[test]
