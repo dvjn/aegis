@@ -892,3 +892,47 @@ fn the_init_line_puts_the_shims_first_in_bash_and_fish() {
         assert_eq!(text(&output.stdout), expected);
     }
 }
+
+#[test]
+fn the_hint_names_the_shell_ags_runs_in_over_the_login_shell() {
+    let f = Fixture::new();
+    let aegis = Aegis::start(&[("new", &[("claude", "claude_subscription")])], true);
+    f.log_in(&aegis.url, "new");
+    let find = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(name))
+            .find(|shell| shell.is_file())
+    };
+    let hint = |file: &str, line: &str| {
+        format!(
+            "To run plain claude, codex and pi through ags, add this line to {file} and open a new shell:\n  {line}\n"
+        )
+    };
+    // A command after ags keeps each shell from replacing itself with ags.
+    let bash = f
+        .command(find("bash").unwrap(), &[&f.real])
+        .env("SHELL", "/usr/bin/fish")
+        .args(["--norc", "-c", &format!("{AGS} status; true")])
+        .output()
+        .unwrap();
+    assert!(
+        text(&bash.stdout).ends_with(&hint("~/.bashrc", "eval \"$(ags init bash)\"")),
+        "{}",
+        text(&bash.stdout)
+    );
+    if let Some(fish) = find("fish") {
+        let fish = f
+            .command(&fish, &[&f.real])
+            .args(["--no-config", "-c", &format!("{AGS} status; true")])
+            .output()
+            .unwrap();
+        assert!(
+            text(&fish.stdout).ends_with(&hint(
+                "~/.config/fish/config.fish",
+                "ags init fish | source"
+            )),
+            "{}",
+            text(&fish.stdout)
+        );
+    }
+}

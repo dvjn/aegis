@@ -915,7 +915,7 @@ fn shim_hint(store: &Store) {
     if !shims::written(&dir) || shims::active(&dir, std::env::var_os("PATH").as_deref()) {
         return;
     }
-    match Shell::from_env() {
+    match Shell::of_user() {
         Some(shell) => println!(
             "To run plain claude, codex and pi through ags, add this line to {} and open a new shell:\n  {}",
             shell.startup_file(),
