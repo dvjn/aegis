@@ -1,14 +1,12 @@
-//! The vendor credentials of each provider, kept apart from the user's own and from each other's.
-//!
-//! A subscription provider gets a config dir per CLI, where that CLI's own sign-in runs. The
-//! user's settings are linked into it, so only credentials and session state are separate. A
-//! cloud provider keeps its Bedrock API key or Vertex service account in a private file.
+//! The credentials each provider needs. A subscription provider uses each CLI's own sign-in, in the
+//! user's own config dir. A cloud provider keeps its Bedrock API key or Vertex service account in a
+//! private file of ags's, which reaches a CLI only during a launch.
 use std::{
     collections::BTreeSet,
     ffi::{OsStr, OsString},
     fmt, fs, io,
     path::{Path, PathBuf},
-    process::ExitStatus,
+    process::{ExitStatus, Stdio},
 };
 
 use aegis_wire::provider_type::{BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, VERTEX};
@@ -18,92 +16,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
-use crate::{
-    Cli, Store,
-    launch::granted,
-    store::{create_private_dir, write_private},
-};
+use crate::{Cli, Store, launch::granted, shims, store::write_private};
 
 const DIR_NAME: &str = "providers";
-const PI_LAUNCH_DIR: &str = "pi";
 const STATE: &str = "state.json";
 const BEDROCK_KEY: &str = "bedrock-api-key";
 const VERTEX_ACCOUNT: &str = "vertex-service-account.json";
 
-const CLAUDE_CREDENTIALS: &str = ".credentials.json";
-const CLAUDE_STATE: &str = ".claude.json";
-const CODEX_AUTH: &str = "auth.json";
-const PI_AUTH: &str = "auth.json";
-/// Keeps Codex's sign-in in `auth.json` under its home, not in a keyring shared by every home.
-const CODEX_FILE_STORE: &str = "cli_auth_credentials_store=\"file\"";
-
-/// Linked from the user's own config dir; everything else stays with the provider.
-const CLAUDE_SHARED: &[&str] = &[
-    "settings.json",
-    "CLAUDE.md",
-    "rules",
-    "agents",
-    "commands",
-    "skills",
-    "output-styles",
-    "workflows",
-    "keybindings.json",
-    "themes",
-    "hooks",
-    "plugins",
-    "statusline.py",
-    "statusline.sh",
-];
-const CODEX_SHARED: &[&str] = &[
-    "config.toml",
-    "AGENTS.md",
-    "AGENTS.override.md",
-    "rules",
-    "prompts",
-    "hooks.json",
-    ".hook-trust",
-    "skills",
-    "plugins",
-];
-const PI_SHARED: &[&str] = &[
-    "settings.json",
-    "keybindings.json",
-    "mcp.json",
-    "models.json",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "SYSTEM.md",
-    "APPEND_SYSTEM.md",
-    "extensions",
-    "skills",
-    "prompts",
-    "themes",
-    "npm",
-];
-/// Settings Claude Code keeps in `.claude.json` beside its sign-in, copied from the user's own.
-const CLAUDE_STATE_SHARED: &[&str] = &[
-    "mcpServers",
-    "hasCompletedOnboarding",
-    "lastOnboardingVersion",
-];
-const CLAUDE_PROJECT_SHARED: &[&str] = &[
-    "mcpServers",
-    "enabledMcpjsonServers",
-    "disabledMcpjsonServers",
-    "hasTrustDialogAccepted",
-];
-
 /// One credential a provider needs before a CLI can use it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {
-    /// The CLI's own sign-in, in its own config dir for this provider.
+    /// The CLI's own sign-in, in the user's own config dir.
     SignIn(Cli),
     BedrockKey,
     VertexAccount,
 }
 
 impl Need {
-    /// Everything a provider of `provider_type` needs: one sign-in per CLI that runs on it, or its key.
+    /// Everything a provider of `provider_type` needs: the sign-in of each CLI that runs on it, or its key.
     pub fn all(provider_type: &str) -> Vec<Self> {
         match provider_type {
             BEDROCK => vec![Self::BedrockKey],
@@ -117,26 +47,23 @@ impl Need {
         }
     }
 
-    /// What `cli` needs to run on a provider of `provider_type`.
-    pub fn of_launch(cli: Cli, provider_type: &str) -> Option<Self> {
+    /// What ags must hold before a launch on a provider of `provider_type`. A CLI that is not
+    /// signed in asks for its own sign-in.
+    pub fn of_launch(provider_type: &str) -> Option<Self> {
         match provider_type {
             BEDROCK => Some(Self::BedrockKey),
             VERTEX => Some(Self::VertexAccount),
-            CLAUDE_SUBSCRIPTION | CODEX_SUBSCRIPTION => Some(Self::SignIn(cli)),
             _ => None,
         }
     }
-}
 
-impl Need {
-    /// Names this need of `provider` in ags's state.
-    fn key(self, provider: &str) -> String {
-        let need = match self {
-            Self::SignIn(cli) => cli.to_string(),
-            Self::BedrockKey => BEDROCK.to_owned(),
-            Self::VertexAccount => VERTEX.to_owned(),
-        };
-        format!("{provider}/{need}")
+    /// Names this need of `provider` in ags's state; a sign-in is the CLI's, whichever provider.
+    fn key(self, provider: &str, provider_type: &str) -> String {
+        match self {
+            Self::SignIn(cli) => format!("sign-in/{cli}/{provider_type}"),
+            Self::BedrockKey => format!("{provider}/{BEDROCK}"),
+            Self::VertexAccount => format!("{provider}/{VERTEX}"),
+        }
     }
 }
 
@@ -159,7 +86,7 @@ pub fn product(cli: Cli) -> &'static str {
     }
 }
 
-/// Credentials Claude Code reads from its environment before its own sign-in.
+/// Credentials Claude Code reads from its environment before its own sign-in or a launch's key.
 const CLAUDE_CREDENTIAL_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -167,7 +94,7 @@ const CLAUDE_CREDENTIAL_VARS: &[&str] = &[
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "AWS_BEARER_TOKEN_BEDROCK",
 ];
 
 /// What picks where Claude Code sends its requests, as Claude Code reads it: each upstream's
@@ -213,8 +140,9 @@ const CLOUD_CREDENTIALS: &[&str] = &[
     "GOOGLE_CLOUD_API_KEY",
 ];
 
-/// What a CLI would use for every provider in place of the provider's own sign-in and upstream.
-fn shared_auth(cli: Cli, provider_type: &str) -> Vec<&'static str> {
+/// What a launch of `cli` drops from its environment, and Claude Code's launch settings blank:
+/// credentials and upstreams that would take the place of the provider's.
+pub(crate) fn launch_unset(cli: Cli, provider_type: &str) -> Vec<&'static str> {
     let mut names = match (cli, provider_type) {
         (Cli::Claude, _) => CLAUDE_CREDENTIAL_VARS
             .iter()
@@ -280,13 +208,24 @@ const LAUNCH_ENV: &[&str] = &[
     "GOOGLE_APPLICATION_CREDENTIALS",
 ];
 
+/// Inside an Aegis launch, drops what it set.
+pub fn outside_launch() -> EnvChanges {
+    let mut changes = EnvChanges::default();
+    if std::env::var_os(crate::clis::SECRET_ENV).is_none() {
+        return changes;
+    }
+    for name in from_launch() {
+        changes.remove(name);
+    }
+    changes
+}
+
 /// What a sign-in run from inside a launch drops before setting its own.
 fn from_launch() -> impl Iterator<Item = &'static str> {
     LAUNCH_ENV
         .iter()
         .copied()
         .chain(CLAUDE_ROUTES.iter().map(|(name, _)| *name))
-        .chain(DIR_VARS.iter().flat_map(|(own, kept)| [*own, *kept]))
 }
 
 /// pi's own provider for providers of `provider_type`, whose name its sign-ins are kept under.
@@ -300,134 +239,56 @@ pub(crate) fn pi_provider(provider_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Each CLI's variable for its config dir, and the variable a launch keeps the user's value in, so
-/// that ags run inside a launch still finds the user's own dirs.
-const DIR_VARS: [(&str, &str); 3] = [
-    ("CLAUDE_CONFIG_DIR", "AGS_USER_CLAUDE_CONFIG_DIR"),
-    ("CODEX_HOME", "AGS_USER_CODEX_HOME"),
-    ("PI_CODING_AGENT_DIR", "AGS_USER_PI_CODING_AGENT_DIR"),
-];
-
-/// The user's own config of each CLI, outside ags.
+/// Where the user keeps their own files, outside ags.
 #[derive(Clone, Debug, Default)]
 pub struct Home {
-    claude: Option<PathBuf>,
-    claude_state: Option<PathBuf>,
-    codex: Option<PathBuf>,
-    pi: Option<PathBuf>,
-    /// The user's value of each of `DIR_VARS`, which a launch passes on.
-    vars: [Option<PathBuf>; 3],
-    /// The user's home dir, whose defaults stand in for unset variables.
+    /// The user's home dir, for `~` in paths the user gives.
     user: Option<PathBuf>,
-    /// Each of `DIR_VARS` as this process has it.
-    own: [Option<PathBuf>; 3],
-    /// What the launch ags runs in kept of each, `Some(None)` when the user had not set it.
-    kept: [Option<Option<PathBuf>>; 3],
+    /// Claude Code's config dir, where the user's settings are.
+    claude: Option<PathBuf>,
+    /// The value of `PATH` that ags finds each CLI on.
+    path: Option<OsString>,
 }
 
 impl Home {
-    /// Where each CLI keeps its config for this user, following the CLI's own variables.
     pub fn from_env() -> Self {
         Self::from_vars(|name| std::env::var_os(name))
     }
 
     fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Self {
         let path = |value: OsString| Some(PathBuf::from(value)).filter(|path| path.is_absolute());
+        let user = var("HOME").or_else(|| var("USERPROFILE")).and_then(path);
         Self {
-            user: var("HOME").or_else(|| var("USERPROFILE")).and_then(path),
-            own: DIR_VARS.map(|(name, _)| var(name).and_then(path)),
-            kept: DIR_VARS.map(|(_, kept)| var(kept).map(path)),
-            ..Self::default()
+            claude: var("CLAUDE_CONFIG_DIR")
+                .and_then(path)
+                .or_else(|| user.as_ref().map(|home| home.join(".claude"))),
+            user,
+            path: var("PATH"),
         }
-        .resolve(None)
     }
 
-    /// The default locations under `home`.
+    /// The default locations under `home`, with no CLI on `PATH`.
     pub fn at(home: &Path) -> Self {
         Self {
             user: Some(home.to_owned()),
-            ..Self::default()
+            claude: Some(home.join(".claude")),
+            path: None,
         }
-        .resolve(None)
     }
 
-    /// Settles each CLI's dir. A variable that points inside `ags`, as it does in a CLI that ags
-    /// launched, gives way to the user's value the launch kept, or else to the default.
-    fn resolve(mut self, ags: Option<&Path>) -> Self {
-        let ags = ags.map(canonical);
-        let inside = |path: &Path| {
-            ags.as_ref()
-                .is_some_and(|ags| canonical(path).starts_with(ags))
-        };
-        let defaults = Self {
-            claude: self.user.as_ref().map(|home| home.join(".claude")),
-            claude_state: self.user.as_ref().map(|home| home.join(CLAUDE_STATE)),
-            codex: self.user.as_ref().map(|home| home.join(".codex")),
-            pi: self.user.as_ref().map(|home| home.join(".pi/agent")),
-            ..Self::default()
-        };
-        let mut vars = self.own.clone();
-        for (var, kept) in vars.iter_mut().zip(&self.kept) {
-            if var.as_deref().is_some_and(inside) {
-                *var = kept.clone().flatten().filter(|kept| !inside(kept));
-            }
-        }
-        let [claude, codex, pi] = vars.clone();
-        let outside = |path: Option<PathBuf>| path.filter(|path| !inside(path));
-        self.claude_state = outside(
-            claude
-                .as_ref()
-                .map(|dir| dir.join(CLAUDE_STATE))
-                .or(defaults.claude_state),
-        );
-        self.claude = outside(claude.or(defaults.claude));
-        self.codex = outside(codex.or(defaults.codex));
-        self.pi = outside(pi.or(defaults.pi));
-        self.vars = vars;
+    /// Finds each CLI on `path`, a value of `PATH`.
+    #[must_use]
+    pub fn with_path(mut self, path: impl Into<OsString>) -> Self {
+        self.path = Some(path.into());
         self
     }
-
-    fn dir(&self, cli: Cli) -> Option<&Path> {
-        match cli {
-            Cli::Claude => self.claude.as_deref(),
-            Cli::Codex => self.codex.as_deref(),
-            Cli::Pi => self.pi.as_deref(),
-        }
-    }
-
-    /// What a launch passes on so that ags run inside it finds these same dirs.
-    fn kept(&self) -> impl Iterator<Item = (&'static str, OsString)> + '_ {
-        DIR_VARS
-            .iter()
-            .zip(&self.vars)
-            .map(|((_, kept), value)| (*kept, value.clone().unwrap_or_default().into_os_string()))
-    }
-}
-
-/// `path` with links resolved, as far as it exists.
-fn canonical(path: &Path) -> PathBuf {
-    if let Ok(path) = fs::canonicalize(path) {
-        return path;
-    }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => canonical(parent).join(name),
-        _ => path.to_owned(),
-    }
-}
-
-/// What a launch adds so that a CLI uses one provider's own config dir.
-#[derive(Debug, Default)]
-pub(crate) struct Isolation {
-    pub args: Vec<OsString>,
-    pub env: Vec<(&'static str, OsString)>,
-    pub unset: Vec<&'static str>,
 }
 
 /// The credentials of every provider on this machine.
 pub struct Credentials {
     dir: PathBuf,
     home: Home,
-    /// Its lock guards `state.json` and each provider's copy of Claude Code's state file.
+    /// Its lock guards `state.json`.
     store: Store,
 }
 
@@ -442,7 +303,7 @@ struct State {
     skipped: BTreeSet<String>,
 }
 
-/// Something about a provider's settings the user should hear about once.
+/// Something about the user's settings they should hear about once.
 struct Notice {
     key: String,
     text: String,
@@ -450,10 +311,9 @@ struct Notice {
 
 impl Credentials {
     pub fn new(store: &Store, home: Home) -> Self {
-        let dir = store.dir().join(DIR_NAME);
         Self {
-            home: home.resolve(Some(store.dir())),
-            dir,
+            dir: store.dir().join(DIR_NAME),
+            home,
             store: Store::at(store.dir()),
         }
     }
@@ -486,152 +346,95 @@ impl Credentials {
         Ok(self.dir.join(dir_name(provider)))
     }
 
-    /// The config dir `cli` uses for `provider`.
-    pub fn cli_dir(&self, provider: &str, cli: Cli) -> Result<PathBuf> {
-        Ok(self.provider_dir(provider)?.join(cli.to_string()))
+    /// The real `cli`, past ags's shims.
+    pub(crate) fn program(&self, cli: Cli) -> Result<PathBuf> {
+        shims::program_on(&self.store, cli, self.home.path.as_deref())
     }
 
-    /// Whether `provider` has `need`, without asking the vendor.
-    pub fn has(&self, provider: &str, provider_type: &str, need: Need) -> Result<bool> {
-        let dir = self.provider_dir(provider)?;
+    /// Whether the real `cli` is installed.
+    pub fn installed(&self, cli: Cli) -> bool {
+        self.program(cli).is_ok()
+    }
+
+    /// Whether `provider` has `need`: a cloud credential ags keeps, or the CLI's own sign-in of the
+    /// kind the provider takes, as the CLI's status command reports it.
+    pub async fn has(&self, provider: &str, provider_type: &str, need: Need) -> Result<bool> {
         Ok(match need {
-            Need::SignIn(Cli::Claude) => {
-                let dir = dir.join(Cli::Claude.to_string());
-                // On macOS the sign-in itself is in the keychain.
-                if cfg!(target_os = "macos") {
-                    read_json(&dir.join(CLAUDE_STATE))?
-                        .is_some_and(|state| state.get("oauthAccount").is_some())
-                } else {
-                    has_claude_sign_in(&dir.join(CLAUDE_CREDENTIALS))?
-                }
+            Need::SignIn(cli) => self.signed_in(cli, provider_type).await,
+            Need::BedrockKey | Need::VertexAccount => {
+                is_file(&self.cloud_file(provider, provider_type)?)
             }
-            Need::SignIn(Cli::Codex) => is_file(&dir.join(Cli::Codex.to_string()).join(CODEX_AUTH)),
-            Need::SignIn(Cli::Pi) => {
-                let Some(name) = pi_provider(provider_type) else {
-                    return Ok(false);
-                };
-                read_json(&dir.join(Cli::Pi.to_string()).join(PI_AUTH))?
-                    .is_some_and(|auth| auth.get(name).is_some())
-            }
-            Need::BedrockKey => is_file(&dir.join(BEDROCK_KEY)),
-            Need::VertexAccount => is_file(&dir.join(VERTEX_ACCOUNT)),
         })
     }
 
-    /// Creates `provider`'s dir for `cli` and brings the user's settings into it.
-    pub(crate) fn prepare(&self, provider: &str, cli: Cli) -> Result<PathBuf> {
-        self.prepared(provider, cli).map(|(dir, _)| dir)
-    }
-
-    /// `prepare`, also naming the user's settings files that the provider holds a different copy of.
-    fn prepared(&self, provider: &str, cli: Cli) -> Result<(PathBuf, Links)> {
-        let dir = self.cli_dir(provider, cli)?;
-        let links = self.prepare_dir(&dir, cli)?;
-        Ok((dir, links))
-    }
-
-    /// Creates `dir` for `cli` and brings the user's settings into it.
-    fn prepare_dir(&self, dir: &Path, cli: Cli) -> Result<Links> {
-        create_private_dir(dir)?;
-        let links = match self.home.dir(cli) {
-            Some(own) => link(own, dir, shared(cli))?,
-            None => Links::default(),
+    /// Whether `cli` has the sign-in a `provider_type` launch uses: a Claude subscription, a
+    /// ChatGPT login, or pi's own OAuth sign-in to that provider, not an API key.
+    async fn signed_in(&self, cli: Cli, provider_type: &str) -> bool {
+        let Ok(program) = self.program(cli) else {
+            return false;
         };
-        // A file shared again is warned about again if it is split off later.
-        let stale: Vec<String> = links
-            .linked
-            .iter()
-            .flat_map(|name| [differs_key(dir, name), blocked_key(dir, name)])
-            .collect();
-        if stale
-            .iter()
-            .any(|key| self.state().is_ok_and(|state| state.warned.contains(key)))
-        {
-            self.update(|state| {
-                for key in &stale {
-                    state.warned.remove(key);
-                }
-                Ok(())
-            })?;
+        let mut command = Command::new(program);
+        match cli {
+            Cli::Claude => {
+                // The blanks a launch gives Claude Code, so the user's settings answer as they would then.
+                let blanks: Map<String, Value> = launch_unset(cli, provider_type)
+                    .into_iter()
+                    .map(|name| (name.to_owned(), "".into()))
+                    .collect();
+                let settings = serde_json::json!({ "env": blanks }).to_string();
+                command
+                    .arg("--settings")
+                    .arg(settings)
+                    .args(["auth", "status", "--json"])
+            }
+            Cli::Codex => command.args(["login", "status"]),
+            Cli::Pi => {
+                let Some(name) = pi_provider(provider_type) else {
+                    return false;
+                };
+                command.args([
+                    "auth",
+                    "check",
+                    "--provider",
+                    name,
+                    "--no-refresh",
+                    "--json",
+                ])
+            }
+        };
+        as_users(&mut command, cli, provider_type);
+        command.stdin(Stdio::null()).kill_on_drop(true);
+        let Ok(output) = command.output().await else {
+            return false;
+        };
+        let json = || serde_json::from_slice::<Map<String, Value>>(&output.stdout).ok();
+        match cli {
+            Cli::Claude => json().is_some_and(|status| {
+                status.get("loggedIn") == Some(&Value::Bool(true))
+                    && field(&status, "authMethod") == Some("claude.ai")
+            }),
+            Cli::Codex => [&output.stdout, &output.stderr]
+                .iter()
+                .any(|text| String::from_utf8_lossy(text).contains("Logged in using ChatGPT")),
+            Cli::Pi => json().is_some_and(|check| {
+                field(&check, "status") == Some("ready")
+                    && field(&check, "authType") == Some("oauth")
+            }),
         }
-        if cli == Cli::Claude
-            && let Some(own) = &self.home.claude_state
-        {
-            let _lock = self.store.lock()?;
-            share_claude_state(own, &dir.join(CLAUDE_STATE))?;
-        }
-        Ok(links)
     }
 
-    /// Prepares `provider`'s dir for `cli` and returns what the user has not been told yet about it.
-    pub fn notices(&self, provider: &str, cli: Cli) -> Result<Vec<String>> {
-        let (dir, links) = self.prepared(provider, cli)?;
-        self.untold(provider, &dir, &links, cli)
-    }
-
-    /// Prepares the dir of pi launches and returns what the user has not been told yet about it.
-    pub fn pi_notices(&self) -> Result<Vec<String>> {
-        let dir = self.pi_dir();
-        let links = self.prepare_dir(&dir, Cli::Pi)?;
-        self.untold("ags", &dir, &links, Cli::Pi)
-    }
-
-    /// What the user has not been told yet about `cli`'s settings in `dir`, which `owner` keeps.
-    fn untold(&self, owner: &str, dir: &Path, links: &Links, cli: Cli) -> Result<Vec<String>> {
-        let product = product(cli);
-        let differing = links.differing.iter().map(|name| Notice {
-            key: differs_key(dir, name),
-            text: format!(
-                "{owner} keeps its own {name} for {product}, which differs from yours; delete {} to share yours again",
-                dir.join(name).display()
-            ),
-        });
-        let blocked = links.blocked.iter().map(|name| Notice {
-            key: blocked_key(dir, name),
-            text: format!(
-                "{owner} has its own {name} for {product}, so yours is not shared; delete {} to share yours",
-                dir.join(name).display()
-            ),
-        });
-        let mut notices: Vec<Notice> = differing.chain(blocked).collect();
+    /// What the user has not been told yet about their own settings of `cli`.
+    pub fn notices(&self, cli: Cli) -> Result<Vec<String>> {
+        let mut notices = vec![];
         if cli == Cli::Claude
             && let Some(own) = &self.home.claude
             && let Some(settings) = read_json(&own.join("settings.json")).ok().flatten()
+            && settings.contains_key("apiKeyHelper")
         {
-            if settings.contains_key("apiKeyHelper") {
-                notices.push(Notice {
-                    key: "claude/apiKeyHelper".to_owned(),
-                    text: "your Claude Code settings set apiKeyHelper, so every Claude provider uses that key in place of its own sign-in".to_owned(),
-                });
-            }
-            let env = settings.get("env").and_then(Value::as_object);
-            let set = |name: &str| env.is_some_and(|env| env.contains_key(name));
-            let mut warn = |name: &str, text: String| {
-                notices.push(Notice {
-                    key: format!("claude/env/{name}"),
-                    text: format!("your Claude Code settings set {name}, {text}"),
-                });
-            };
-            for name in CLAUDE_CREDENTIAL_VARS.iter().filter(|name| set(name)) {
-                warn(
-                    name,
-                    "so every Claude provider uses it in place of its own sign-in".to_owned(),
-                );
-            }
-            // Claude Code applies its settings' environment over the one a launch gives it.
-            for (name, _) in CLAUDE_ROUTES.iter().filter(|(name, _)| set(name)) {
-                warn(
-                    name,
-                    "which overrides where each ags launch sends Claude Code".to_owned(),
-                );
-            }
-            for name in CLOUD_CREDENTIALS.iter().filter(|name| set(name)) {
-                warn(
-                    name,
-                    "which a Bedrock or Vertex provider may use in place of its own credential"
-                        .to_owned(),
-                );
-            }
+            notices.push(Notice {
+                key: "claude/apiKeyHelper".to_owned(),
+                text: "your Claude Code settings set apiKeyHelper, so Claude Code sends that key to Claude providers in place of your sign-in".to_owned(),
+            });
         }
         if notices.iter().all(|notice| {
             self.state()
@@ -648,91 +451,13 @@ impl Credentials {
         })
     }
 
-    /// Points `cli` at `provider`'s config dir, after preparing it.
-    pub(crate) fn isolate(
-        &self,
-        provider: &str,
-        provider_type: &str,
-        cli: Cli,
-    ) -> Result<Isolation> {
-        let dir = self.prepare(provider, cli)?.into_os_string();
-        let unset = shared_auth(cli, provider_type);
-        let mut isolation = match cli {
-            Cli::Claude => Isolation {
-                args: vec![],
-                env: vec![("CLAUDE_CONFIG_DIR", dir)],
-                unset: unset.clone(),
-            },
-            Cli::Codex => Isolation {
-                args: vec!["-c".into(), CODEX_FILE_STORE.into()],
-                env: vec![("CODEX_HOME", dir)],
-                unset: unset.clone(),
-            },
-            Cli::Pi => Isolation {
-                args: vec![],
-                env: vec![("PI_CODING_AGENT_DIR", dir)],
-                unset,
-            },
-        };
-        isolation.env.extend(self.home.kept());
-        Ok(isolation)
-    }
-
-    /// Points pi at the dir of pi launches, after preparing it. pi reaches each provider's own
-    /// credential through the launch's extension instead.
-    pub(crate) fn isolate_pi(&self) -> Result<Isolation> {
-        let dir = self.pi_dir();
-        self.prepare_dir(&dir, Cli::Pi)?;
-        let mut unset = vec![];
-        for provider_type in Cli::Pi.provider_types() {
-            for name in shared_auth(Cli::Pi, provider_type) {
-                if !unset.contains(&name) {
-                    unset.push(name);
-                }
-            }
-        }
-        let mut env = vec![("PI_CODING_AGENT_DIR", dir.into_os_string())];
-        env.extend(self.home.kept());
-        Ok(Isolation {
-            args: vec![],
-            env,
-            unset,
-        })
-    }
-
-    /// pi's own dir during a launch, with its sessions, whichever providers the launch reaches.
-    fn pi_dir(&self) -> PathBuf {
-        self.store.dir().join(PI_LAUNCH_DIR)
-    }
-
-    /// The file of `provider`'s credential for pi: its pi sign-in, Bedrock API key or Vertex
-    /// service account.
-    pub(crate) fn pi_credential(&self, provider: &str, provider_type: &str) -> Result<PathBuf> {
-        let dir = self.provider_dir(provider)?;
-        Ok(match provider_type {
-            BEDROCK => dir.join(BEDROCK_KEY),
-            VERTEX => dir.join(VERTEX_ACCOUNT),
-            _ => dir.join(Cli::Pi.to_string()).join(PI_AUTH),
-        })
-    }
-
-    /// Runs `cli`'s own sign-in in `provider`'s config dir. `program` replaces the real CLI on `PATH`.
-    pub async fn sign_in(
-        &self,
-        provider: &str,
-        provider_type: &str,
-        cli: Cli,
-        program: Option<&OsStr>,
-    ) -> Result<ExitStatus> {
-        let isolation = self.isolate(provider, provider_type, cli)?;
-        let program = match program {
-            Some(program) => program.to_owned(),
-            None => crate::shims::program(&self.store, cli)?.into_os_string(),
-        };
+    /// Runs `cli`'s own sign-in for providers of `provider_type`, in the user's own config dir.
+    pub async fn sign_in(&self, provider_type: &str, cli: Cli) -> Result<ExitStatus> {
+        let program = self.program(cli)?;
         let mut command = Command::new(&program);
         match cli {
             Cli::Claude => command.args(["auth", "login"]),
-            Cli::Codex => command.arg("login").args(isolation.args),
+            Cli::Codex => command.arg("login"),
             Cli::Pi => {
                 let Some(name) = pi_provider(provider_type)
                     .filter(|_| matches!(provider_type, CLAUDE_SUBSCRIPTION | CODEX_SUBSCRIPTION))
@@ -742,10 +467,8 @@ impl Credentials {
                 command.args(["auth", "login", name])
             }
         };
-        for name in isolation.unset.iter().copied().chain(from_launch()) {
-            command.env_remove(name);
-        }
-        command.envs(isolation.env).kill_on_drop(true);
+        as_users(&mut command, cli, provider_type);
+        command.kill_on_drop(true);
         // Ctrl-C is the sign-in's to handle; ags carries on to its next prompt.
         #[cfg(unix)]
         // SAFETY: the closure only calls signal, which is async-signal-safe.
@@ -757,42 +480,21 @@ impl Credentials {
             });
         }
         let _ignored = Interrupts::ignore();
-        let mut child = crate::launch::spawn(command, &program)?;
+        let mut child = crate::launch::spawn(command, program.as_os_str())?;
         child.wait().await.context("waiting for the sign-in")
     }
 
-    /// Inside an Aegis launch, drops what it set and gives each CLI the user's own config dir.
-    pub fn outside_launch(&self) -> EnvChanges {
-        let mut changes = EnvChanges::default();
-        let inside = ["AGS_LAUNCH_SECRET"]
-            .into_iter()
-            .chain(DIR_VARS.iter().map(|(_, kept)| *kept))
-            .any(|name| std::env::var_os(name).is_some());
-        if !inside {
-            return changes;
-        }
-        for name in from_launch() {
-            changes.remove(name);
-        }
-        for ((own, _), value) in DIR_VARS.iter().zip(&self.home.vars) {
-            if let Some(value) = value {
-                changes.set(own, value);
-            }
-        }
-        changes
-    }
-
     /// Remembers that the user chose not to set up `need` for `provider`.
-    pub fn skip(&self, provider: &str, need: Need) -> Result<()> {
+    pub fn skip(&self, provider: &str, provider_type: &str, need: Need) -> Result<()> {
         self.update(|state| {
-            state.skipped.insert(need.key(provider));
+            state.skipped.insert(need.key(provider, provider_type));
             Ok(())
         })
     }
 
     /// Forgets that `need` was skipped for `provider`, once it is set up.
-    pub fn unskip(&self, provider: &str, need: Need) -> Result<()> {
-        let key = need.key(provider);
+    pub fn unskip(&self, provider: &str, provider_type: &str, need: Need) -> Result<()> {
+        let key = need.key(provider, provider_type);
         if !self.state()?.skipped.contains(&key) {
             return Ok(());
         }
@@ -867,25 +569,45 @@ impl Credentials {
             })
     }
 
+    /// The file of a cloud provider's stored credential: its Bedrock API key or Vertex service account.
+    pub(crate) fn cloud_file(&self, provider: &str, provider_type: &str) -> Result<PathBuf> {
+        let dir = self.provider_dir(provider)?;
+        match provider_type {
+            BEDROCK => Ok(dir.join(BEDROCK_KEY)),
+            VERTEX => Ok(dir.join(VERTEX_ACCOUNT)),
+            _ => bail!("{provider} is not a cloud provider"),
+        }
+    }
+
     /// How a CLI finds a cloud provider's stored credential: the variables its SDK reads.
     pub fn cloud_env(
         &self,
         provider: &str,
         provider_type: &str,
     ) -> Result<Vec<(&'static str, OsString)>> {
-        let dir = self.provider_dir(provider)?;
         Ok(match provider_type {
             BEDROCK => {
-                let key = String::from_utf8(read(&dir.join(BEDROCK_KEY))?)
+                let key = String::from_utf8(read(&self.cloud_file(provider, provider_type)?)?)
                     .context("the stored Bedrock API key is not text")?;
                 vec![("AWS_BEARER_TOKEN_BEDROCK", key.trim().into())]
             }
             VERTEX => vec![(
                 "GOOGLE_APPLICATION_CREDENTIALS",
-                dir.join(VERTEX_ACCOUNT).into_os_string(),
+                self.cloud_file(provider, provider_type)?.into_os_string(),
             )],
             _ => vec![],
         })
+    }
+}
+
+/// Makes `command` run as the user's own CLI would, for providers of `provider_type`: with nothing
+/// of a launch it may run in, and without what a launch drops.
+fn as_users(command: &mut Command, cli: Cli, provider_type: &str) {
+    for name in launch_unset(cli, provider_type)
+        .into_iter()
+        .chain(from_launch())
+    {
+        command.env_remove(name);
     }
 }
 
@@ -906,7 +628,8 @@ pub enum StepStatus {
     Skipped,
 }
 
-/// The credentials of every granted provider, or only of `provider`.
+/// The credentials of every granted provider, or only of `provider`. A sign-in that several
+/// providers share is listed once, under the first of them.
 pub async fn setup_steps(
     store: &Store,
     credentials: &Credentials,
@@ -927,7 +650,7 @@ pub async fn setup_steps(
         }
     }
     let skipped = credentials.state()?.skipped;
-    let mut steps = vec![];
+    let mut steps: Vec<Step> = vec![];
     for id in &machine.providers {
         if provider.is_some_and(|only| only != id) {
             continue;
@@ -936,13 +659,20 @@ pub async fn setup_steps(
             continue;
         };
         for need in Need::all(provider_type) {
+            let shared = matches!(need, Need::SignIn(_))
+                && steps
+                    .iter()
+                    .any(|step| step.need == need && step.provider_type == *provider_type);
+            if shared {
+                continue;
+            }
             steps.push(Step {
                 provider: id.clone(),
                 provider_type: provider_type.clone(),
                 need,
-                status: if credentials.has(id, provider_type, need)? {
+                status: if credentials.has(id, provider_type, need).await? {
                     StepStatus::Done
-                } else if skipped.contains(&need.key(id)) {
+                } else if skipped.contains(&need.key(id, provider_type)) {
                     StepStatus::Skipped
                 } else {
                     StepStatus::Missing
@@ -953,133 +683,9 @@ pub async fn setup_steps(
     Ok(steps)
 }
 
-/// Whether the real `cli` is on `PATH`, past ags's shims.
-pub fn installed(store: &Store, cli: Cli) -> bool {
-    crate::shims::program(store, cli).is_ok()
-}
-
 /// Whether `program` is an executable in one of the dirs of `path`, a value of `PATH`.
 pub(crate) fn on_path(program: &str, path: Option<&OsStr>) -> bool {
     !crate::shims::executables(program, path).is_empty()
-}
-
-fn shared(cli: Cli) -> &'static [&'static str] {
-    match cli {
-        Cli::Claude => CLAUDE_SHARED,
-        Cli::Codex => CODEX_SHARED,
-        Cli::Pi => PI_SHARED,
-    }
-}
-
-/// What linking the user's settings into a provider's dir did and could not do.
-#[derive(Default)]
-struct Links {
-    /// Linked now, where nothing or an unchanged copy was.
-    linked: Vec<String>,
-    /// Files the provider holds a different copy of.
-    differing: Vec<String>,
-    /// Entries the provider holds that are not a file the user's could replace, such as a dir.
-    blocked: Vec<String>,
-}
-
-fn differs_key(dir: &Path, name: &str) -> String {
-    format!("differs/{}/{name}", dir.display())
-}
-
-fn blocked_key(dir: &Path, name: &str) -> String {
-    format!("blocked/{}/{name}", dir.display())
-}
-
-/// Links each of `names` that exists in `own` into `dir`. A CLI that saves a file by renaming over
-/// it replaces the link with a copy; an unchanged copy is linked again.
-fn link(own: &Path, dir: &Path, names: &[&str]) -> Result<Links> {
-    let mut links = Links::default();
-    for name in names {
-        let (from, to) = (own.join(name), dir.join(name));
-        if from.symlink_metadata().is_err() {
-            continue;
-        }
-        match to.symlink_metadata() {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(meta) if meta.is_symlink() => continue,
-            Ok(meta) if meta.is_file() && from.is_file() => {
-                if read(&to)? != read(&from)? {
-                    links.differing.push((*name).to_owned());
-                    continue;
-                }
-            }
-            Ok(_) => {
-                links.blocked.push((*name).to_owned());
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("reading {}", to.display()));
-            }
-        }
-        #[cfg(unix)]
-        {
-            let staging = dir.join(format!(".{name}.ags-link"));
-            let _ = fs::remove_file(&staging);
-            std::os::unix::fs::symlink(&from, &staging)
-                .and_then(|()| fs::rename(&staging, &to))
-                .with_context(|| format!("linking {} into {}", from.display(), dir.display()))?;
-            links.linked.push((*name).to_owned());
-        }
-        // Symbolic links need extra rights on Windows, so settings stay apart there.
-        #[cfg(not(unix))]
-        let _ = to;
-    }
-    Ok(links)
-}
-
-/// Brings the settings Claude Code keeps in the user's own `.claude.json` into `state`.
-fn share_claude_state(own: &Path, state: &Path) -> Result<()> {
-    let Some(own) = read_json(own)? else {
-        return Ok(());
-    };
-    let mut current = read_json(state)?.unwrap_or_default();
-    let mut next = current.clone();
-    mirror(&own, &mut next, CLAUDE_STATE_SHARED);
-    if let Some(Value::Object(projects)) = own.get("projects") {
-        let mine = next
-            .entry("projects")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(mine) = mine {
-            for (path, project) in projects {
-                let Value::Object(project) = project else {
-                    continue;
-                };
-                let entry = mine
-                    .entry(path)
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if let Value::Object(entry) = entry {
-                    mirror(project, entry, CLAUDE_PROJECT_SHARED);
-                }
-            }
-        }
-    }
-    if next == current {
-        return Ok(());
-    }
-    current = next;
-    write_json(state, &current)
-}
-
-/// Sets each of `keys` that `from` has to its value there; keys `from` lacks are left alone.
-fn mirror(from: &Map<String, Value>, to: &mut Map<String, Value>, keys: &[&str]) {
-    for key in keys {
-        if let Some(value) = from.get(*key) {
-            to.insert((*key).to_owned(), value.clone());
-        }
-    }
-}
-
-fn write_json(path: &Path, value: &Map<String, Value>) -> Result<()> {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
-        bail!("{} is not a file path", path.display());
-    };
-    write_private(dir, name, &serde_json::to_vec_pretty(value)?)?;
-    Ok(())
 }
 
 /// A dir name for a provider ID that no other ID shares on a filesystem that ignores case: the
@@ -1132,9 +738,8 @@ impl Drop for Interrupts {
     }
 }
 
-/// Claude Code keeps MCP sign-ins in the same file, so only `claudeAiOauth` is its own.
-fn has_claude_sign_in(path: &Path) -> Result<bool> {
-    Ok(read_json(path)?.is_some_and(|credentials| credentials.contains_key("claudeAiOauth")))
+fn field<'a>(json: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
+    json.get(name).and_then(Value::as_str)
 }
 
 fn is_file(path: &Path) -> bool {
@@ -1158,13 +763,18 @@ fn read_json(path: &Path) -> Result<Option<Map<String, Value>>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{clis::Upstream, store::tests::scratch};
+
+    /// The variables that point a CLI at a config dir; a launch or sign-in never sets them.
+    pub(crate) const CONFIG_DIRS: [&str; 3] =
+        ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"];
 
     struct Fixture {
         root: PathBuf,
         home: PathBuf,
+        bin: PathBuf,
         credentials: Credentials,
     }
 
@@ -1172,11 +782,17 @@ mod tests {
         fn new() -> Self {
             let root = scratch();
             let home = root.join("home");
+            let bin = root.join("bin");
             fs::create_dir_all(&home).unwrap();
-            let credentials = Credentials::new(&Store::at(root.join("ags")), Home::at(&home));
+            fs::create_dir_all(&bin).unwrap();
+            let credentials = Credentials::new(
+                &Store::at(root.join("ags")),
+                Home::at(&home).with_path(&bin),
+            );
             Self {
                 root,
                 home,
+                bin,
                 credentials,
             }
         }
@@ -1198,6 +814,23 @@ mod tests {
         }
     }
 
+    /// Everything under `dir`, as sorted paths relative to it.
+    fn tree(dir: &Path) -> Vec<PathBuf> {
+        let mut found = vec![];
+        let mut pending = vec![dir.to_owned()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).into_iter().flatten().flatten() {
+                let path = entry.path();
+                found.push(path.strip_prefix(dir).unwrap().to_owned());
+                if path.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
@@ -1205,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_needs_a_sign_in_per_cli_or_its_key() {
+    fn a_provider_needs_each_clis_sign_in_or_its_key() {
         assert_eq!(
             Need::all(CLAUDE_SUBSCRIPTION),
             [Need::SignIn(Cli::Claude), Need::SignIn(Cli::Pi)]
@@ -1218,372 +851,139 @@ mod tests {
         assert_eq!(Need::all(VERTEX), [Need::VertexAccount]);
         assert!(Need::all("typesafe").is_empty());
         assert_eq!(
-            Need::of_launch(Cli::Pi, CODEX_SUBSCRIPTION),
-            Some(Need::SignIn(Cli::Pi))
+            Need::of_launch(CODEX_SUBSCRIPTION),
+            None,
+            "the CLI asks for its own sign-in"
         );
-        assert_eq!(Need::of_launch(Cli::Claude, "typesafe"), None);
+        assert_eq!(Need::of_launch(BEDROCK), Some(Need::BedrockKey));
+        assert_eq!(Need::of_launch("typesafe"), None);
         assert_eq!(Need::SignIn(Cli::Claude).to_string(), "Claude Code sign-in");
         assert_eq!(Need::BedrockKey.to_string(), "Bedrock API key");
     }
 
     #[test]
-    fn each_provider_has_its_own_dir_per_cli() {
-        let fixture = Fixture::new();
-        let credentials = &fixture.credentials;
-        let claude = credentials
-            .isolate("work", CLAUDE_SUBSCRIPTION, Cli::Claude)
-            .unwrap();
-        assert!(claude.args.is_empty());
-        assert_eq!(
-            claude.env[..1],
-            [(
-                "CLAUDE_CONFIG_DIR",
-                fixture.provider("work").join("claude").into_os_string()
-            )]
-        );
-        let other = credentials
-            .isolate("personal", CLAUDE_SUBSCRIPTION, Cli::Claude)
-            .unwrap();
-        assert_ne!(claude.env, other.env, "two providers never share a sign-in");
-        let codex = credentials
-            .isolate("work", CODEX_SUBSCRIPTION, Cli::Codex)
-            .unwrap();
-        assert_eq!(codex.args, [OsString::from("-c"), CODEX_FILE_STORE.into()]);
-        assert!(claude.unset.contains(&"ANTHROPIC_API_KEY"));
-        assert!(claude.unset.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
-        assert!(codex.unset.contains(&"OPENAI_API_KEY"));
-        assert!(codex.unset.contains(&"CODEX_ACCESS_TOKEN"));
+    fn a_launch_drops_what_would_replace_its_providers_sign_in_and_upstream() {
+        let claude = launch_unset(Cli::Claude, CLAUDE_SUBSCRIPTION);
+        assert!(claude.contains(&"ANTHROPIC_API_KEY"));
+        assert!(claude.contains(&"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"));
         for (route, _) in CLAUDE_ROUTES {
-            let set_by_subscription = *route == "ANTHROPIC_BASE_URL";
             assert_eq!(
-                claude.unset.contains(route),
-                !set_by_subscription,
+                claude.contains(route),
+                *route != "ANTHROPIC_BASE_URL",
                 "{route}"
             );
         }
-        assert!(
-            claude
-                .unset
-                .contains(&"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")
-        );
-        let on_bedrock = shared_auth(Cli::Claude, BEDROCK);
+        let on_bedrock = launch_unset(Cli::Claude, BEDROCK);
         assert!(!on_bedrock.contains(&"CLAUDE_CODE_USE_BEDROCK"));
         assert!(on_bedrock.contains(&"CLAUDE_CODE_USE_VERTEX"));
-        assert_eq!(codex.env[0].0, "CODEX_HOME");
-        let pi = credentials
-            .isolate("work", CODEX_SUBSCRIPTION, Cli::Pi)
-            .unwrap();
-        assert_eq!(
-            pi.env[..1],
-            [(
-                "PI_CODING_AGENT_DIR",
-                fixture.provider("work").join("pi").into_os_string()
-            )]
-        );
-        #[cfg(unix)]
-        {
-            assert_eq!(mode(&fixture.root.join("ags").join(DIR_NAME)), 0o700);
-            assert_eq!(mode(&fixture.provider("work")), 0o700);
-            assert_eq!(mode(&fixture.provider("work").join("codex")), 0o700);
-        }
-        let work = credentials.cli_dir("Work", Cli::Claude).unwrap();
-        let name = work
-            .parent()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(name.starts_with("work."), "{name}");
-        assert_ne!(
-            name.to_lowercase(),
-            "work",
-            "Work and work stay apart where case is ignored"
-        );
-        assert_ne!(work, credentials.cli_dir("WORK", Cli::Claude).unwrap());
-        for refused in ["", "../work", "a/b", ".", &"x".repeat(65)] {
-            assert!(
-                credentials
-                    .isolate(refused, CLAUDE_SUBSCRIPTION, Cli::Claude)
-                    .is_err(),
-                "{refused:?}"
-            );
+        let codex = launch_unset(Cli::Codex, CODEX_SUBSCRIPTION);
+        assert!(codex.contains(&"OPENAI_API_KEY"));
+        assert!(codex.contains(&"CODEX_ACCESS_TOKEN"));
+        assert!(launch_unset(Cli::Pi, CLAUDE_SUBSCRIPTION).contains(&"ANTHROPIC_OAUTH_TOKEN"));
+        for cli in Cli::value_variants() {
+            for provider_type in cli.provider_types() {
+                let unset = launch_unset(*cli, provider_type);
+                for name in CLOUD_CREDENTIALS {
+                    assert_eq!(
+                        unset.contains(name),
+                        matches!(*provider_type, BEDROCK | VERTEX),
+                        "{cli} on {provider_type}: {name}"
+                    );
+                }
+                for name in CONFIG_DIRS
+                    .into_iter()
+                    .chain(["CLAUDE_SECURESTORAGE_CONFIG_DIR"])
+                {
+                    assert!(!unset.contains(&name), "the user's own {name} stays");
+                }
+            }
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn settings_are_linked_and_credentials_stay_apart() {
-        let fixture = Fixture::new();
-        fixture.write(".claude/settings.json", "{}");
-        fixture.write(".claude/agents/reviewer.md", "agent");
-        fixture.write(".claude/.credentials.json", "{\"own\":1}");
-        fixture.write(".claude/history.jsonl", "");
-        fixture.write(".codex/config.toml", "model = \"x\"");
-        fixture.write(".codex/auth.json", "{}");
-        fixture.write(".pi/agent/settings.json", "{}");
-        fixture.write(".pi/agent/auth.json", "{}");
-        let credentials = &fixture.credentials;
-        let claude = credentials.prepare("work", Cli::Claude).unwrap();
-        assert_eq!(
-            fs::read_link(claude.join("settings.json")).unwrap(),
-            fixture.home.join(".claude/settings.json")
-        );
-        assert_eq!(
-            fs::read_to_string(claude.join("agents/reviewer.md")).unwrap(),
-            "agent"
-        );
-        for isolated in [".credentials.json", "history.jsonl", "commands"] {
-            assert!(
-                claude.join(isolated).symlink_metadata().is_err(),
-                "{isolated}"
-            );
-        }
-        let codex = credentials.prepare("work", Cli::Codex).unwrap();
-        assert!(codex.join("config.toml").is_symlink());
-        assert!(!codex.join("auth.json").exists());
-        let pi = credentials.prepare("work", Cli::Pi).unwrap();
-        assert!(pi.join("settings.json").is_symlink());
-        assert!(!pi.join("auth.json").exists());
-
-        // A provider's own file is kept, and settings added later are linked on the next launch.
-        fs::remove_file(claude.join("settings.json")).unwrap();
-        fs::write(claude.join("settings.json"), "{\"mine\":1}").unwrap();
-        fixture.write(".claude/commands/review.md", "command");
-        credentials.prepare("work", Cli::Claude).unwrap();
-        assert_eq!(
-            fs::read_to_string(claude.join("settings.json")).unwrap(),
-            "{\"mine\":1}"
-        );
-        assert!(claude.join("commands").is_symlink());
+    fn the_users_own_claude_code_dir_holds_their_settings() {
+        let vars = |pairs: &'static [(&str, &str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let home = Home::from_vars(vars(&[("HOME", "/home/me"), ("PATH", "/bin")]));
+        assert_eq!(home.claude, Some(PathBuf::from("/home/me/.claude")));
+        assert_eq!(home.path, Some(OsString::from("/bin")));
+        let own = Home::from_vars(vars(&[
+            ("HOME", "/home/me"),
+            ("CLAUDE_CONFIG_DIR", "/home/me/work-claude"),
+        ]));
+        assert_eq!(own.claude, Some(PathBuf::from("/home/me/work-claude")));
+        assert_eq!(Home::at(Path::new("/home/me")).path, None);
     }
 
     #[test]
-    fn a_pi_launch_has_one_dir_of_its_own_and_no_ones_credentials() {
-        let fixture = Fixture::new();
-        fixture.write(".pi/agent/settings.json", "{}");
-        fixture.write(".pi/agent/auth.json", "{}");
-        let credentials = &fixture.credentials;
-        let pi = credentials.isolate_pi().unwrap();
-        let dir = fixture.root.join("ags").join(PI_LAUNCH_DIR);
-        assert_eq!(
-            pi.env[0],
-            ("PI_CODING_AGENT_DIR", dir.clone().into_os_string())
-        );
-        assert!(dir.join("settings.json").is_symlink());
-        assert!(!dir.join("auth.json").exists());
-        for name in [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "AWS_PROFILE",
-            "GOOGLE_CLOUD_API_KEY",
-        ] {
-            assert!(pi.unset.contains(&name), "{name}");
-        }
-        fs::remove_file(dir.join("settings.json")).unwrap();
-        fs::write(dir.join("settings.json"), "{\"mine\":1}").unwrap();
-        let notices = credentials.pi_notices().unwrap();
-        assert_eq!(
-            notices,
-            [format!(
-                "ags keeps its own settings.json for pi, which differs from yours; delete {} to share yours again",
-                dir.join("settings.json").display()
-            )]
-        );
-        assert!(credentials.pi_notices().unwrap().is_empty());
-        assert_eq!(
-            credentials
-                .pi_credential("work", CLAUDE_SUBSCRIPTION)
-                .unwrap(),
-            fixture.provider("work").join("pi").join(PI_AUTH)
-        );
-        assert_eq!(
-            credentials.pi_credential("aws", BEDROCK).unwrap(),
-            fixture.provider("aws").join(BEDROCK_KEY)
-        );
-        // ags run inside a pi launch still finds the user's own pi dir.
-        let nested = Home::from_vars(|name| match name {
-            "HOME" => Some(fixture.home.clone().into_os_string()),
-            "PI_CODING_AGENT_DIR" => Some(dir.clone().into_os_string()),
-            _ => None,
-        })
-        .resolve(Some(&fixture.root.join("ags")));
-        assert_eq!(nested.pi, Some(fixture.home.join(".pi/agent")));
-    }
-
-    #[test]
-    fn claude_code_settings_in_its_state_file_follow_the_users_own() {
-        let fixture = Fixture::new();
-        fixture.write(
-            ".claude.json",
-            r#"{"mcpServers":{"docs":{"command":"docs"}},"hasCompletedOnboarding":true,
-            "oauthAccount":{"emailAddress":"me@example.com"},"userID":"u",
-            "projects":{"/src":{"mcpServers":{"db":{}},"hasTrustDialogAccepted":true,"lastCost":1}}}"#,
-        );
-        let credentials = &fixture.credentials;
-        let dir = credentials.prepare("work", Cli::Claude).unwrap();
-        let state = read_json(&dir.join(CLAUDE_STATE)).unwrap().unwrap();
-        assert_eq!(state["mcpServers"]["docs"]["command"], "docs");
-        assert_eq!(state["hasCompletedOnboarding"], true);
-        assert!(
-            state.get("oauthAccount").is_none(),
-            "the sign-in stays apart"
-        );
-        assert!(state.get("userID").is_none());
-        let project = &state["projects"]["/src"];
-        assert_eq!(project["hasTrustDialogAccepted"], true);
-        assert!(project.get("lastCost").is_none());
-        #[cfg(unix)]
-        assert_eq!(mode(&dir.join(CLAUDE_STATE)), 0o600);
-
-        // Only keys the user's file has are set; Claude Code's own are never removed.
-        let mut state = state;
-        state.insert("numStartups".into(), 3.into());
-        write_json(&dir.join(CLAUDE_STATE), &state).unwrap();
-        fixture.write(
-            ".claude.json",
-            r#"{"mcpServers":{},"projects":{"/src":{}}}"#,
-        );
-        credentials.prepare("work", Cli::Claude).unwrap();
-        let state = read_json(&dir.join(CLAUDE_STATE)).unwrap().unwrap();
-        assert_eq!(state["numStartups"], 3);
-        assert_eq!(state["mcpServers"], Value::Object(Map::new()));
-        assert_eq!(state["hasCompletedOnboarding"], true);
-        assert_eq!(state["projects"]["/src"]["hasTrustDialogAccepted"], true);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_shared_file_a_cli_replaced_is_linked_again_or_named_once() {
-        let fixture = Fixture::new();
-        fixture.write(".codex/config.toml", "model = \"a\"");
-        fixture.write(".codex/AGENTS.md", "rules");
-        let credentials = &fixture.credentials;
-        let dir = credentials.prepare("work", Cli::Codex).unwrap();
-        assert!(credentials.notices("work", Cli::Codex).unwrap().is_empty());
-
-        // Codex saved config.toml by renaming a new file over the link, unchanged.
-        fs::remove_file(dir.join("config.toml")).unwrap();
-        fs::write(dir.join("config.toml"), "model = \"a\"").unwrap();
-        assert!(credentials.notices("work", Cli::Codex).unwrap().is_empty());
-        assert!(dir.join("config.toml").is_symlink());
-
-        // A copy that differs is kept, and named only once.
-        fs::remove_file(dir.join("config.toml")).unwrap();
-        fs::write(dir.join("config.toml"), "model = \"b\"").unwrap();
-        let notices = credentials.notices("work", Cli::Codex).unwrap();
-        assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].starts_with("work keeps its own config.toml for Codex"),
-            "{}",
-            notices[0]
-        );
-        assert!(credentials.notices("work", Cli::Codex).unwrap().is_empty());
-        assert_eq!(
-            fs::read_to_string(dir.join("config.toml")).unwrap(),
-            "model = \"b\""
-        );
-        assert!(dir.join("AGENTS.md").is_symlink());
-
-        // Once shared again, a later split is named again.
-        fs::write(dir.join("config.toml"), "model = \"a\"").unwrap();
-        assert!(credentials.notices("work", Cli::Codex).unwrap().is_empty());
-        assert!(dir.join("config.toml").is_symlink());
-        fs::remove_file(dir.join("config.toml")).unwrap();
-        fs::write(dir.join("config.toml"), "model = \"c\"").unwrap();
-        assert_eq!(credentials.notices("work", Cli::Codex).unwrap().len(), 1);
-
-        // A dir of the provider's own where the user's is shared is named once.
-        fixture.write(".codex/rules/default.rules", "");
-        fs::create_dir(dir.join("rules")).unwrap();
-        let notices = credentials.notices("work", Cli::Codex).unwrap();
-        assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].starts_with("work has its own rules for Codex, so yours is not shared"),
-            "{}",
-            notices[0]
-        );
-        assert!(credentials.notices("work", Cli::Codex).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_key_helper_in_the_users_settings_is_named_once() {
-        let fixture = Fixture::new();
-        fixture.write(
-            ".claude/settings.json",
-            r#"{"apiKeyHelper":"key.sh","env":{"ANTHROPIC_API_KEY":"k","EDITOR":"vi"}}"#,
-        );
-        let credentials = &fixture.credentials;
-        let notices = credentials.notices("work", Cli::Claude).unwrap();
-        assert_eq!(
-            notices,
-            [
-                "your Claude Code settings set apiKeyHelper, so every Claude provider uses that key in place of its own sign-in",
-                "your Claude Code settings set ANTHROPIC_API_KEY, so every Claude provider uses it in place of its own sign-in",
-            ]
-        );
-        assert!(
-            credentials
-                .notices("other", Cli::Claude)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(credentials.notices("work", Cli::Codex).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_route_or_cloud_credential_in_the_users_settings_is_named_once() {
-        let fixture = Fixture::new();
-        fixture.write(
-            ".claude/settings.json",
-            r#"{"env":{"ANTHROPIC_UNIX_SOCKET":"/run/s","AWS_PROFILE":"dev","AWS_REGION":"us-east-1"}}"#,
-        );
-        let credentials = &fixture.credentials;
-        assert_eq!(
-            credentials.notices("work", Cli::Claude).unwrap(),
-            [
-                "your Claude Code settings set ANTHROPIC_UNIX_SOCKET, which overrides where each ags launch sends Claude Code",
-                "your Claude Code settings set AWS_PROFILE, which a Bedrock or Vertex provider may use in place of its own credential",
-            ]
-        );
-        assert!(credentials.notices("work", Cli::Claude).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_claude_sign_in_is_its_own_oauth_entry() {
+    fn a_skipped_sign_in_is_the_clis_whichever_provider_it_was_skipped_for() {
         let fixture = Fixture::new();
         let credentials = &fixture.credentials;
-        let claude = Need::SignIn(Cli::Claude);
-        let dir = credentials.prepare("work", Cli::Claude).unwrap();
-        fs::write(dir.join(CLAUDE_CREDENTIALS), r#"{"mcpOAuth":{}}"#).unwrap();
+        let pi = Need::SignIn(Cli::Pi);
+        credentials.skip("work", CLAUDE_SUBSCRIPTION, pi).unwrap();
+        let skipped = credentials.state().unwrap().skipped;
+        assert!(skipped.contains(&pi.key("home", CLAUDE_SUBSCRIPTION)));
+        assert!(!skipped.contains(&pi.key("work", CODEX_SUBSCRIPTION)));
+        credentials.skip("aws", BEDROCK, Need::BedrockKey).unwrap();
+        let skipped = credentials.state().unwrap().skipped;
+        assert!(!skipped.contains(&Need::BedrockKey.key("aws2", BEDROCK)));
+        credentials.unskip("home", CLAUDE_SUBSCRIPTION, pi).unwrap();
         assert!(
             !credentials
-                .has("work", CLAUDE_SUBSCRIPTION, claude)
-                .unwrap(),
-            "MCP sign-ins alone are not a Claude sign-in"
+                .state()
+                .unwrap()
+                .skipped
+                .contains(&pi.key("work", CLAUDE_SUBSCRIPTION))
         );
-        if !cfg!(target_os = "macos") {
-            fs::write(dir.join(CLAUDE_CREDENTIALS), r#"{"claudeAiOauth":{}}"#).unwrap();
-            assert!(
-                credentials
-                    .has("work", CLAUDE_SUBSCRIPTION, claude)
-                    .unwrap()
-            );
-        }
     }
 
     #[test]
-    fn a_cloud_provider_keeps_its_credential_in_a_private_file() {
+    fn only_a_key_helper_in_the_users_settings_is_named_and_once() {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".claude/settings.json",
+            r#"{"apiKeyHelper":"key.sh","env":{"ANTHROPIC_API_KEY":"k","ANTHROPIC_UNIX_SOCKET":"/run/s",
+            "CLAUDE_CODE_USE_VERTEX":"1","AWS_PROFILE":"dev","EDITOR":"vi"}}"#,
+        );
+        let credentials = &fixture.credentials;
+        assert_eq!(
+            credentials.notices(Cli::Claude).unwrap(),
+            [
+                "your Claude Code settings set apiKeyHelper, so Claude Code sends that key to Claude providers in place of your sign-in",
+            ]
+        );
+        assert!(credentials.notices(Cli::Claude).unwrap().is_empty());
+        assert!(credentials.notices(Cli::Codex).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cloud_provider_keeps_its_credential_in_a_private_file() {
         let fixture = Fixture::new();
         let credentials = &fixture.credentials;
-        assert!(!credentials.has("aws", BEDROCK, Need::BedrockKey).unwrap());
+        assert!(
+            !credentials
+                .has("aws", BEDROCK, Need::BedrockKey)
+                .await
+                .unwrap()
+        );
         for refused in ["", "  ", "two words"] {
             assert!(credentials.save_bedrock_key("aws", refused).is_err());
         }
         credentials
             .save_bedrock_key("aws", " ABSKexample\n")
             .unwrap();
-        assert!(credentials.has("aws", BEDROCK, Need::BedrockKey).unwrap());
+        assert!(
+            credentials
+                .has("aws", BEDROCK, Need::BedrockKey)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             credentials.cloud_env("aws", BEDROCK).unwrap(),
             [("AWS_BEARER_TOKEN_BEDROCK", OsString::from("ABSKexample"))]
@@ -1598,7 +998,12 @@ mod tests {
                 .to_string()
                 .ends_with("is not a Google Cloud service account key")
         );
-        assert!(!credentials.has("gcp", VERTEX, Need::VertexAccount).unwrap());
+        assert!(
+            !credentials
+                .has("gcp", VERTEX, Need::VertexAccount)
+                .await
+                .unwrap()
+        );
         let account = r#"{"type":"service_account","project_id":"p","client_email":"a@p.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----"}"#;
         fixture.write("key.json", account);
         credentials
@@ -1606,6 +1011,7 @@ mod tests {
             .unwrap();
         let stored = fixture.provider("gcp").join(VERTEX_ACCOUNT);
         assert_eq!(fs::read_to_string(&stored).unwrap(), account);
+        assert_eq!(credentials.cloud_file("gcp", VERTEX).unwrap(), stored);
         assert_eq!(credentials.vertex_project("gcp").unwrap(), "p");
         assert!(credentials.vertex_project("aws").is_err());
         for project in ["p/../x", ".", "..", "", "-p"] {
@@ -1637,118 +1043,72 @@ mod tests {
             assert_eq!(mode(&stored), 0o600);
             assert_eq!(mode(&fixture.provider("aws").join(BEDROCK_KEY)), 0o600);
             assert_eq!(mode(&fixture.provider("gcp")), 0o700);
+            assert_eq!(mode(&fixture.root.join("ags").join(DIR_NAME)), 0o700);
         }
-    }
-
-    #[test]
-    fn a_cli_that_ags_launched_is_not_the_users_own() {
-        let fixture = Fixture::new();
-        let custom = fixture.root.join("custom-claude");
-        let launch = fixture.provider("work").join("claude");
-        let home = fixture.home.clone();
-        let env = |pairs: Vec<(&'static str, PathBuf)>| {
-            let pairs: Vec<(&str, OsString)> = pairs
-                .into_iter()
-                .map(|(name, value)| (name, value.into_os_string()))
-                .collect();
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(known, _)| *known == name)
-                    .map(|(_, value)| value.clone())
-            }
-        };
-
-        let store = Store::at(fixture.root.join("ags"));
-        let resolved = |pairs| Credentials::new(&store, Home::from_vars(env(pairs))).home;
-
-        // The user's own CLAUDE_CONFIG_DIR is passed on to a launch, which sets its own.
-        let outer = resolved(vec![
-            ("HOME", home.clone()),
-            ("CLAUDE_CONFIG_DIR", custom.clone()),
-        ]);
-        assert_eq!(outer.claude_state, Some(custom.join(CLAUDE_STATE)));
-        let kept: Vec<(&'static str, PathBuf)> = outer
-            .kept()
-            .map(|(name, value)| (name, PathBuf::from(value)))
-            .collect();
-        let inside_launch = |claude_config_dir: &Path| {
-            let mut pairs = vec![
-                ("HOME", home.clone()),
-                ("CLAUDE_CONFIG_DIR", claude_config_dir.to_owned()),
-            ];
-            pairs.extend(kept.iter().cloned());
-            resolved(pairs)
-        };
-        let inner = inside_launch(&launch);
-        assert_eq!(inner.claude, Some(custom.clone()));
-        assert_eq!(inner.claude_state, Some(custom.join(CLAUDE_STATE)));
-        assert_eq!(
-            inner.codex,
-            Some(home.join(".codex")),
-            "an unset variable stays unset"
+        let work = credentials.cloud_file("Work", BEDROCK).unwrap();
+        let name = work
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(name.starts_with("work."), "{name}");
+        assert_ne!(
+            work,
+            credentials.cloud_file("work", BEDROCK).unwrap(),
+            "Work and work stay apart where case is ignored"
         );
-
-        // A dir the user chose inside the launch, outside ags, is theirs.
-        let chosen = fixture.root.join("chosen");
-        assert_eq!(inside_launch(&chosen).claude, Some(chosen));
-
-        // Without them, a dir inside ags falls back to the default, also through a link.
-        fs::create_dir_all(&launch).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&launch, fixture.root.join("link")).unwrap();
-        #[cfg(unix)]
-        let launch = fixture.root.join("link");
-        let nested = resolved(vec![("HOME", home.clone()), ("CLAUDE_CONFIG_DIR", launch)]);
-        assert_eq!(nested.claude, Some(home.join(".claude")));
-        assert_eq!(nested.claude_state, Some(home.join(CLAUDE_STATE)));
+        for refused in ["", "../work", "a/b", ".", &"x".repeat(65)] {
+            assert!(
+                credentials.cloud_file(refused, BEDROCK).is_err(),
+                "{refused:?}"
+            );
+        }
     }
 
     #[test]
     fn a_sign_in_inherits_nothing_a_launch_sets() {
         let fixture = Fixture::new();
-        let path = gcloud_on_path(&fixture);
-        store_cloud_credentials(&fixture, "work");
         let dropped: Vec<&str> = from_launch().collect();
         // A launch only adds loopback hosts to the user's own list, which a sign-in may keep.
         let kept: Vec<&str> = crate::launch::no_proxy(|_| None)
             .iter()
             .map(|(name, _)| *name)
             .collect();
-        let pi = fixture.credentials.isolate_pi().unwrap();
-        let pi_set = pi.env.iter().map(|(name, _)| *name);
-        for name in pi_set.chain([crate::pi::ROUTES_ENV, crate::clis::SECRET_ENV]) {
+        for name in [crate::pi::ROUTES_ENV, crate::clis::SECRET_ENV] {
             assert!(dropped.contains(&name), "pi sets {name}");
         }
-        for cli in Cli::value_variants() {
-            if *cli == Cli::Pi {
-                continue;
-            }
+        fs::write(fixture.bin.join("gcloud"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                fixture.bin.join("gcloud"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let path = fixture.bin.to_str().unwrap().to_owned();
+        for cli in [Cli::Claude, Cli::Codex] {
             for provider_type in cli.provider_types() {
+                let upstream = Upstream {
+                    id: "work",
+                    provider_type,
+                    region: Some("us-east-1"),
+                    project: Some("p"),
+                };
                 let setup = cli
                     .setup(
-                        cloud_upstream(provider_type),
+                        upstream,
                         "http://127.0.0.1:1",
                         "secret",
                         &fixture.root,
                         |name| (name == "PATH").then(|| path.clone()),
                     )
                     .unwrap();
-                let isolation = fixture
-                    .credentials
-                    .isolate("work", provider_type, *cli)
-                    .unwrap();
-                let cloud = fixture
-                    .credentials
-                    .cloud_env("work", provider_type)
-                    .unwrap();
-                let set = setup
-                    .env
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .chain(isolation.env.iter().map(|(name, _)| *name))
-                    .chain(cloud.iter().map(|(name, _)| *name));
-                for name in set {
+                let cloud = ["AWS_BEARER_TOKEN_BEDROCK", "GOOGLE_APPLICATION_CREDENTIALS"];
+                for name in setup.env.iter().map(|(name, _)| *name).chain(cloud) {
                     assert!(dropped.contains(&name), "{cli} sets {name}");
                 }
             }
@@ -1757,97 +1117,48 @@ mod tests {
         assert!(kept.iter().all(|name| !dropped.contains(name)));
     }
 
-    fn cloud_upstream(provider_type: &str) -> Upstream<'_> {
-        Upstream {
-            id: "work",
-            provider_type,
-            region: Some("us-east-1"),
-            project: Some("p"),
-        }
-    }
-
-    /// A `PATH` value holding an executable `gcloud`.
-    fn gcloud_on_path(fixture: &Fixture) -> String {
-        let bin = fixture.root.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("gcloud"), "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(bin.join("gcloud"), fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        bin.to_str().unwrap().to_owned()
-    }
-
-    fn store_cloud_credentials(fixture: &Fixture, provider: &str) {
-        fixture.write(
-            "key.json",
-            r#"{"type":"service_account","project_id":"p","client_email":"a@p.iam.gserviceaccount.com","private_key":"k"}"#,
-        );
-        let credentials = &fixture.credentials;
-        credentials
-            .save_bedrock_key(provider, "ABSKexample")
-            .unwrap();
-        credentials
-            .save_vertex_account(provider, &fixture.home.join("key.json"))
-            .unwrap();
-    }
-
-    #[test]
-    fn a_claude_launch_keeps_only_its_providers_route_and_cloud_credential() {
-        let fixture = Fixture::new();
-        let path = gcloud_on_path(&fixture);
-        for provider_type in [CLAUDE_SUBSCRIPTION, BEDROCK, VERTEX] {
-            let setup = Cli::Claude
-                .setup(
-                    cloud_upstream(provider_type),
-                    "http://127.0.0.1:1",
-                    "secret",
-                    &fixture.root,
-                    |name| (name == "PATH").then(|| path.clone()),
-                )
-                .unwrap();
-            let isolation = fixture
-                .credentials
-                .isolate("work", provider_type, Cli::Claude)
-                .unwrap();
-            for (route, _) in CLAUDE_ROUTES {
-                let set = setup.env.iter().any(|(name, _)| name == route);
-                assert_ne!(
-                    set,
-                    isolation.unset.contains(route),
-                    "{provider_type}: {route} is either set or cleared"
-                );
-            }
-            let cloud = matches!(provider_type, BEDROCK | VERTEX);
-            for cli in Cli::value_variants() {
-                let isolation = fixture
-                    .credentials
-                    .isolate("work", provider_type, *cli)
-                    .unwrap();
-                for name in CLOUD_CREDENTIALS {
-                    assert_eq!(
-                        isolation.unset.contains(name),
-                        cloud,
-                        "{cli} on {provider_type}: {name}"
-                    );
-                }
-            }
-        }
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_sign_in_runs_the_vendors_own_in_the_providers_dir() {
+    async fn a_sign_in_runs_the_vendors_own_in_the_users_dir() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = Fixture::new();
-        let stub = fixture.home.join("stub");
-        fs::write(
-            &stub,
-            "#!/bin/sh\nhome=\"$CODEX_HOME$PI_CODING_AGENT_DIR\"\nprintf '%s\\n' \"$@\" > \"$home/args\"\nprintf '{\"openai-codex\":{}}' > \"$home/auth.json\"\nexec grep SigIgn /proc/self/status > \"$home/ignored\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        // Each stand-in CLI prints the status in `<cli>-status`, which its sign-in replaces with
+        // `<cli>-login`, and records how it ran.
+        let stub = "#!/bin/sh\nout=\"$(dirname \"$0\")\"\nname=\"${0##*/}\"\n\
+            case \"$*\" in\n\
+            *'auth status --json'|'login status'|'auth check '*) printf '%s\\n' \"$@\" > \"$out/$name-checked\"; cat \"$out/$name-status\"; exit 0 ;;\n\
+            esac\n\
+            printf '%s\\n' \"$@\" > \"$out/$name-args\"\n\
+            printf '%s' \"${CLAUDE_CONFIG_DIR-unset} ${CODEX_HOME-unset} ${PI_CODING_AGENT_DIR-unset}\" > \"$out/$name-dirs\"\n\
+            cp \"$out/$name-login\" \"$out/$name-status\"\n\
+            exec grep SigIgn /proc/self/status > \"$out/$name-ignored\"\n";
+        // An API key the CLI holds is not the sign-in a subscription provider takes.
+        for (cli, key, login) in [
+            (
+                "claude",
+                r#"{"loggedIn":true,"authMethod":"api_key"}"#,
+                r#"{"loggedIn":true,"authMethod":"claude.ai"}"#,
+            ),
+            (
+                "codex",
+                "API key configured - ***",
+                "Logged in using ChatGPT",
+            ),
+            (
+                "pi",
+                r#"{"status":"ready","authType":"api_key"}"#,
+                r#"{"status":"ready","authType":"oauth"}"#,
+            ),
+        ] {
+            let path = fixture.bin.join(cli);
+            fs::write(&path, stub).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(fixture.bin.join(format!("{cli}-status")), key).unwrap();
+            fs::write(fixture.bin.join(format!("{cli}-login")), login).unwrap();
+        }
+        let earlier = fixture.provider("work").join("claude");
+        fs::create_dir_all(&earlier).unwrap();
+        fs::write(earlier.join(".claude.json"), "{}").unwrap();
         let interrupt = || {
             // SAFETY: a null new action only reads the current one into `current`.
             let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -1855,22 +1166,30 @@ mod tests {
             current.sa_sigaction
         };
         let before = interrupt();
+        let theirs = CONFIG_DIRS
+            .map(|name| std::env::var(name).unwrap_or_else(|_| "unset".to_owned()))
+            .join(" ");
         let credentials = &fixture.credentials;
-        for (cli, args) in [
-            (Cli::Codex, format!("login\n-c\n{CODEX_FILE_STORE}\n")),
-            (Cli::Pi, "auth\nlogin\nopenai-codex\n".to_owned()),
+        for (cli, provider_type, args) in [
+            (Cli::Claude, CLAUDE_SUBSCRIPTION, "auth\nlogin\n"),
+            (Cli::Codex, CODEX_SUBSCRIPTION, "login\n"),
+            (Cli::Pi, CODEX_SUBSCRIPTION, "auth\nlogin\nopenai-codex\n"),
         ] {
-            let status = credentials
-                .sign_in("work", CODEX_SUBSCRIPTION, cli, Some(stub.as_os_str()))
-                .await
-                .unwrap();
+            let need = Need::SignIn(cli);
+            assert!(!credentials.has("work", provider_type, need).await.unwrap());
+            let status = credentials.sign_in(provider_type, cli).await.unwrap();
             assert!(status.success());
             assert_eq!(interrupt(), before, "ags handles Ctrl-C as before");
-            let dir = fixture.provider("work").join(cli.to_string());
-            assert_eq!(fs::read_to_string(dir.join("args")).unwrap(), args);
+            let read = |what: &str| fs::read_to_string(fixture.bin.join(format!("{cli}-{what}")));
+            assert_eq!(read("args").unwrap(), args);
+            assert_eq!(
+                read("dirs").unwrap(),
+                theirs,
+                "{cli} signs in to the user's own dir"
+            );
             #[cfg(target_os = "linux")]
             {
-                let ignored = fs::read_to_string(dir.join("ignored")).unwrap();
+                let ignored = read("ignored").unwrap();
                 let mask = u64::from_str_radix(ignored.trim().trim_start_matches("SigIgn:\t"), 16)
                     .unwrap();
                 // Read by a program the script execs, since a shell ignores SIGQUIT itself.
@@ -1880,11 +1199,43 @@ mod tests {
                     "the sign-in gets Ctrl-C and Ctrl-\\: {ignored}"
                 );
             }
-            assert!(
-                credentials
-                    .has("work", CODEX_SUBSCRIPTION, Need::SignIn(cli))
-                    .unwrap()
-            );
+            assert!(credentials.has("work", provider_type, need).await.unwrap());
         }
+        // Claude Code reports its sign-in as a launch would leave it, with the same blanks.
+        let checked = fs::read_to_string(fixture.bin.join("claude-checked")).unwrap();
+        let checked: Vec<&str> = checked.lines().collect();
+        assert_eq!(checked[0], "--settings");
+        let blanks: Value = serde_json::from_str(checked[1]).unwrap();
+        assert_eq!(blanks["env"]["ANTHROPIC_API_KEY"], "");
+        assert_eq!(blanks["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
+        assert_eq!(checked[2..], ["auth", "status", "--json"]);
+        assert!(
+            tree(&fixture.home).is_empty(),
+            "ags writes nothing of the user's"
+        );
+        assert_eq!(
+            tree(&fixture.provider("work")),
+            [
+                PathBuf::from("claude"),
+                PathBuf::from("claude/.claude.json")
+            ]
+        );
+        assert!(
+            credentials
+                .sign_in(BEDROCK, Cli::Pi)
+                .await
+                .unwrap_err()
+                .to_string()
+                .starts_with("pi can't sign in")
+        );
+        fs::remove_file(fixture.bin.join("codex")).unwrap();
+        assert!(!credentials.installed(Cli::Codex));
+        assert!(
+            !credentials
+                .has("work", CODEX_SUBSCRIPTION, Need::SignIn(Cli::Codex))
+                .await
+                .unwrap(),
+            "a CLI that is not installed is not signed in"
+        );
     }
 }

@@ -39,7 +39,7 @@ enum Command {
     Logout,
     /// Show the server, account and providers of this machine
     Status,
-    /// Sign in to each provider that needs it, or again to one provider
+    /// Sign in to each CLI and save cloud keys as needed, or set up one provider again
     Setup {
         /// Set up only this provider, again if it was set up before
         provider: Option<String>,
@@ -191,8 +191,8 @@ async fn launch(
             offer
         }
     };
-    set_up_for_launch(credentials, cli, &offer).await?;
-    warn(credentials, &offer.id, cli)?;
+    set_up_for_launch(credentials, &offer).await?;
+    warn(credentials, cli)?;
     let launched = ags::launch(store, credentials, cli, &offer, args, program).await?;
     if let Some(error) = launched.logged_out {
         eprintln!("ags: {error:#}");
@@ -231,10 +231,7 @@ async fn launch_pi(
         }
     }
     if let Some(offer) = &plan.requested {
-        set_up_for_launch(credentials, Cli::Pi, offer).await?;
-    }
-    for notice in credentials.pi_notices()? {
-        eprintln!("ags: {notice}");
+        set_up_for_launch(credentials, offer).await?;
     }
     let launched = ags::launch_pi(store, credentials, &plan, args, program).await?;
     if let Some(error) = launched.logged_out {
@@ -253,7 +250,7 @@ async fn launch_from_shim(
 ) -> anyhow::Result<Exit> {
     let real = shims::program(store, cli)?;
     if bypassed() {
-        return run_real(&real, args, &without_aegis(credentials, cli));
+        return run_real(&real, args, &without_aegis(cli));
     }
     let chain = shims::chain();
     shims::check_depth(&chain, cli)?;
@@ -283,7 +280,7 @@ async fn launch_from_shim(
         };
         if !interactive() {
             eprintln!("ags: opening {cli} without Aegis: {error:#}");
-            return run_real(&real, args, &without_aegis(credentials, cli));
+            return run_real(&real, args, &without_aegis(cli));
         }
         eprintln!("ags: {error:#}");
         if !fixed {
@@ -296,7 +293,7 @@ async fn launch_from_shim(
             }
         }
         if confirm(&format!("Open {cli} without Aegis?"))? {
-            return run_real(&real, args, &without_aegis(credentials, cli));
+            return run_real(&real, args, &without_aegis(cli));
         }
         return Ok(Exit::Code(ExitCode::FAILURE));
     }
@@ -307,8 +304,8 @@ fn bypassed() -> bool {
 }
 
 /// What `cli` run without Aegis changes in the environment ags has.
-fn without_aegis(credentials: &Credentials, cli: Cli) -> EnvChanges {
-    let mut changes = credentials.outside_launch();
+fn without_aegis(cli: Cli) -> EnvChanges {
+    let mut changes = ags::outside_launch();
     changes.remove(shims::BYPASS);
     changes.set(shims::LAUNCHED, shims::entered(&shims::chain(), cli));
     changes
@@ -410,14 +407,12 @@ impl Drop for PromptsOnStderr {
     }
 }
 
-/// Offers to set up what `cli` needs to run on `offer`, which the launch can't go without.
-async fn set_up_for_launch(
-    credentials: &Credentials,
-    cli: Cli,
-    offer: &Offer,
-) -> anyhow::Result<()> {
-    if let Some(need) = Need::of_launch(cli, &offer.provider_type)
-        && !credentials.has(&offer.id, &offer.provider_type, need)?
+/// Offers to set up what a launch on `offer` can't go without.
+async fn set_up_for_launch(credentials: &Credentials, offer: &Offer) -> anyhow::Result<()> {
+    if let Some(need) = Need::of_launch(&offer.provider_type)
+        && !credentials
+            .has(&offer.id, &offer.provider_type, need)
+            .await?
     {
         let id = &offer.id;
         if !interactive() {
@@ -438,9 +433,9 @@ async fn set_up_for_launch(
     Ok(())
 }
 
-/// Tells the user, once, about settings that keep `provider` from using its own sign-in in `cli`.
-fn warn(credentials: &Credentials, provider: &str, cli: Cli) -> anyhow::Result<()> {
-    for notice in credentials.notices(provider, cli)? {
+/// Tells the user, once, about their own settings of `cli` that change what a launch uses.
+fn warn(credentials: &Credentials, cli: Cli) -> anyhow::Result<()> {
+    for notice in credentials.notices(cli)? {
         eprintln!("ags: {notice}");
     }
     Ok(())
@@ -468,9 +463,9 @@ async fn setup(
     let (mut todo, mut absent, mut skipped) = (vec![], vec![], vec![]);
     for step in steps {
         match step.status {
-            StepStatus::Done if !redo || !has_cli(store, &step) => {}
+            StepStatus::Done if !redo || !has_cli(credentials, &step) => {}
             StepStatus::Skipped if !redo => skipped.push(step),
-            _ if !has_cli(store, &step) => absent.push(step),
+            _ if !has_cli(credentials, &step) => absent.push(step),
             _ => todo.push(step),
         }
     }
@@ -488,14 +483,13 @@ async fn setup(
             println!("{} ({}): {}", step.provider, step.provider_type, step.need);
             let name = product(cli);
             if !confirm(&format!(
-                "{name} is not installed. Sign in to it for {} once it is?",
-                step.provider
+                "{name} is not installed. Sign in to it once it is?"
             ))? {
-                credentials.skip(&step.provider, step.need)?;
+                credentials.skip(&step.provider, &step.provider_type, step.need)?;
                 skipped.push(step.clone());
                 continue;
             }
-            credentials.unskip(&step.provider, step.need)?;
+            credentials.unskip(&step.provider, &step.provider_type, step.need)?;
         }
         waiting.push(step.clone());
     }
@@ -556,9 +550,9 @@ async fn setup(
 }
 
 /// Whether the CLI a step signs in to is installed; other steps need no CLI.
-fn has_cli(store: &Store, step: &Step) -> bool {
+fn has_cli(credentials: &Credentials, step: &Step) -> bool {
     match step.need {
-        Need::SignIn(cli) => ags::installed(store, cli),
+        Need::SignIn(cli) => credentials.installed(cli),
         _ => true,
     }
 }
@@ -578,16 +572,20 @@ async fn set_up(credentials: &Credentials, step: &Step) -> anyhow::Result<Outcom
     let answered = match need {
         Need::SignIn(cli) => {
             let name = product(cli);
-            if !confirm(&format!("Sign in to {name} for {id} now?"))? {
+            let question = match step.status {
+                StepStatus::Done => format!("{name} is signed in. Sign in again?"),
+                _ => format!("Sign in to {name} now?"),
+            };
+            if !confirm(&question)? {
                 None
             } else {
-                warn(credentials, id, cli)?;
-                credentials.sign_in(id, provider_type, cli, None).await?;
-                if !credentials.has(id, provider_type, need)? {
-                    eprintln!("ags: {id} is not signed in to {name}");
+                warn(credentials, cli)?;
+                credentials.sign_in(provider_type, cli).await?;
+                if !credentials.has(id, provider_type, need).await? {
+                    eprintln!("ags: {name} is not signed in");
                     return Ok(Outcome::Failed);
                 }
-                Some(format!("{id} is signed in to {name}."))
+                Some(format!("{name} is signed in."))
             }
         }
         Need::BedrockKey => {
@@ -611,13 +609,13 @@ async fn set_up(credentials: &Credentials, step: &Step) -> anyhow::Result<Outcom
     };
     match answered {
         Some(done) => {
-            credentials.unskip(id, need)?;
+            credentials.unskip(id, provider_type, need)?;
             println!("{done}");
             Ok(Outcome::Done)
         }
         None if step.status == StepStatus::Done => Ok(Outcome::Kept),
         None => {
-            credentials.skip(id, need)?;
+            credentials.skip(id, provider_type, need)?;
             Ok(Outcome::Skipped)
         }
     }
@@ -874,9 +872,9 @@ async fn login(
     } else if ags::setup_steps(store, credentials, None)
         .await?
         .iter()
-        .any(|step| step.status == StepStatus::Missing && has_cli(store, step))
+        .any(|step| step.status == StepStatus::Missing && has_cli(credentials, step))
     {
-        println!("Run `ags setup` in a terminal to sign in to each provider.");
+        println!("Run `ags setup` in a terminal to finish setting up.");
     }
     shim_hint(store);
     Ok(())

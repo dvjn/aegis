@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aegis_wire::provider_type::{BEDROCK, VERTEX};
+use aegis_wire::provider_type::BEDROCK;
 use anyhow::{Result, bail};
 use serde::Serialize;
 
@@ -52,9 +52,10 @@ struct PiRoute {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Reach {
-    /// The file of the provider's credential.
-    credential: PathBuf,
-    /// The credential is a pi sign-in, kept under the name of pi's own provider.
+    /// The file of a cloud provider's credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<PathBuf>,
+    /// The credential is the user's own pi sign-in to pi's own provider.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sign_in: bool,
     /// The credential file holds the API key itself.
@@ -244,15 +245,27 @@ fn reach(
 ) -> Result<(String, Reach), String> {
     let (id, provider_type) = (offer.id.as_str(), offer.provider_type.as_str());
     let failed = |error: anyhow::Error| format!("{error:#}");
-    let credential = credentials
-        .pi_credential(id, provider_type)
-        .map_err(failed)?;
-    let need = Need::of_launch(Cli::Pi, provider_type)
-        .ok_or_else(|| format!("pi can't run on {id}, a {provider_type} provider"))?;
+    let base = format!("/{id}{}", Cli::Pi.base_path(provider_type));
+    let Some(need) = Need::of_launch(provider_type) else {
+        let builtin = pi_provider(provider_type)
+            .filter(|_| Cli::Pi.runs_on(provider_type))
+            .ok_or_else(|| format!("pi can't run on {id}, a {provider_type} provider"))?;
+        let reach = Reach {
+            credential: None,
+            sign_in: true,
+            key: false,
+            env: BTreeMap::new(),
+            missing: format!("ags: pi is not signed in to {builtin}; run `ags setup {id}`"),
+            again: format!(
+                "ags: {id} uses pi's own sign-in to {builtin}; run `ags setup {id}` to sign in again"
+            ),
+        };
+        return Ok((base, reach));
+    };
+    let credential = credentials.cloud_file(id, provider_type).map_err(failed)?;
     let missing = format!("ags: {id} has no {need}; run `ags setup {id}`");
     let again =
         format!("ags: {id} has its {need} from ags; run `ags setup {id}` to set it up again");
-    let base = format!("/{id}{}", Cli::Pi.base_path(provider_type));
     let mut upstream = Upstream {
         id,
         provider_type,
@@ -263,7 +276,7 @@ fn reach(
         BEDROCK => {
             let region = aws_region(Cli::Pi, upstream, inherited).map_err(failed)?;
             let reach = Reach {
-                credential,
+                credential: Some(credential),
                 sign_in: false,
                 key: true,
                 env: BTreeMap::from([("AWS_REGION", region)]),
@@ -272,7 +285,7 @@ fn reach(
             };
             (base, reach)
         }
-        VERTEX => {
+        _ => {
             let project = credentials.vertex_project(id).map_err(failed)?;
             upstream.project = Some(&project);
             let (project, location) =
@@ -292,21 +305,10 @@ fn reach(
             // pi leaves the project and location out of its paths once its base URL moves.
             let base = format!("{base}/v1/projects/{project}/locations/{location}");
             let reach = Reach {
-                credential,
+                credential: Some(credential),
                 sign_in: false,
                 key: false,
                 env,
-                missing,
-                again,
-            };
-            (base, reach)
-        }
-        _ => {
-            let reach = Reach {
-                credential,
-                sign_in: true,
-                key: false,
-                env: BTreeMap::new(),
                 missing,
                 again,
             };
@@ -317,7 +319,7 @@ fn reach(
 
 #[cfg(test)]
 mod tests {
-    use aegis_wire::provider_type::{CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION};
+    use aegis_wire::provider_type::{CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, VERTEX};
     use serde_json::{Value, json};
 
     use super::*;
@@ -496,10 +498,9 @@ mod tests {
                 "provider": "work",
                 "builtin": "anthropic",
                 "baseUrl": "http://127.0.0.1:4000/work",
-                "credential": fixture.provider("work").join("pi/auth.json"),
                 "signIn": true,
-                "missing": "ags: work has no pi sign-in; run `ags setup work`",
-                "again": "ags: work has its pi sign-in from ags; run `ags setup work` to set it up again",
+                "missing": "ags: pi is not signed in to anthropic; run `ags setup work`",
+                "again": "ags: work uses pi's own sign-in to anthropic; run `ags setup work` to sign in again",
             })
         );
         assert_eq!(routes["work"]["baseUrl"], routes["anthropic"]["baseUrl"]);

@@ -49,32 +49,30 @@ export default async function (pi) {
       models,
       api: { stream: failing(message), streamSimple: failing(message) },
     });
-  const signIns = new Map();
-  // A sign-in stays in its provider's own file, where pi refreshes it under pi's own lock.
-  const signIn = (path) => {
-    if (!signIns.has(path)) {
+  let userAuth;
+  // The user's own pi sign-ins, which pi refreshes in place under its own lock.
+  const ownSignIns = () => {
+    if (!userAuth) {
       const created = ModelRuntime.create({
-        authPath: path,
+        authPath: join(getAgentDir(), "auth.json"),
         modelsPath: null,
         allowModelNetwork: false,
         refreshOnCreate: false,
       });
-      signIns.set(path, created);
+      userAuth = created;
       created.catch(() => {
-        if (signIns.get(path) === created) signIns.delete(path);
+        if (userAuth === created) userAuth = undefined;
       });
     }
-    return signIns.get(path);
+    return userAuth;
   };
-  const ready = (route) =>
-    route.signIn ? readJson(route.credential)?.[route.builtin] !== undefined : existsSync(route.credential);
   const resolve = async (route) => {
-    if (!ready(route)) throw new Error(route.missing);
     if (route.signIn) {
-      const resolution = await (await signIn(route.credential)).getAuth(route.builtin);
+      const resolution = await (await ownSignIns()).getAuth(route.builtin);
       if (!resolution?.auth.apiKey) throw new Error(route.missing);
       return { auth: { apiKey: resolution.auth.apiKey, headers }, source: "ags" };
     }
+    if (!existsSync(route.credential)) throw new Error(route.missing);
     const apiKey = route.key ? readFileSync(route.credential, "utf8").trim() : undefined;
     return { auth: { apiKey, headers }, env: route.env, source: "ags" };
   };
@@ -84,7 +82,8 @@ export default async function (pi) {
     if (!base) continue;
     const name =
       route.provider === undefined ? base.name : route.id === route.provider ? route.id : `${base.name} (${route.provider})`;
-    const pinned = (model) => ({ ...model, provider: route.id, baseUrl: route.baseUrl });
+    // The secret rides on each model too, since pi resolves a sign-in it holds itself without the provider.
+    const pinned = (model) => ({ ...model, provider: route.id, baseUrl: route.baseUrl, headers: { ...model.headers, ...headers } });
     // pi lists models from filterModels but finds a named one without it, so a built-in name
     // lists nothing yet still serves a default model, `--model` or a saved session.
     const unlisted =
@@ -99,10 +98,12 @@ export default async function (pi) {
       name,
       baseUrl: route.baseUrl,
       auth: {
+        // pi keeps the user's own sign-in under its provider's ID, which only pi's own sign-in reads.
+        ...(route.signIn && route.id === route.builtin && base.auth?.oauth ? { oauth: base.auth.oauth } : {}),
         apiKey: {
           name: "Aegis",
           login: async () => {
-            throw new Error(ready(route) ? route.again : route.missing);
+            throw new Error(route.signIn || existsSync(route.credential) ? route.again : route.missing);
           },
           check: async () => ({ type: "api_key", source: "ags" }),
           resolve: () => resolve(route),
