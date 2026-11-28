@@ -194,7 +194,7 @@ pub fn check_depth(chain: &[Entered], cli: Cli) -> Result<()> {
 }
 
 /// Whether process `pid` is still running.
-fn running(pid: u32) -> bool {
+pub(crate) fn running(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
@@ -329,7 +329,12 @@ fn find(cli: Cli, shims: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
 
 /// The real `cli` on this process's `PATH`, which is how ags finds every CLI it runs.
 pub fn program(store: &Store, cli: Cli) -> Result<PathBuf> {
-    find(cli, &dir(store), std::env::var_os("PATH").as_deref())
+    program_on(store, cli, std::env::var_os("PATH").as_deref())
+}
+
+/// The real `cli` on `path`, a value of `PATH`.
+pub(crate) fn program_on(store: &Store, cli: Cli, path: Option<&OsStr>) -> Result<PathBuf> {
+    find(cli, &dir(store), path)
         .ok_or_else(|| anyhow!("could not find {cli}; install it or add it to PATH"))
 }
 

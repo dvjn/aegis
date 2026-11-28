@@ -68,8 +68,15 @@ async fn a_launched_cli_reaches_its_provider_only_through_its_own_proxy() {
     let dir = std::env::temp_dir().join(format!("ags-launch-{}", uuid::Uuid::new_v4()));
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    let clis = dir.join("clis");
+    std::fs::create_dir_all(&clis).unwrap();
+    stub(
+        &clis,
+        "claude",
+        r#"case "$*" in *'auth status --json') [ -e "$out/signed-in" ] && echo '{"loggedIn":true,"authMethod":"claude.ai"}' ;; esac"#,
+    );
     let store = Store::at(dir.join("ags"));
-    let credentials = Credentials::new(&store, Home::at(&dir.join("home")));
+    let credentials = Credentials::new(&store, Home::at(&dir.join("home")).with_path(&clis));
     let mut approval = None;
     ags::login(&store, &base, |request| {
         approval = Some(tokio::spawn(approve(
@@ -141,25 +148,19 @@ async fn a_launched_cli_reaches_its_provider_only_through_its_own_proxy() {
             step("codex", "codex_subscription", Need::SignIn(Cli::Pi)),
         ]
     );
-    let claude_dir = credentials.cli_dir("claude", Cli::Claude).unwrap();
-    std::fs::create_dir_all(&claude_dir).unwrap();
-    std::fs::write(
-        claude_dir.join(".credentials.json"),
-        r#"{"claudeAiOauth":{}}"#,
-    )
-    .unwrap();
-    credentials.skip("claude", Need::SignIn(Cli::Pi)).unwrap();
+    // Claude Code says it is signed in, in the user's own dir.
+    std::fs::write(clis.join("signed-in"), "").unwrap();
+    credentials
+        .skip("claude", "claude_subscription", Need::SignIn(Cli::Pi))
+        .unwrap();
     let steps = ags::setup_steps(&store, &credentials, Some("claude"))
         .await
         .unwrap();
     let statuses: Vec<_> = steps.iter().map(|step| step.status).collect();
-    let signed_in = if cfg!(target_os = "macos") {
-        StepStatus::Missing
-    } else {
-        StepStatus::Done
-    };
-    assert_eq!(statuses, [signed_in, StepStatus::Skipped]);
-    credentials.unskip("claude", Need::SignIn(Cli::Pi)).unwrap();
+    assert_eq!(statuses, [StepStatus::Done, StepStatus::Skipped]);
+    credentials
+        .unskip("claude", "claude_subscription", Need::SignIn(Cli::Pi))
+        .unwrap();
     let steps = ags::setup_steps(&store, &credentials, Some("claude"))
         .await
         .unwrap();
@@ -176,7 +177,8 @@ async fn a_launched_cli_reaches_its_provider_only_through_its_own_proxy() {
         "claude",
         r#"printf '%s\n' "$@" > "$out/args"
 printf '%s' "$ANTHROPIC_BASE_URL" > "$out/base"
-printf '%s' "$CLAUDE_CONFIG_DIR" > "$out/config"
+printf '%s' "${CLAUDE_CONFIG_DIR-}${CODEX_HOME-}${PI_CODING_AGENT_DIR-}" > "$out/config"
+if [ "$1" = --settings ]; then cp "$2" "$out/settings"; fi
 secret="$(printf '%s\n' "$ANTHROPIC_CUSTOM_HEADERS" | grep '^x-ags-launch-secret: ')"
 printf '%s' "$secret" > "$out/secret"
 call -X POST "$ANTHROPIC_BASE_URL/v1/messages" -H 'content-type: application/json' \
@@ -206,9 +208,25 @@ exit 7"#,
         "the CLI's exit code comes back"
     );
     assert!(launched.logged_out.is_none());
-    assert_eq!(read(&bin, "args"), format!("{}\n", args.join("\n")));
-    assert_eq!(read(&bin, "config"), claude_dir.to_str().unwrap());
+    let given = read(&bin, "args");
+    let given: Vec<&str> = given.lines().collect();
+    assert_eq!(given[0], "--settings", "{given:?}");
+    let settings = Path::new(given[1]);
+    assert!(settings.starts_with(store.dir()), "{}", settings.display());
+    assert!(!settings.exists(), "the launch's settings go with it");
+    assert_eq!(given[2..], args);
+    // The dirs the CLI gets are whatever this process has, which ags passes on as they are.
+    let own_dirs: String = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"]
+        .map(|name| std::env::var(name).unwrap_or_default())
+        .concat();
+    assert_eq!(
+        read(&bin, "config"),
+        own_dirs,
+        "Claude Code runs in the user's own dir"
+    );
     let proxy = read(&bin, "base");
+    let settings: serde_json::Value = serde_json::from_str(&read(&bin, "settings")).unwrap();
+    assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], proxy.as_str());
     assert!(proxy.starts_with("http://127.0.0.1:"), "{proxy}");
     assert!(!proxy.contains(&token));
     let secret = read(&bin, "secret");
@@ -247,7 +265,7 @@ exit 7"#,
         &bin,
         "pi",
         r#"printf '%s\n' "$@" > "$out/pi-args"
-printf '%s' "$PI_CODING_AGENT_DIR" > "$out/pi-config"
+printf '%s' "${CLAUDE_CONFIG_DIR-}${CODEX_HOME-}${PI_CODING_AGENT_DIR-}" > "$out/pi-config"
 base_url() { printf '%s' "$AGS_PI_ROUTES" | grep -o "\"id\":\"$1\"[^}]*" | sed 's/.*"baseUrl":"\([^"]*\)".*/\1/'; }
 codex="$(base_url openai-codex)"
 printf '%s' "$codex" > "$out/pi-codex"
@@ -286,7 +304,8 @@ kill -TERM $$"#,
     );
     assert_eq!(
         read(&bin, "pi-config"),
-        store.dir().join("pi").to_str().unwrap()
+        own_dirs,
+        "pi runs in the user's own dir"
     );
     assert_eq!(read(&bin, "pi-status"), "200");
     assert_eq!(read(&bin, "pi-ungranted"), "403");

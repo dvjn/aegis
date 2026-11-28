@@ -16,7 +16,7 @@ use aegis_wire::{Machine, TokenResponse};
 use anyhow::{Result, bail};
 pub use clis::Cli;
 pub use credentials::{
-    Credentials, EnvChanges, Home, Need, Step, StepStatus, installed, product, setup_steps,
+    Credentials, EnvChanges, Home, Need, Step, StepStatus, outside_launch, product, setup_steps,
 };
 pub use launch::{
     CliDefault, Launched, NoProvider, NotLoggedIn, Offer, PiPlan, Pick, Started, TypeDefault,

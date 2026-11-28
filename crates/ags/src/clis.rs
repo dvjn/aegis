@@ -9,10 +9,15 @@ use std::{
 };
 
 use aegis_wire::provider_type::{BEDROCK, CLAUDE_SUBSCRIPTION, CODEX_SUBSCRIPTION, VERTEX};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::ValueEnum;
+use serde_json::{Map, Value};
 
-use crate::{credentials::on_path, proxy::SECRET_HEADER, store::create_private_dir};
+use crate::{
+    credentials::{launch_unset, on_path},
+    proxy::SECRET_HEADER,
+    store::create_private_dir,
+};
 
 /// Carries the proxy's secret to the CLI.
 pub(crate) const SECRET_ENV: &str = "AGS_LAUNCH_SECRET";
@@ -164,9 +169,10 @@ impl Cli {
                     }
                     _ => setup.env.push(("ANTHROPIC_BASE_URL", base_url.to_owned())),
                 }
-                setup
-                    .env
-                    .push(("ANTHROPIC_CUSTOM_HEADERS", headers.join("\n")));
+                setup.env.extend([
+                    ("ANTHROPIC_CUSTOM_HEADERS", headers.join("\n")),
+                    (SECRET_ENV, secret.to_owned()),
+                ]);
             }
             Self::Codex => {
                 let (base_url, auth) = match provider_type {
@@ -287,6 +293,85 @@ pub(crate) fn vertex_location<'a>(
         bail!("{variable} is not a Google Cloud location: {location:?}");
     }
     Ok((project, location))
+}
+
+/// The JSON object of a Claude Code settings file.
+pub(crate) type ClaudeSettings = Map<String, Value>;
+
+/// Claude Code's `--settings` for a launch on a provider of `provider_type`, which outrank the
+/// user's own settings files: the user's own `--settings`, if any, under an env block of the
+/// launch's `env` and the provider's `cloud` credential, with what would replace them blanked.
+pub(crate) fn claude_settings(
+    provider_type: &str,
+    env: &[(&'static str, String)],
+    cloud: &[(&'static str, OsString)],
+    theirs: Option<ClaudeSettings>,
+) -> Result<Vec<u8>> {
+    let mut settings = theirs.unwrap_or_default();
+    let mut block = match settings.remove("env") {
+        Some(Value::Object(block)) => block,
+        _ => Map::new(),
+    };
+    for name in launch_unset(Cli::Claude, provider_type) {
+        block.insert(name.to_owned(), "".into());
+    }
+    for (name, value) in env {
+        block.insert((*name).to_owned(), value.as_str().into());
+    }
+    for (name, value) in cloud {
+        let Some(value) = value.to_str() else {
+            bail!("{name} is not text Claude Code can be given");
+        };
+        block.insert((*name).to_owned(), value.into());
+    }
+    settings.insert("env".to_owned(), Value::Object(block));
+    Ok(serde_json::to_vec_pretty(&settings)?)
+}
+
+/// Takes the user's own `--settings` out of Claude Code's `args`, read from a file or inline JSON.
+/// Claude Code keeps only the last one given.
+pub(crate) fn their_settings(
+    args: Vec<OsString>,
+) -> Result<(Option<ClaudeSettings>, Vec<OsString>)> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut given = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            kept.push(arg);
+            kept.extend(args.by_ref());
+            break;
+        }
+        let value = match arg.to_str() {
+            Some("--settings") => match args.next() {
+                Some(value) => value,
+                None => bail!("--settings needs a file or JSON"),
+            },
+            Some(text) if text.starts_with("--settings=") => {
+                OsString::from(&text["--settings=".len()..])
+            }
+            _ => {
+                kept.push(arg);
+                continue;
+            }
+        };
+        given = Some(value);
+    }
+    let Some(given) = given else {
+        return Ok((None, kept));
+    };
+    let given = given.to_string_lossy().into_owned();
+    // Inline settings may hold secrets, so only a file is named.
+    let (text, shown) = if given.trim_start().starts_with('{') {
+        (given, "inline JSON".to_owned())
+    } else {
+        let text = std::fs::read_to_string(&given)
+            .map_err(|error| anyhow!("can't read your --settings {given}: {error}"))?;
+        (text, given)
+    };
+    let settings = serde_json::from_str(&text)
+        .map_err(|error| anyhow!("your --settings {shown} is not a JSON object: {error}"))?;
+    Ok((Some(settings), kept))
 }
 
 fn ignored(id: &str, location: &str, variable: &str, value: &str) -> String {
@@ -442,6 +527,7 @@ mod tests {
                     "ANTHROPIC_CUSTOM_HEADERS",
                     format!("{SECRET_HEADER}: {SECRET}")
                 ),
+                (SECRET_ENV, SECRET.to_owned()),
             ]
         );
         let theirs = Cli::Claude
@@ -489,6 +575,7 @@ mod tests {
                     "ANTHROPIC_CUSTOM_HEADERS",
                     format!("{SECRET_HEADER}: {SECRET}")
                 ),
+                (SECRET_ENV, SECRET.to_owned()),
             ]
         );
 
@@ -596,6 +683,100 @@ mod tests {
             odd.to_string().starts_with("CLOUD_ML_REGION is not"),
             "{odd}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_codes_launch_settings_carry_the_route_and_blank_whatever_would_replace_it() {
+        let dir = crate::store::tests::scratch();
+        let bedrock = setup(Cli::Claude, BEDROCK, &dir);
+        let theirs = serde_json::json!({
+            "model": "opus",
+            "env": {
+                "EDITOR": "vi",
+                "CLAUDE_CODE_USE_BEDROCK": "0",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example",
+                "AWS_BEARER_TOKEN_BEDROCK": "theirs",
+            },
+        });
+        let settings = claude_settings(
+            BEDROCK,
+            &bedrock.env,
+            &[("AWS_BEARER_TOKEN_BEDROCK", OsString::from("ABSKkey"))],
+            theirs.as_object().cloned(),
+        )
+        .unwrap();
+        let settings: Value = serde_json::from_slice(&settings).unwrap();
+        assert_eq!(settings["model"], "opus", "the user's own settings stay");
+        let env = settings["env"].as_object().unwrap();
+        assert_eq!(env["EDITOR"], "vi");
+        for (name, value) in &bedrock.env {
+            assert_eq!(env[*name], value.as_str(), "{name}");
+        }
+        assert_eq!(env["AWS_BEARER_TOKEN_BEDROCK"], "ABSKkey");
+        for name in [
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_GATEWAY",
+            "ANTHROPIC_UNIX_SOCKET",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_PROFILE",
+        ] {
+            assert_eq!(env[name], "", "{name} is blank");
+        }
+        let subscription = setup(Cli::Claude, CLAUDE_SUBSCRIPTION, &dir);
+        let settings = claude_settings(CLAUDE_SUBSCRIPTION, &subscription.env, &[], None).unwrap();
+        let settings: Value = serde_json::from_slice(&settings).unwrap();
+        assert_eq!(settings.as_object().unwrap().len(), 1, "only an env block");
+        assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], BASE_URL);
+        assert_eq!(settings["env"]["AWS_BEARER_TOKEN_BEDROCK"], "");
+        assert!(settings["env"].get("AWS_PROFILE").is_none());
+        for name in crate::credentials::tests::CONFIG_DIRS {
+            assert!(settings["env"].get(name).is_none());
+            assert!(bedrock.env.iter().all(|(set, _)| *set != name));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_users_own_settings_are_taken_out_of_claude_codes_arguments() {
+        let dir = crate::store::tests::scratch();
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let file = dir.join("mine.json");
+        std::fs::write(&file, r#"{"model":"from-file"}"#).unwrap();
+        let file = file.to_str().unwrap();
+        let (theirs, kept) = their_settings(args(&[
+            "--settings",
+            r#"{"model":"inline"}"#,
+            "-p",
+            &format!("--settings={file}"),
+            "--",
+            "--settings",
+            "x",
+        ]))
+        .unwrap();
+        assert_eq!(theirs.unwrap()["model"], "from-file", "the last one counts");
+        assert_eq!(kept, args(&["-p", "--", "--settings", "x"]));
+        let (none, kept) = their_settings(args(&["--resume"])).unwrap();
+        assert!(none.is_none());
+        assert_eq!(kept, args(&["--resume"]));
+        for (given, refusal) in [
+            (
+                "{not json",
+                "your --settings inline JSON is not a JSON object",
+            ),
+            ("[1]", "can't read your --settings [1]"),
+            (
+                "/nowhere/s.json",
+                "can't read your --settings /nowhere/s.json",
+            ),
+        ] {
+            let error = their_settings(args(&["--settings", given])).unwrap_err();
+            assert!(error.to_string().starts_with(refusal), "{error}");
+        }
+        assert!(their_settings(args(&["--settings"])).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

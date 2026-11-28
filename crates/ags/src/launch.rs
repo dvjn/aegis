@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
+    path::{Path, PathBuf},
     process::ExitStatus,
 };
 
@@ -14,13 +15,15 @@ use clap::ValueEnum;
 
 use crate::{
     Cli, Credentials, LoggedOut, Login, Store,
-    clis::{Upstream, stray_model_regions},
+    clis::{Setup, Upstream, claude_settings, stray_model_regions, their_settings},
+    credentials::launch_unset,
     current_login,
     defaults::{self, Remembered},
     forget, pi,
     proxy::{Proxy, Route},
     server::Server,
     shims::{self, Entered},
+    store::write_private,
 };
 
 /// A provider granted to this machine that a CLI can run on.
@@ -410,7 +413,7 @@ pub struct Launched {
     pub logged_out: Option<anyhow::Error>,
 }
 
-/// Runs `cli` with `args` on `offer`, in the provider's own config dir, until it exits.
+/// Runs `cli` with `args` on `offer`, in the user's own config dir, until it exits.
 /// `program` replaces the real CLI on `PATH`.
 pub async fn launch(
     store: &Store,
@@ -425,7 +428,6 @@ pub async fn launch(
     let login = current_login(store).await?.ok_or_else(not_logged_in)?;
     let server = login.server.clone();
     let program = resolve(store, cli, program)?;
-    let isolation = credentials.isolate(&offer.id, &offer.provider_type, cli)?;
     // A random UUID carries nothing about the launch, such as when it started.
     let launch_id = uuid::Uuid::new_v4().to_string();
     let base_path = cli.base_path(&offer.provider_type);
@@ -448,21 +450,18 @@ pub async fn launch(
         store.dir(),
         |name| std::env::var(name).ok(),
     )?;
-    let setup_notes = setup.notes;
+    let cloud = credentials.cloud_env(&offer.id, &offer.provider_type)?;
     let mut command = Command::new(&program);
-    outside(&mut command, credentials, &chain, cli);
-    command
-        .args(isolation.args)
-        .args(setup.args)
-        .args(args)
-        .envs(isolation.env)
-        .envs(credentials.cloud_env(&offer.id, &offer.provider_type)?)
-        .envs(setup.env)
-        .envs(no_proxy(|name| std::env::var(name).ok()))
-        .kill_on_drop(true);
-    for name in &isolation.unset {
-        command.env_remove(name);
-    }
+    outside(&mut command, &chain, cli);
+    let launching = Launching {
+        cli,
+        provider_type: &offer.provider_type,
+        setup: &setup,
+        cloud,
+        settings_dir: store.dir(),
+        launch_id: &launch_id,
+    };
+    let _settings = configure(&mut command, launching, args)?;
     if cli == Cli::Claude
         && offer.provider_type == VERTEX
         && let Some(location) = &offer.region
@@ -472,15 +471,114 @@ pub async fn launch(
             eprintln!("ags: {note}");
         }
     }
-    for note in &setup_notes {
+    for note in &setup.notes {
         eprintln!("ags: {note}");
     }
     run(store, &server, command, &program, proxy).await
 }
 
+/// What one launch adds to its CLI's command.
+struct Launching<'a> {
+    cli: Cli,
+    provider_type: &'a str,
+    setup: &'a Setup,
+    /// The provider's cloud credential, as the variables its SDK reads.
+    cloud: Vec<(&'static str, OsString)>,
+    /// Where Claude Code's settings file for the launch goes.
+    settings_dir: &'a Path,
+    launch_id: &'a str,
+}
+
+/// Adds the launch's routes and cloud credential before the user's `args`. Claude Code gets both
+/// in a settings file, merged with the user's own `--settings`, which lasts while the result lives.
+fn configure(
+    command: &mut Command,
+    launching: Launching<'_>,
+    args: Vec<OsString>,
+) -> Result<Option<Settings>> {
+    let Launching {
+        cli,
+        provider_type,
+        setup,
+        cloud,
+        settings_dir,
+        launch_id,
+    } = launching;
+    let (settings, args) = match cli {
+        Cli::Claude => {
+            let (theirs, args) = their_settings(args)?;
+            let bytes = claude_settings(provider_type, &setup.env, &cloud, theirs)?;
+            let settings = Settings::write(settings_dir, launch_id, &bytes)?;
+            command.arg("--settings").arg(&settings.0);
+            (Some(settings), args)
+        }
+        _ => {
+            command.envs(cloud);
+            (None, args)
+        }
+    };
+    command
+        .args(&setup.args)
+        .args(args)
+        .envs(setup.env.iter().map(|(name, value)| (*name, value)));
+    seal(command, cli, &[provider_type]);
+    Ok(settings)
+}
+
+/// Lets the CLI reach the proxy directly, ends it with ags, and drops what would take the place
+/// of the providers of `provider_types`.
+fn seal(command: &mut Command, cli: Cli, provider_types: &[&str]) {
+    command
+        .envs(no_proxy(|name| std::env::var(name).ok()))
+        .kill_on_drop(true);
+    for provider_type in provider_types {
+        for name in launch_unset(cli, provider_type) {
+            command.env_remove(name);
+        }
+    }
+}
+
+const SETTINGS_PREFIX: &str = "claude-settings-";
+
+/// Claude Code's settings for one launch, a private file of ags's that goes when the launch ends.
+/// Its name carries the pid of the ags that wrote it.
+struct Settings(PathBuf);
+
+impl Settings {
+    fn write(dir: &Path, launch_id: &str, bytes: &[u8]) -> Result<Self> {
+        sweep_settings(dir);
+        let name = format!("{SETTINGS_PREFIX}{}-{launch_id}.json", std::process::id());
+        write_private(dir, &name, bytes).map(Self)
+    }
+}
+
+impl Drop for Settings {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Removes the settings files of launches whose ags is gone, as after it was killed.
+fn sweep_settings(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(SETTINGS_PREFIX))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        if pid.is_some_and(|pid| !shims::running(pid)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Starts `command` free of any launch this one runs inside, as a launch of `cli` in `chain`.
-fn outside(command: &mut Command, credentials: &Credentials, chain: &[Entered], cli: Cli) {
-    credentials.outside_launch().apply(command.as_std_mut());
+fn outside(command: &mut Command, chain: &[Entered], cli: Cli) {
+    crate::credentials::outside_launch().apply(command.as_std_mut());
     command.env(shims::LAUNCHED, shims::entered(chain, cli));
 }
 
@@ -491,7 +589,7 @@ fn resolve(store: &Store, cli: Cli, program: Option<&OsStr>) -> Result<OsString>
     }
 }
 
-/// Runs pi with `args` on the providers of `plan`, in the dir of pi launches, until it exits.
+/// Runs pi with `args` on the providers of `plan`, in the user's own pi dir, until it exits.
 /// `program` replaces the real pi on `PATH`.
 pub async fn launch_pi(
     store: &Store,
@@ -505,23 +603,14 @@ pub async fn launch_pi(
     let login = current_login(store).await?.ok_or_else(not_logged_in)?;
     let server = login.server.clone();
     let program = resolve(store, Cli::Pi, program)?;
-    let isolation = credentials.isolate_pi()?;
     let (pi, routes) = pi::Launch::new(plan, credentials, |name| std::env::var(name).ok())?;
     let launch_id = uuid::Uuid::new_v4().to_string();
     let proxy = Proxy::start(store.dir(), login, routes, &launch_id).await?;
     let setup = pi.setup(proxy.origin(), proxy.secret(), store.dir())?;
     let mut command = Command::new(&program);
-    outside(&mut command, credentials, &chain, Cli::Pi);
-    command
-        .args(setup.args)
-        .args(args)
-        .envs(isolation.env)
-        .envs(setup.env)
-        .envs(no_proxy(|name| std::env::var(name).ok()))
-        .kill_on_drop(true);
-    for name in &isolation.unset {
-        command.env_remove(name);
-    }
+    outside(&mut command, &chain, Cli::Pi);
+    command.args(setup.args).args(args).envs(setup.env);
+    seal(&mut command, Cli::Pi, Cli::Pi.provider_types());
     for note in &setup.notes {
         eprintln!("ags: {note}");
     }
@@ -813,6 +902,131 @@ mod tests {
                 (VERTEX.to_owned(), "gcp".to_owned()),
             ]))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_launch_leaves_the_users_own_dirs_and_gives_claude_code_its_cloud_key_in_settings() {
+        use aegis_wire::provider_type::BEDROCK;
+        let dir = crate::store::tests::scratch();
+        let upstream = Upstream {
+            id: "aws",
+            provider_type: BEDROCK,
+            region: Some("eu-west-1"),
+            project: None,
+        };
+        let key = || vec![("AWS_BEARER_TOKEN_BEDROCK", OsString::from("ABSKkey"))];
+        let configured = |cli: Cli| {
+            let setup = cli
+                .setup(upstream, "http://127.0.0.1:1", "secret", &dir, |_| None)
+                .unwrap();
+            let mut command = Command::new("cli");
+            let launching = Launching {
+                cli,
+                provider_type: BEDROCK,
+                setup: &setup,
+                cloud: key(),
+                settings_dir: &dir,
+                launch_id: "launch",
+            };
+            let theirs = ["--settings", r#"{"model":"mine"}"#, "--resume"];
+            let theirs = theirs.map(OsString::from).to_vec();
+            let settings = configure(&mut command, launching, theirs).unwrap();
+            let std = command.as_std();
+            let args: Vec<OsString> = std.get_args().map(OsStr::to_owned).collect();
+            let set: BTreeMap<OsString, Option<OsString>> = std
+                .get_envs()
+                .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+                .collect();
+            (args, set, settings)
+        };
+        let set_by = |set: &BTreeMap<OsString, Option<OsString>>, name: &str| {
+            set.get(OsStr::new(name)).cloned().flatten()
+        };
+
+        let (args, set, settings) = configured(Cli::Claude);
+        let settings = settings.expect("Claude Code gets a settings file");
+        let file = settings.0.clone();
+        let pid = std::process::id();
+        assert_eq!(file, dir.join(format!("claude-settings-{pid}-launch.json")));
+        assert_eq!(
+            args,
+            [
+                OsString::from("--settings"),
+                file.clone().into_os_string(),
+                "--resume".into()
+            ]
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(written["env"]["AWS_BEARER_TOKEN_BEDROCK"], "ABSKkey");
+        assert_eq!(
+            written["model"], "mine",
+            "the user's own --settings are kept"
+        );
+        assert_eq!(
+            written["env"]["ANTHROPIC_BEDROCK_BASE_URL"],
+            "http://127.0.0.1:1"
+        );
+        assert_eq!(
+            set_by(&set, "AWS_BEARER_TOKEN_BEDROCK"),
+            None,
+            "the key reaches Claude Code only in its settings"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        drop(settings);
+        assert!(!file.exists(), "the settings go with the launch");
+
+        let (args, codex, settings) = configured(Cli::Codex);
+        assert!(settings.is_none());
+        assert_eq!(
+            args[args.len() - 3..],
+            ["--settings", r#"{"model":"mine"}"#, "--resume"]
+        );
+        assert_eq!(
+            set_by(&codex, "AWS_BEARER_TOKEN_BEDROCK"),
+            Some("ABSKkey".into())
+        );
+        for name in crate::credentials::tests::CONFIG_DIRS {
+            for set in [&set, &codex] {
+                assert!(!set.contains_key(OsStr::new(name)), "{name}");
+            }
+        }
+        assert!(
+            args.iter()
+                .all(|arg| !arg.to_string_lossy().contains("cli_auth_credentials_store")),
+            "Codex keeps its sign-in where the user does"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_left_by_an_ags_that_is_gone_are_removed_and_a_live_launchs_kept() {
+        let dir = crate::store::tests::scratch();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let gone = ended.id();
+        ended.wait().unwrap();
+        let live = std::process::id();
+        let names = [
+            format!("claude-settings-{gone}-a.json"),
+            format!("claude-settings-{live}-b.json"),
+            "claude-settings-other.json".to_owned(),
+            "login.json".to_owned(),
+        ];
+        for name in &names {
+            std::fs::write(dir.join(name), "{}").unwrap();
+        }
+        let settings = Settings::write(&dir, "c", b"{}").unwrap();
+        for (name, kept) in names.iter().zip([false, true, true, true]) {
+            assert_eq!(dir.join(name).exists(), kept, "{name}");
+        }
+        assert!(settings.0.exists());
+        drop(settings);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

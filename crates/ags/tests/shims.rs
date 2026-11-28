@@ -19,7 +19,9 @@ use serde_json::json;
 
 const AGS: &str = env!("CARGO_BIN_EXE_ags");
 /// The real CLI says how it ran, runs `NEXT` in turn after a last `nested`, and exits with `EXIT`.
+/// It leaves out the settings file a launch gives Claude Code, which the launch tests check.
 const REAL: &str = "#!/bin/sh\n\
+    if [ \"$1\" = --settings ]; then shift 2; fi\n\
     echo \"${0##*/} $* | base=${ANTHROPIC_BASE_URL-unset} launched=${AGS_LAUNCHED-unset} bypass=${AGS_BYPASS-unset}\"\n\
     for last in \"$@\"; do :; done\n\
     if [ \"$last\" = nested ] && [ -n \"$NEXT\" ]; then next=${NEXT%% *}; rest=${NEXT#\"$next\"}; NEXT=${rest# } \"$next\" nested; fi\n\
@@ -99,14 +101,6 @@ impl Fixture {
 
     fn token(&self) -> Option<String> {
         self.store.load().unwrap().map(|login| login.access_token)
-    }
-
-    /// Provider `id`'s Claude Code sign-in, as ags checks for it.
-    fn sign_in(&self, id: &str) {
-        let dir = self.store.dir().join("providers").join(id).join("claude");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(".credentials.json"), r#"{"claudeAiOauth":{}}"#).unwrap();
-        fs::write(dir.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
     }
 }
 
@@ -345,11 +339,41 @@ fn at_terminal(mut command: Command, typed: &str) -> (Output, String) {
 }
 
 #[test]
+fn setup_asks_once_for_each_clis_own_sign_in_whichever_providers_share_it() {
+    let f = Fixture::new();
+    let aegis = Aegis::start(
+        &[(
+            "old",
+            &[
+                ("work", "claude_subscription"),
+                ("home", "claude_subscription"),
+            ],
+        )],
+        true,
+    );
+    f.log_in(&aegis.url, "old");
+    // The real CLIs say they are not signed in, and their sign-in is declined.
+    let mut setup = f.command(AGS, &[&f.real]);
+    setup.arg("setup").env("EXIT", "1");
+    let (output, shown) = at_terminal(setup, "n\nn\n");
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(
+        text(&output.stdout),
+        "\nwork (claude_subscription): Claude Code sign-in\n\
+         \nwork (claude_subscription): pi sign-in\n\
+         \nSkipped: work (Claude Code sign-in), work (pi sign-in). Set one up with `ags setup <provider>`.\n"
+    );
+    assert_eq!(
+        shown,
+        "Sign in to Claude Code now? [Y/n] Sign in to pi now? [Y/n] "
+    );
+}
+
+#[test]
 fn a_logged_in_shim_launches_through_aegis_once_and_a_nested_one_runs_the_real_cli() {
     let f = Fixture::new();
     let aegis = Aegis::start(&[("old", &[("claude", "claude_subscription")])], true);
     f.log_in(&aegis.url, "old");
-    f.sign_in("claude");
     let output = f
         .plain("claude")
         .arg("nested")
@@ -381,10 +405,6 @@ fn another_cli_inside_a_launch_gets_its_own_launch_through_aegis() {
         true,
     );
     f.log_in(&aegis.url, "old");
-    f.sign_in("claude");
-    let codex = f.store.dir().join("providers/codex/codex");
-    fs::create_dir_all(&codex).unwrap();
-    fs::write(codex.join("auth.json"), "{}").unwrap();
     let output = f
         .plain("claude")
         .arg("nested")
@@ -425,7 +445,6 @@ fn a_wrapper_that_runs_ags_itself_ends_after_a_few_rounds() {
     let f = Fixture::new();
     let aegis = Aegis::start(&[("old", &[("claude", "claude_subscription")])], true);
     f.log_in(&aegis.url, "old");
-    f.sign_in("claude");
     let wrapper = f.root.join("wrapper");
     script(
         &wrapper.join("claude"),
@@ -448,7 +467,6 @@ fn a_shim_inside_an_ended_launch_starts_afresh() {
     let f = Fixture::new();
     let aegis = Aegis::start(&[("old", &[("claude", "claude_subscription")])], true);
     f.log_in(&aegis.url, "old");
-    f.sign_in("claude");
     let mut ended = Command::new("true").spawn().unwrap();
     let gone = ended.id();
     ended.wait().unwrap();
@@ -516,7 +534,7 @@ fn without_a_terminal_a_shim_opens_the_real_cli_with_why() {
     let aegis = Aegis::start(
         &[
             ("codex-only", &[("codex", "codex_subscription")]),
-            ("claude", &[("claude", "claude_subscription")]),
+            ("aws", &[("aws", "bedrock")]),
             ("none", &[]),
         ],
         true,
@@ -531,9 +549,9 @@ fn without_a_terminal_a_shim_opens_the_real_cli_with_why() {
             ),
         ),
         (
+            "aws",
             "claude",
-            "claude",
-            "claude has no Claude Code sign-in yet; run `ags setup claude` first".to_owned(),
+            "aws has no Bedrock API key yet; run `ags setup aws` first".to_owned(),
         ),
         (
             "none",
@@ -600,26 +618,25 @@ fn ags_bypass_runs_the_real_cli_for_that_run_only_and_outside_any_launch() {
     let env = f.root.join("env/claude");
     script(
         &env,
-        "#!/bin/sh\nfor name in AGS_LAUNCH_SECRET ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CLAUDE_CONFIG_DIR AGS_USER_CLAUDE_CONFIG_DIR AGS_LAUNCHED AGS_BYPASS; do eval \"echo $name=\\${$name-unset}\"; done\n",
+        "#!/bin/sh\nfor name in AGS_LAUNCH_SECRET ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS AWS_BEARER_TOKEN_BEDROCK CLAUDE_CONFIG_DIR AGS_LAUNCHED AGS_BYPASS; do eval \"echo $name=\\${$name-unset}\"; done\n",
     );
-    let isolated = f.store.dir().join("providers/claude/claude");
     let output = f
         .command(f.shims.join("claude"), &[&f.shims, env.parent().unwrap()])
         .env("AGS_BYPASS", "1")
         .env("AGS_LAUNCH_SECRET", "secret")
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
         .env("ANTHROPIC_CUSTOM_HEADERS", "x-ags-launch-secret: secret")
-        .env("CLAUDE_CONFIG_DIR", &isolated)
-        .env("AGS_USER_CLAUDE_CONFIG_DIR", "/home/me/own-claude")
+        .env("AWS_BEARER_TOKEN_BEDROCK", "ABSKkey")
+        .env("CLAUDE_CONFIG_DIR", "/home/me/own-claude")
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", text(&output.stderr));
     assert_eq!(
         text(&output.stdout),
         "AGS_LAUNCH_SECRET=unset\nANTHROPIC_BASE_URL=unset\nANTHROPIC_CUSTOM_HEADERS=unset\n\
-         CLAUDE_CONFIG_DIR=/home/me/own-claude\nAGS_USER_CLAUDE_CONFIG_DIR=unset\n\
+         AWS_BEARER_TOKEN_BEDROCK=unset\nCLAUDE_CONFIG_DIR=/home/me/own-claude\n\
          AGS_LAUNCHED=claude\nAGS_BYPASS=unset\n",
-        "nothing of the launch it ran in reaches it"
+        "nothing of the launch it ran in reaches it, and the user's own dir stays"
     );
 }
 
@@ -695,8 +712,7 @@ fn at_a_terminal_a_shim_offers_to_log_in_then_to_open_the_real_cli() {
 fn at_a_terminal_a_shim_logs_in_and_then_launches_through_aegis() {
     let f = Fixture::new();
     let aegis = Aegis::start(&[("new", &[("claude", "claude_subscription")])], true);
-    f.sign_in("claude");
-    let typed = format!("y\n{}\nn\n", aegis.url);
+    let typed = format!("y\n{}\nn\nn\n", aegis.url);
     let (output, shown) = at_terminal(f.plain("claude"), &typed);
     assert!(output.status.success(), "{shown}");
     assert_eq!(
@@ -732,7 +748,6 @@ fn pairing_again_for_a_provider_keeps_the_old_pairing_until_the_new_one_is_appro
             approve,
         );
         f.log_in(&aegis.url, "old");
-        f.sign_in("claude");
         let (output, shown) = at_terminal(f.plain("claude"), "y\nn\nn\nn\nn\n");
         assert!(
             shown.contains("Pair this machine with http://127.0.0.1:PORT again to grant claude a provider? [Y/n] "),
